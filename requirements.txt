@@ -1,0 +1,17 @@
+bottle==0.13.4
+certifi==2026.10.23
+cffi==2.1.1
+charset-normalizer==3.5.2
+clr_loader==0.2.10
+cryptography==50.0.2
+idna==3.20
+proxy_tools==0.1.0
+psutil==7.2.0
+pycparser==3.12
+PySocks==1.7.1
+pythonnet==3.0.5
+pywebview==6.1
+requests==2.34.2
+typing_extensions==4.15.0
+urllib3==2.8.0
+websocket-client==1.9.0

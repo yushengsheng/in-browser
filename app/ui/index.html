@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>本地指纹浏览器</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='5' y='5' width='22' height='22' rx='6' fill='%232878f6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+          <div>本地指纹浏览器<small>LOCAL BROWSER</small></div>
+        </div>
+        <nav class="main-nav" aria-label="主要导航">
+          <button class="nav-item active" data-panel="profiles">
+            <span data-icon="windows"></span>浏览器窗口
+          </button>
+          <button class="nav-item" data-panel="groups">
+            <span data-icon="folder"></span>分组管理
+          </button>
+          <button class="nav-item" data-panel="proxies">
+            <span data-icon="globe"></span>代理配置
+          </button>
+          <button class="nav-item" data-panel="settings">
+            <span data-icon="settings"></span>设置
+          </button>
+          <button class="nav-item" data-panel="help">
+            <span data-icon="help"></span>使用说明
+          </button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-indicator"><span></span>本机窗口管理</div>
+          <p>配置和浏览器数据保存在本机</p>
+          <button id="recycle-nav" class="recycle-button">
+            <span data-icon="trash"></span>回收站
+            <span id="archived-count">0</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="page-header">
+          <div>
+            <h1 id="page-title">浏览器窗口</h1>
+            <p id="page-subtitle">同步并管理独立的本机浏览器副本</p>
+          </div>
+          <div class="header-right">
+            <span id="connection-status" class="connection-status"
+              >正在连接本地服务…</span
+            ><button
+              id="refresh-button"
+              class="icon-button"
+              title="刷新"
+              aria-label="刷新"
+            >
+              <span data-icon="refresh"></span>
+            </button>
+          </div>
+        </header>
+        <div id="service-error" class="service-error" role="alert" hidden></div>
+
+        <section
+          id="panel-profiles"
+          class="panel active"
+          aria-label="浏览器窗口"
+        >
+          <div class="workspace-card">
+            <div class="card-toolbar">
+              <button id="create-button" class="button primary">
+                <span data-icon="refresh"></span>同步窗口</button
+              ><button id="sync-preview-button" class="button">
+                <span data-icon="eye"></span>预览来源</button
+              ><button id="export-button" class="button">
+                <span data-icon="export"></span>导出配置
+              </button>
+              <div class="toolbar-spacer"></div>
+              <span class="total-label"
+                >共 <strong id="total-count">0</strong> 个窗口</span
+              >
+            </div>
+            <div class="list-tabs" role="tablist" aria-label="窗口状态">
+              <button
+                class="list-tab active"
+                data-filter="all"
+                role="tab"
+                aria-selected="true"
+              >
+                全部窗口 <span id="count-all">0</span></button
+              ><button
+                class="list-tab"
+                data-filter="running"
+                role="tab"
+                aria-selected="false"
+              >
+                已打开 <span id="count-running">0</span>
+              </button>
+            </div>
+            <div class="filter-row">
+              <label class="search-input"
+                ><span data-icon="search"></span
+                ><input
+                  id="search-input"
+                  type="search"
+                  placeholder="搜索名称、序号、备注或代理 IP"
+                  aria-label="搜索窗口" /></label
+              ><select id="group-filter" aria-label="按分组筛选">
+                <option value="">全部分组</option></select
+              ><select id="tag-filter" aria-label="按标签筛选">
+                <option value="">全部标签</option></select
+              ><button id="clear-filters" class="text-button">重置筛选</button>
+            </div>
+            <div class="table-scroll">
+              <table class="profile-table">
+                <thead>
+                  <tr>
+                    <th class="select-cell">
+                      <input
+                        id="select-all"
+                        type="checkbox"
+                        aria-label="选择本页全部窗口"
+                      />
+                    </th>
+                    <th>
+                      <button class="sort-button" data-sort="seq">
+                        序号 <span>↕</span>
+                      </button>
+                    </th>
+                    <th>分组</th>
+                    <th>
+                      <button class="sort-button" data-sort="name">
+                        窗口名称 <span>↕</span>
+                      </button>
+                    </th>
+                    <th>代理 IP</th>
+                    <th>标签</th>
+                    <th>备注</th>
+                    <th>
+                      <button class="sort-button" data-sort="created_at">
+                        创建时间 <span>↕</span>
+                      </button>
+                    </th>
+                    <th>系统</th>
+                    <th class="actions-cell">操作</th>
+                    <th>
+                      <button class="sort-button" data-sort="last_opened_at">
+                        最近打开时间 <span>↕</span>
+                      </button>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody id="profile-rows"></tbody>
+              </table>
+              <div id="empty-state" class="empty-state">
+                <div class="empty-icon" data-icon="windows"></div>
+                <h3>暂无浏览器窗口</h3>
+                <p>点击“同步窗口”查看可用来源；仅导入完整配置和浏览器资料</p>
+              </div>
+            </div>
+            <footer class="table-footer">
+              <div class="batch-actions">
+                <span>已选 <strong id="selected-count">0</strong> 项</span
+                ><button data-batch="open" class="button small">打开</button
+                ><button data-batch="close" class="button small">关闭</button
+                ><button data-batch="archive" class="button small danger-text">
+                  移至回收站</button
+                ><button data-batch="delete" class="button small danger-text">
+                  删除</button
+                ><button id="clear-selection" class="text-button">
+                  取消选择
+                </button>
+              </div>
+              <div class="pagination">
+                <span id="range-label">0–0 / 0</span
+                ><select id="page-size" aria-label="每页数量">
+                  <option value="20">20 条/页</option>
+                  <option value="50">50 条/页</option>
+                  <option value="100">100 条/页</option></select
+                ><button id="prev-page" class="icon-button" aria-label="上一页">
+                  ‹</button
+                ><span id="page-label">1 / 1</span
+                ><button id="next-page" class="icon-button" aria-label="下一页">
+                  ›
+                </button>
+              </div>
+            </footer>
+          </div>
+        </section>
+
+        <section id="panel-groups" class="panel" aria-label="分组管理">
+          <div class="settings-card">
+            <div class="section-heading">
+              <div>
+                <h2>分组管理</h2>
+                <p>分组用于整理窗口。重命名后将同步更新对应窗口。</p>
+              </div>
+              <button id="add-group" class="button primary">
+                <span data-icon="plus"></span>新增分组
+              </button>
+            </div>
+            <div id="group-list" class="group-list"></div>
+            <div class="panel-footer">
+              <span id="groups-save-note" class="muted">修改后请保存</span
+              ><button id="save-groups" class="button primary">保存分组</button>
+            </div>
+          </div>
+        </section>
+        <section id="panel-proxies" class="panel" aria-label="代理配置">
+          <div class="settings-card">
+            <div class="section-heading">
+              <div>
+                <h2>代理配置</h2>
+                <p>查看窗口正在使用的代理。代理信息可在窗口编辑页修改。</p>
+              </div>
+            </div>
+            <div id="proxy-list" class="proxy-list"></div>
+          </div>
+        </section>
+        <section id="panel-settings" class="panel" aria-label="设置">
+          <div class="settings-card">
+            <div class="section-heading">
+              <div>
+                <h2>本地设置</h2>
+                <p>配置程序的本机运行选项。</p>
+              </div>
+            </div>
+            <div id="settings-form"></div>
+            <div class="panel-footer">
+              <span class="muted">设置由本地服务保存</span
+              ><button id="save-settings" class="button primary">
+                保存设置
+              </button>
+            </div>
+          </div>
+        </section>
+        <section id="panel-help" class="panel" aria-label="使用说明">
+          <div class="settings-card help-content">
+            <h2>使用说明</h2>
+            <div class="help-grid">
+              <article>
+                <span class="step-number">01</span>
+                <h3 id="help-source-title">同步本地窗口</h3>
+                <p id="help-source-description">
+                  点击“同步窗口”查看当前可用来源。导入范围以本地运行模式及来源预览为准，只有完整配置和浏览器资料才可导入。
+                </p>
+              </article>
+              <article>
+                <span class="step-number">02</span>
+                <h3>保留独立副本</h3>
+                <p>
+                  同步会复制窗口信息、指纹和浏览器资料。重复同步跳过已有副本；来源改动或删除不会覆盖、删除本地副本。
+                </p>
+              </article>
+              <article>
+                <span class="step-number">03</span>
+                <h3>打开与管理</h3>
+                <p>
+                  点击“打开”启动环境；已打开窗口可激活或关闭。可选择多个窗口执行批量操作。
+                </p>
+              </article>
+              <article>
+                <span class="step-number">04</span>
+                <h3>本机数据与回收站</h3>
+                <p>
+                  移至回收站会保留配置以便恢复。备注、标签和代理仍可在本机管理；“导出配置”不包含完整浏览器资料。
+                </p>
+              </article>
+            </div>
+            <div id="help-import-notice" class="info-banner">
+              本地副本保留来源指纹，界面仅供查看。来源配置和资料须完整，只有资料复制与保存完成才会计为成功。
+            </div>
+            <p>开窗前会用独立临时窗口核对本机已登记环境；字体、渲染等受测项目变化时会停止打开账号窗口，不会自动接受新设备。代理修改在本机保存，关闭并重新打开后生效；代理失败不会改为直连，代理模式下本机网址也经过代理。当前支持TCP，不支持SOCKS5 UDP。导出文件只包含加密配置，不包含完整浏览器资料。</p>
+            <h3>快捷操作</h3>
+            <p>
+              按
+              <kbd>Esc</kbd>
+              关闭菜单或抽屉。有未保存的修改时会提示确认。搜索、分组和标签可以组合筛选。
+            </p>
+          </div>
+        </section>
+        <section id="panel-recycle" class="panel" aria-label="回收站">
+          <div class="settings-card">
+            <div class="section-heading">
+              <div>
+                <h2>回收站</h2>
+                <p>已归档的配置保存在本机，可恢复后继续使用。</p>
+              </div>
+              <button id="refresh-recycle" class="button">刷新</button>
+            </div>
+            <div class="recycle-actions">
+              <label class="checkbox-field"><input id="recycle-select-all" type="checkbox">全选</label>
+              <span>已选 <strong id="recycle-selected-count">0</strong> 项</span>
+              <button id="recycle-delete-selected" class="button small danger-text" disabled>删除所选窗口</button>
+            </div>
+            <div id="recycle-list"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+    <section
+      id="profile-drawer"
+      class="profile-drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="drawer-title"
+      hidden
+    >
+      <header class="drawer-header">
+        <h2 id="drawer-title">编辑窗口</h2>
+        <button
+          id="close-drawer"
+          class="icon-button close-button"
+          aria-label="关闭编辑窗口"
+        >
+          ×
+        </button>
+      </header>
+      <div class="drawer-layout">
+        <nav id="drawer-nav" class="drawer-nav" aria-label="窗口配置分类">
+          <button class="active" data-section="basic">
+            <span data-icon="profile"></span>基础设置</button
+          ><button data-section="proxy">
+            <span data-icon="globe"></span>代理设置</button
+          ><button data-section="fingerprint">
+            <span data-icon="fingerprint"></span>指纹设置</button
+          ><button data-section="preferences">
+            <span data-icon="settings"></span>偏好设置</button
+          ><button data-section="cookies">
+            <span data-icon="cookie"></span>Cookie
+          </button>
+        </nav>
+        <div id="drawer-scroll" class="drawer-scroll">
+          <div id="drawer-error" class="inline-error" role="alert" hidden></div>
+          <form id="profile-form" autocomplete="off" novalidate></form>
+        </div>
+      </div>
+      <footer class="drawer-footer">
+        <span class="muted">指纹在比特配置后导入</span>
+        <div class="footer-buttons">
+          <button id="cancel-drawer" class="button">取消</button
+          ><button id="save-profile" class="button primary">确定</button>
+        </div>
+      </footer>
+    </section>
+    <dialog id="sync-dialog" class="sync-dialog" aria-labelledby="sync-title">
+      <header class="sync-header">
+        <div><h2 id="sync-title">同步本地窗口</h2><p id="sync-source-note">正在读取本地运行模式及可用来源…</p></div>
+        <button id="sync-close" class="icon-button close-button" aria-label="关闭同步面板">×</button>
+      </header>
+      <div class="sync-body">
+        <div id="sync-explanation" class="info-banner sync-explanation">同步只添加具有完整配置和浏览器资料的新副本；不会重复、覆盖或因来源删除而删除本地副本。</div>
+        <div id="sync-error" class="inline-error" role="alert" hidden></div>
+        <section id="sync-preview" aria-label="选择同步窗口">
+          <div class="sync-toolbar">
+            <label class="search-input"><span data-icon="search"></span><input id="sync-search" type="search" placeholder="搜索窗口名称或序号" aria-label="搜索待同步窗口"></label>
+            <button id="sync-reload" class="button small"><span data-icon="refresh"></span>重新预览</button>
+          </div>
+          <p id="sync-preview-summary" class="sync-summary" role="status">正在读取本机窗口…</p>
+          <div class="sync-table-scroll">
+            <table class="sync-table"><thead><tr><th class="select-cell"><input id="sync-select-all" type="checkbox" aria-label="选择本次预览全部可导入窗口"></th><th>窗口</th><th>环境</th><th>同步状态</th></tr></thead><tbody id="sync-preview-rows"></tbody></table>
+            <p id="sync-empty" class="plain-empty" hidden>未发现可同步的本机窗口。</p>
+          </div>
+          <div class="sync-pagination"><span id="sync-selection-count">已选 0 个</span><div class="pagination"><span id="sync-range"></span><button id="sync-prev" class="icon-button" aria-label="上一页同步窗口">‹</button><span id="sync-page">1 / 1</span><button id="sync-next" class="icon-button" aria-label="下一页同步窗口">›</button></div></div>
+        </section>
+        <section id="sync-progress-section" aria-label="同步进度" hidden>
+          <div class="sync-progress-heading"><h3 id="sync-phase">准备同步…</h3><span id="sync-progress-count"></span></div>
+          <progress id="sync-progress" max="1" value="0" aria-label="窗口同步进度"></progress>
+          <p id="sync-progress-summary" class="sync-summary" role="status"></p>
+          <p id="sync-background-note" class="field-hint">可关闭此面板继续管理本地窗口；同步将在后台继续。</p>
+          <div id="sync-result-list" class="sync-result-list" role="log" aria-live="polite"></div>
+        </section>
+      </div>
+      <footer class="sync-footer"><span id="sync-footer-note" class="muted">其他云端窗口不在本次同步范围内</span><div class="footer-buttons"><button id="sync-cancel-job" class="button danger-text" hidden>取消剩余同步</button><button id="sync-retry-status" class="button" hidden>继续读取进度</button><button id="sync-dismiss" class="button">关闭</button><button id="sync-start" class="button primary" disabled>同步所选窗口</button></div></footer>
+    </dialog>
+    <div id="row-menu" class="row-menu" role="menu" hidden></div>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <dialog id="confirm-dialog" class="confirm-dialog">
+      <form method="dialog">
+        <div class="confirm-icon">!</div>
+        <h3 id="confirm-title">确认操作</h3>
+        <p id="confirm-message"></p>
+        <div class="dialog-actions">
+          <button id="confirm-cancel" class="button" value="cancel" autofocus>取消</button
+          ><button id="confirm-accept" class="button primary" value="confirm">
+            确定
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <script src="app.js"></script>
+  </body>
+</html>
