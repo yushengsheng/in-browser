@@ -56,6 +56,12 @@ jobs:
           New-Item -ItemType Directory -Path analysis/reports -Force | Out-Null
           & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_clean_start.py" --execute | Tee-Object -FilePath analysis/reports/clean-start.json
           if ($LASTEXITCODE -ne 0) { throw 'Fresh manager acceptance failed' }
+      - name: Diagnose native rendering candidates without changing source data
+        if: ${{ !cancelled() && env.IB_PACKAGE != '' }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/diagnose_portability.py" --execute --package "$env:IB_PACKAGE"
+          if ($LASTEXITCODE -ne 0) { throw 'Native diagnostic measurement failed' }
       - name: Open the locally created profile on this device
         if: ${{ !cancelled() && env.IB_PACKAGE != '' }}
         shell: pwsh
@@ -71,5 +77,6 @@ jobs:
             ${{ runner.temp }}/source-check.json
             analysis/reports/clean-start.json
             ${{ env.IB_PACKAGE }}/analysis/reports/portable-device.json
+            ${{ env.IB_PACKAGE }}/analysis/reports/portable-candidates.json
           if-no-files-found: warn
           retention-days: 14
