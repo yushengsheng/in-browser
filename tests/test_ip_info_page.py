@@ -16,13 +16,23 @@ from manager_service import ManagerService
 
 
 class InfoTabTests(unittest.TestCase):
-    def connection(self,pages):
+    def connection(self,pages,*,on_snapshot=None):
+        pages=copy.deepcopy(pages);snapshots=0
         def call(method,params=None,session=None):
-            if method=='Target.getTargets':return {'targetInfos':pages}
-            if method=='Target.createTarget':return {'targetId':'new-info'}
-            if method=='Target.attachToTarget':return {'sessionId':'info-session'}
+            nonlocal snapshots
+            if method=='Target.getTargets':
+                snapshots+=1
+                if on_snapshot:on_snapshot(snapshots,pages)
+                return {'targetInfos':copy.deepcopy(pages)}
+            if method=='Target.createTarget':
+                pages.append({'type':'page','url':IP_INFO_URL,'targetId':'new-info'})
+                return {'targetId':'new-info'}
+            if method=='Target.closeTarget':
+                pages[:]=[page for page in pages if page['targetId']!=params['targetId']]
+                return {'success':True}
             return {}
-        return Mock(call=Mock(side_effect=call))
+        connection=Mock(call=Mock(side_effect=call));connection.pages=pages
+        return connection
 
     def test_new_tab_keeps_all_existing_pages_and_uses_browser_network(self):
         connection=self.connection([{'type':'page','url':'https://synthetic.invalid/account','targetId':'account'}])
@@ -30,25 +40,29 @@ class InfoTabTests(unittest.TestCase):
         connection.call.assert_any_call('Target.createTarget',{'url':IP_INFO_URL,'background':False})
         self.assertFalse(any(call.args[0] in ('Page.navigate','Target.closeTarget','Network.setUserAgentOverride','Emulation.setDeviceMetricsOverride') for call in connection.call.call_args_list))
 
-    def test_restored_info_tab_is_refreshed_without_accumulating_tabs(self):
+    def test_restored_info_tab_is_replaced_only_after_new_page_is_confirmed(self):
         connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'restored-info'},
                                     {'type':'page','url':'https://synthetic.invalid/account','targetId':'account'}])
-        self.assertEqual(show_ip_info(connection),'restored-info')
-        connection.call.assert_any_call('Page.reload',{'ignoreCache':True},session='info-session')
-        connection.call.assert_any_call('Target.detachFromTarget',{'sessionId':'info-session'})
-        self.assertFalse(any(call.args[0]=='Target.createTarget' for call in connection.call.call_args_list))
+        self.assertEqual(show_ip_info(connection),'new-info')
+        calls=[value.args[0] for value in connection.call.call_args_list]
+        self.assertEqual(calls,['Target.getTargets','Target.createTarget','Target.getTargets',
+            'Target.getTargets','Target.closeTarget','Target.getTargets','Target.activateTarget'])
+        self.assertEqual({page['targetId'] for page in connection.pages},{'account','new-info'})
+        self.assertFalse(any(value.startswith('Page.') or value in ('Target.attachToTarget','Target.detachFromTarget') for value in calls))
 
     def test_similar_urls_and_non_page_targets_are_never_reused(self):
         for url,kind in [('https://ifconfig.co.evil.invalid/','page'),(IP_INFO_URL+'?ip=synthetic','page'),(IP_INFO_URL,'service_worker')]:
             with self.subTest(url=url,kind=kind):self.assertEqual(show_ip_info(self.connection([{'type':kind,'url':url,'targetId':'other'}])),'new-info')
 
     def test_missing_creation_receipt_fails_instead_of_claiming_page_opened(self):
-        connection=self.connection([]);connection.call.side_effect=lambda *args,**kwargs:{}
-        with self.assertRaises(LocalBrowserError):show_ip_info(connection)
+        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}]);original=connection.call.side_effect
+        connection.call.side_effect=lambda method,*args,**kwargs:{} if method=='Target.createTarget' else original(method,*args,**kwargs)
+        with self.assertRaises(LocalBrowserError) as failure:show_ip_info(connection)
+        self.assertEqual(failure.exception.operation,'Target.createTarget')
+        self.assertFalse(any(value.args[0]=='Target.closeTarget' for value in connection.call.call_args_list))
 
     def test_each_cdp_failure_has_a_fixed_operation_without_original_private_text(self):
-        for operation in ('Target.getTargets','Target.attachToTarget','Page.reload',
-                          'Target.detachFromTarget','Target.createTarget','Target.activateTarget'):
+        for operation in ('Target.getTargets','Target.closeTarget','Target.createTarget','Target.activateTarget'):
             pages=[] if operation=='Target.createTarget' else [{'type':'page','url':IP_INFO_URL,'targetId':'info'}]
             connection=self.connection(pages);original=connection.call.side_effect
             def call(method,params=None,session=None):
@@ -61,22 +75,147 @@ class InfoTabTests(unittest.TestCase):
             self.assertEqual(failure.exception.operation,operation)
             self.assertEqual(failure.exception.cause_type,'TimeoutError')
             self.assertNotIn('synthetic-private',str(failure.exception))
-            if operation=='Page.reload':
-                connection.call.assert_any_call('Target.detachFromTarget',{'sessionId':'info-session'})
 
-    def test_detach_failure_cannot_mask_the_primary_reload_failure(self):
-        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'info'}])
-        original=connection.call.side_effect
-        def call(method,params=None,session=None):
-            if method=='Page.reload':raise TimeoutError('synthetic-private-primary')
-            if method=='Target.detachFromTarget':raise OSError('synthetic-private-cleanup')
-            return original(method,params,session)
+    def test_new_target_wrong_url_or_reused_id_cannot_close_any_old_page(self):
+        for altered in ('wrong-url','reused-id'):
+            def change(number,pages):
+                if number==2:
+                    pages[-1]['url']='https://synthetic.invalid/account'
+            connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}],on_snapshot=change)
+            original=connection.call.side_effect
+            if altered=='reused-id':
+                connection.call.side_effect=lambda method,*args,**kwargs:{'targetId':'old'} if method=='Target.createTarget' else original(method,*args,**kwargs)
+            with self.subTest(altered=altered),self.assertRaises(LocalBrowserError):show_ip_info(connection)
+            self.assertFalse(any(value.args[0]=='Target.closeTarget' for value in connection.call.call_args_list))
+
+    def test_old_info_changed_to_account_or_disappeared_before_close_is_preserved(self):
+        for disappeared in (False,True):
+            def change(number,pages):
+                if number==3:
+                    if disappeared:pages[:]=[page for page in pages if page['targetId']!='old']
+                    else:pages[0]['url']='https://synthetic.invalid/account'
+            connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}],on_snapshot=change)
+            self.assertEqual(show_ip_info(connection),'new-info')
+            self.assertFalse(any(value.args[0]=='Target.closeTarget' for value in connection.call.call_args_list))
+
+    def test_only_the_first_initial_info_page_is_replaced_and_other_info_pages_are_preserved(self):
+        def change(number,pages):
+            if number==2:pages.append({'type':'page','url':IP_INFO_URL,'targetId':'concurrent-info'})
+        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old1'},
+            {'type':'page','url':IP_INFO_URL.rstrip('/'),'targetId':'old2'},
+            {'type':'page','url':IP_INFO_URL+'?private=value','targetId':'similar'}],on_snapshot=change)
+        self.assertEqual(show_ip_info(connection),'new-info')
+        closed=[value.args[1]['targetId'] for value in connection.call.call_args_list if value.args[0]=='Target.closeTarget']
+        self.assertEqual(closed,['old1'])
+        self.assertEqual({page['targetId'] for page in connection.pages},{'old2','similar','concurrent-info','new-info'})
+
+    def test_close_failure_or_unconfirmed_removal_is_not_reported_as_success(self):
+        for result in (False,True):
+            connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}]);original=connection.call.side_effect
+            connection.timeout=.001
+            connection.call.side_effect=lambda method,*args,**kwargs:{'success':result} if method=='Target.closeTarget' else original(method,*args,**kwargs)
+            with self.subTest(result=result),self.assertRaises(LocalBrowserError):show_ip_info(connection)
+            self.assertEqual({page['targetId'] for page in connection.pages},{'old','new-info'})
+            self.assertFalse(any(value.args[0]=='Target.activateTarget' for value in connection.call.call_args_list))
+
+    def test_new_target_disappearing_before_final_snapshot_fails(self):
+        def change(number,pages):
+            if number==3:pages[:]=[page for page in pages if page['targetId']!='new-info']
+        connection=self.connection([],on_snapshot=change);connection.timeout=.001
+        with self.assertRaises(LocalBrowserError):show_ip_info(connection)
+
+    def test_same_new_id_exact_blank_exact_is_confirmed_before_close_and_after_close(self):
+        clock=[0.0]
+        def change(number,pages):
+            if number in (3,5):
+                next(page for page in pages if page['targetId']=='new-info')['url']='about:blank'
+            if number in (4,6):
+                next(page for page in pages if page['targetId']=='new-info')['url']=IP_INFO_URL
+        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}],on_snapshot=change)
+        with patch('ip_info_page.time.monotonic',side_effect=lambda:clock[0]), \
+                patch('ip_info_page.time.sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)):
+            self.assertEqual(show_ip_info(connection),'new-info')
+        self.assertEqual(sum(value.args[0]=='Target.createTarget' for value in connection.call.call_args_list),1)
+        self.assertEqual(sum(value.args[0]=='Target.closeTarget' for value in connection.call.call_args_list),1)
+        self.assertEqual({page['targetId'] for page in connection.pages},{'new-info'})
+        self.assertAlmostEqual(clock[0],.1)
+
+    def test_blank_creation_and_pending_close_only_recheck_the_same_targets(self):
+        clock=[0.0];observed=[]
+        def change(number,pages):
+            if number==2:pages[-1]['url']='about:blank'
+            if number==3:pages[-1]['url']=IP_INFO_URL
+            if number==6:pages[:]=[page for page in pages if page['targetId']!='old']
+        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}],on_snapshot=change)
+        connection.timeout=1.0;original=connection.call.side_effect
+        def call(method,*args,**kwargs):
+            observed.append((method,connection.timeout))
+            if method=='Target.closeTarget':return {'success':True}
+            return original(method,*args,**kwargs)
         connection.call.side_effect=call
-        with self.assertRaises(LocalBrowserError) as failure:show_ip_info(connection)
-        self.assertEqual(failure.exception.operation,'Page.reload')
+        with patch('ip_info_page.time.monotonic',side_effect=lambda:clock[0]), \
+                patch('ip_info_page.time.sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)):
+            self.assertEqual(show_ip_info(connection),'new-info')
+        methods=[method for method,_ in observed]
+        self.assertEqual(methods.count('Target.createTarget'),1)
+        self.assertEqual(methods.count('Target.closeTarget'),1)
+        self.assertEqual(connection.timeout,1.0)
+        self.assertGreater(clock[0],0)
+        remaining=[timeout for method,timeout in observed[2:]]
+        self.assertTrue(all(0<timeout<=1 for timeout in remaining))
+        self.assertEqual(remaining,sorted(remaining,reverse=True))
+
+    def test_confirmation_deadline_refuses_without_repeating_create_and_restores_timeout(self):
+        clock=[0.0]
+        def change(number,pages):
+            if number>=2:pages[-1]['url']=''
+        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'old'}],on_snapshot=change)
+        connection.timeout=.1
+        with patch('ip_info_page.time.monotonic',side_effect=lambda:clock[0]), \
+                patch('ip_info_page.time.sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)):
+            with self.assertRaises(LocalBrowserError) as failure:show_ip_info(connection)
+        self.assertEqual(failure.exception.operation,'Target.getTargets')
         self.assertEqual(failure.exception.cause_type,'TimeoutError')
-        self.assertIs(failure.exception.cleanup_failed,True)
-        self.assertNotIn('synthetic-private',str(failure.exception))
+        self.assertEqual(connection.timeout,.1)
+        self.assertEqual(clock[0],.1)
+        self.assertEqual(sum(value.args[0]=='Target.createTarget' for value in connection.call.call_args_list),1)
+        self.assertFalse(any(value.args[0]=='Target.closeTarget' for value in connection.call.call_args_list))
+
+    def test_initially_absent_new_target_is_confirmed_without_creating_another(self):
+        clock=[0.0]
+        def change(number,pages):
+            if number==2:pages.clear()
+            if number==3:pages.append({'type':'page','url':IP_INFO_URL,'targetId':'new-info'})
+        connection=self.connection([],on_snapshot=change)
+        with patch('ip_info_page.time.monotonic',side_effect=lambda:clock[0]), \
+                patch('ip_info_page.time.sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)):
+            self.assertEqual(show_ip_info(connection),'new-info')
+        self.assertEqual(sum(value.args[0]=='Target.createTarget' for value in connection.call.call_args_list),1)
+
+    def test_confirmation_budget_is_finite_capped_and_compatible_with_missing_mock_timeout(self):
+        from ip_info_page import _confirmation_budget
+        class Connection:pass
+        connection=Connection()
+        self.assertEqual(_confirmation_budget(connection),5)
+        for value,expected in ((2,2),(20,5),(0,5),(-1,5),(True,5),(None,5),('private',5),(float('nan'),5)):
+            connection.timeout=value
+            self.assertEqual(_confirmation_budget(connection),expected)
+
+    def test_confirmation_exception_restores_the_original_timeout_and_absent_attribute(self):
+        class Connection:pass
+        for initial in (None,2.0):
+            connection=Connection()
+            if initial is not None:connection.timeout=initial
+            def fail():
+                self.assertGreater(connection.timeout,0)
+                self.assertAlmostEqual(connection.timeout,.1)
+                raise RuntimeError('synthetic')
+            with patch('ip_info_page.time.monotonic',return_value=1):
+                with self.assertRaises(RuntimeError):
+                    from ip_info_page import _within_confirmation
+                    _within_confirmation(connection,1.1,fail)
+            if initial is None:self.assertFalse(hasattr(connection,'timeout'))
+            else:self.assertEqual(connection.timeout,initial)
 
 
 class ManagerRouteTests(unittest.TestCase):

@@ -69,7 +69,7 @@ def error_diagnostics(error):
         for frame in traceback.extract_tb(error.__traceback__)[-8:]]}
     if getattr(error, 'code', None) == 'ip_info_failed':
         operations = frozenset(('Target.getTargets', 'Target.attachToTarget', 'Page.reload',
-            'Target.detachFromTarget', 'Target.createTarget', 'Target.activateTarget'))
+            'Target.detachFromTarget', 'Target.createTarget', 'Target.closeTarget', 'Target.activateTarget'))
         causes = frozenset(('LocalBrowserError', 'OSError', 'TimeoutError', 'ConnectionError',
             'ConnectionResetError', 'ConnectionAbortedError', 'ConnectionRefusedError', 'BrokenPipeError',
             'WebSocketException', 'WebSocketTimeoutException', 'WebSocketConnectionClosedException',
@@ -155,12 +155,16 @@ def url_digest(url):
     return hashlib.sha256(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', '')).encode('utf-8')).hexdigest()
 
 
+def _route_digest(url):
+    parsed = urlsplit(url)
+    return hashlib.sha256(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', parsed.fragment)).encode('utf-8')).hexdigest()
+
+
 def target_route(connection, target, marker):
     current = connection.call('Target.getTargetInfo', {'targetId': target})['targetInfo']
     if current.get('type') != 'page' or origin(current.get('url')) != marker['target_origin']:
         raise AcceptanceError()
-    parsed = urlsplit(current['url'])
-    return hashlib.sha256(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', parsed.fragment)).encode('utf-8')).hexdigest()
+    return _route_digest(current['url'])
 
 
 def _hash(value):
@@ -176,6 +180,8 @@ def validate_marker(value):
         raise ValueError()
     target = value.get('target_origin')
     if origin(target) != target:
+        raise ValueError()
+    if 'target_route_sha256' in value and not _hash(value['target_route_sha256']):
         raise ValueError()
     rule = value.get('auth_rule')
     if (not isinstance(rule, dict) or origin(rule.get('origin')) != rule['origin']
@@ -503,14 +509,20 @@ def attach_existing(connection, marker, report=None):
                 matches.append(target)
         except (ValueError, TypeError):
             continue
+    same_origin = matches
+    if 'target_route_sha256' in marker:
+        matches = [value for value in matches if _route_digest(value['url']) == marker['target_route_sha256']]
+    if report is not None:
+        routes = {(urlsplit(value['url']).path, urlsplit(value['url']).fragment) for value in same_origin}
+        selection = {'same_origin_page_count': len(same_origin), 'same_origin_routes_equal': len(routes) == 1}
+        if 'target_route_sha256' in marker:
+            selection.update(route_filter_applied=True, route_matching_page_count=len(matches))
+        if matches:
+            selected = urlsplit(matches[0]['url'])
+            selection.update(selected_query_present=bool(selected.query), selected_fragment_present=bool(selected.fragment))
+        report.setdefault('page_selections', []).append(selection)
     if not matches:
         raise AcceptanceError()
-    if report is not None:
-        selected = urlsplit(matches[0]['url'])
-        routes = {(urlsplit(value['url']).path, urlsplit(value['url']).fragment) for value in matches}
-        report.setdefault('page_selections', []).append({'same_origin_page_count': len(matches),
-            'same_origin_routes_equal': len(routes) == 1, 'selected_query_present': bool(selected.query),
-            'selected_fragment_present': bool(selected.fragment)})
     target = matches[0]['targetId']
     session = connection.call('Target.attachToTarget', {'targetId': target, 'flatten': True})['sessionId']
     connection.call('Page.enable', session=session)

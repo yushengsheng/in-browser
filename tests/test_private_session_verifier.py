@@ -70,6 +70,14 @@ class MarkerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verifier._json(raw)
 
+    def test_optional_target_route_requires_an_exact_hash(self):
+        value = marker()
+        value['target_route_sha256'] = verifier._route_digest(TARGET + '/safe#session')
+        self.assertIs(verifier.validate_marker(value), value)
+        for invalid in ('private-path', None, 1, 'A' * 64):
+            value['target_route_sha256'] = invalid
+            with self.assertRaises(ValueError):verifier.validate_marker(value)
+
     def test_record_requires_exact_authorized_profile_and_unchanged_stable_hash(self):
         with tempfile.TemporaryDirectory(prefix='private-session-unit-') as directory:
             data = Path(directory).resolve()
@@ -285,6 +293,32 @@ class EvidenceTests(unittest.TestCase):
             'same_origin_routes_equal': False, 'selected_query_present': True, 'selected_fragment_present': True}]})
         self.assertNotIn(TARGET, json.dumps(report))
         self.assertNotIn('private', json.dumps(report))
+
+    def test_optional_route_selects_matching_existing_page_and_refuses_missing_route(self):
+        connection = Mock()
+        private_route = TARGET + '/private-account?changing=value#canvas'
+        def call(method, params=None, session=None):
+            if method == 'Target.getTargets':
+                return {'targetInfos': [{'type': 'page', 'url': TARGET + '/other', 'targetId': 'wrong'},
+                    {'type': 'page', 'url': private_route, 'targetId': 'correct'}]}
+            if method == 'Target.attachToTarget':
+                self.assertEqual(params['targetId'], 'correct')
+                return {'sessionId': 'page'}
+            return {}
+        connection.call.side_effect = call
+        value = marker()
+        value['target_route_sha256'] = verifier._route_digest(private_route.replace('changing=value', 'changing=old'))
+        report = {}
+        self.assertEqual(verifier.attach_existing(connection, value, report=report), ('correct', 'page'))
+        self.assertEqual(report['page_selections'][0]['route_matching_page_count'], 1)
+        self.assertNotIn('private-account', json.dumps(report))
+        self.assertNotIn(value['target_route_sha256'], json.dumps(report))
+        connection.call.reset_mock()
+        value['target_route_sha256'] = verifier._route_digest(TARGET + '/missing')
+        report = {}
+        with self.assertRaises(verifier.AcceptanceError):verifier.attach_existing(connection, value, report=report)
+        self.assertEqual(report['page_selections'][0]['route_matching_page_count'], 0)
+        self.assertEqual([args.args[0] for args in connection.call.call_args_list], ['Target.getTargets'])
 
 
 class EventRetentionTests(unittest.TestCase):
