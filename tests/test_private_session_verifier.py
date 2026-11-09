@@ -293,5 +293,19 @@ class OwnershipAndOutputTests(unittest.TestCase):
             self.assertEqual(json.loads(destination.read_text()), result)
 
 
+class DiagnosticPrivacyTests(unittest.TestCase):
+    def test_error_messages_and_unknown_field_names_never_leave_local_classifier(self):
+        secret = 'synthetic-private-credential-do-not-log'
+        error = RuntimeError('代理检测未通过' + secret)
+        result = verifier.error_diagnostics(error)
+        self.assertEqual(result['reason_code'], 'proxy_check_failed')
+        self.assertNotIn(secret, json.dumps(result))
+        error.changed_fields = ['fonts.metrics', secret]
+        result = verifier.error_diagnostics(error)
+        self.assertEqual(result['reason_code'], 'continuity_gate')
+        self.assertEqual(result['continuity_changed_fields'], ['fonts.metrics'])
+        self.assertNotIn(secret, json.dumps(result))
+
+
 if __name__ == '__main__':
     unittest.main()

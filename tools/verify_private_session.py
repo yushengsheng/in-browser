@@ -20,6 +20,7 @@ import stat
 import sys
 import tempfile
 import time
+import traceback
 from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,36 @@ AUTH_TIMEOUT = 60
 EVENTS = frozenset(('Network.requestWillBeSent', 'Network.responseReceived',
                     'Network.loadingFinished', 'Network.loadingFailed',
                     'Network.requestServedFromCache'))
+DIAGNOSTIC_FIELDS = frozenset(('audio.offline audio.supported canvas.geometry canvas.text context.secure '
+    'devices.kinds devices.supported fonts.metrics locale.options navigator.cookieEnabled '
+    'navigator.deviceMemory navigator.hardwareConcurrency navigator.language navigator.languages '
+    'navigator.maxTouchPoints navigator.platform navigator.userAgent navigator.vendor navigator.webdriver '
+    'screen.availHeight screen.availWidth screen.colorDepth screen.devicePixelRatio screen.height '
+    'screen.media screen.orientation screen.pixelDepth screen.width timezone.name uaData.high uaData.low '
+    'uaData.supported webgl1.attributes webgl1.extensions webgl1.identity webgl1.limits webgl1.pixels '
+    'webgl1.precision webgl1.supported webgl2.attributes webgl2.extensions webgl2.identity webgl2.limits '
+    'webgl2.pixels webgl2.precision webgl2.supported baseline binding probe.server probe.navigation '
+    'probe.secureContext probe.stability').split())
+
+
+def error_diagnostics(error):
+    """Classify locally; raw exceptions can contain proxy or account details."""
+    fields = getattr(error, 'changed_fields', [])
+    result = {'error_type': type(error).__name__, 'frames': [
+        {'file': Path(frame.filename).name, 'line': frame.lineno}
+        for frame in traceback.extract_tb(error.__traceback__)[-8:]]}
+    if isinstance(fields, list) and fields:
+        result['reason_code'] = 'continuity_gate'
+        result['continuity_changed_fields'] = sorted({f for f in fields if isinstance(f, str) and f in DIAGNOSTIC_FIELDS})
+    else:
+        message = str(error)
+        for prefix, code in (('代理检测未通过', 'proxy_check_failed'),
+                             ('本地代理未就绪', 'proxy_runtime_unready'),
+                             ('本地代理在检测期间退出', 'proxy_runtime_lost')):
+            if message.startswith(prefix):
+                result['reason_code'] = code
+                break
+    return result
 
 
 class AcceptanceError(Exception):
@@ -542,7 +573,7 @@ def main(argv=None):
         marker = load_marker(ROOT)
         run(ROOT, marker, args.duration_seconds, report)
     except BaseException as error:
-        report['error_type'] = type(error).__name__
+        report.update(error_diagnostics(error))
         report['success'] = False
     report['long_acceptance'] = bool(report['success'] and report['requested_duration_seconds'] >= 7200
                                      and report['held_duration_seconds'] >= 7200)
