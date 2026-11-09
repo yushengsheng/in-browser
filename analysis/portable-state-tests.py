@@ -24,7 +24,7 @@ def main():
         report['checks'][name]=bool(value)
         if not value:raise AssertionError(name)
     with tempfile.TemporaryDirectory(prefix='portable-state-') as tmp:
-        root=Path(tmp)/'first';root.mkdir();config=SimpleNamespace(independent=True)
+        root=Path(tmp).resolve()/'first';root.mkdir();config=SimpleNamespace(independent=True)
         store=WindowStore(config,root)
         write_encrypted(root/'independent-mode.bin',{'format':1})
         write_encrypted(root/'configuration-context.bin',{'fixture':'private'})
@@ -43,7 +43,7 @@ def main():
             check('all_current_bins_read_without_dpapi',read_encrypted(root/'configuration-context.bin')['fixture']=='private')
             check('catalog_read_without_dpapi',store.all()[0]['id']=='fixture')
             check('repeat_migration_is_local',migrate(service)['already_portable'])
-        moved=Path(tmp)/'different-directory';shutil.copytree(root,moved)
+        moved=Path(tmp).resolve()/'different-directory';shutil.copytree(root,moved)
         with patch('local_state._dpapi_protect',side_effect=AssertionError('Original Windows user unavailable')):
             moved_store=WindowStore(config,moved)
             check('copied_catalog_rebases_data_paths',moved_store.all()[0]['_runtime']['profile_path']==str(moved/'profiles/fixture'))

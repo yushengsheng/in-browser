@@ -55,7 +55,7 @@ def manifest(folder):
 
 
 def fixture(root,count=3,*,encrypted=False):
-    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    root=Path(root).resolve();root.mkdir(parents=True,exist_ok=True)
     items=[]
     for number in range(1,count+1):
         item=candidate(number,'相同名称');source=root/'sources'/item['source_id']
@@ -109,7 +109,7 @@ def crash_fixture(root,stage):
 class SyncReliabilityTests(unittest.TestCase):
     def setUp(self):
         temporary=tempfile.TemporaryDirectory(prefix='sync-reliability-')
-        self.addCleanup(temporary.cleanup);self.root=Path(temporary.name)
+        self.addCleanup(temporary.cleanup);self.root=Path(temporary.name).resolve()
         guard=patch.object(window_sync,'profile_processes',return_value=[])
         guard.start();self.addCleanup(guard.stop)
 

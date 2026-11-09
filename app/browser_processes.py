@@ -6,6 +6,10 @@ import psutil
 from local_state import LocalBrowserError
 
 
+def _canonical_profile(profile):
+    return os.path.normcase(str(Path(profile).resolve()))
+
+
 class ProfileProcessSnapshot:
     """One request's process index; never grants authority to control a browser."""
 
@@ -32,7 +36,7 @@ class ProfileProcessSnapshot:
                         continue
                     for value in _switch_values(args, '--user-data-dir'):
                         if value:
-                            key = os.path.normcase(os.path.abspath(value.strip('"')))
+                            key = self._profile_key(value.strip('"'))
                             self._occupied.add(key)
                             if _is_browser(args):self._profiles.setdefault(key, {})[process.pid] = info.get('create_time')
                 except (psutil.Error, OSError, ValueError, TypeError):
@@ -46,7 +50,7 @@ class ProfileProcessSnapshot:
     def _profile_key(self, profile):
         value = str(profile)
         if value not in self._profile_keys:
-            self._profile_keys[value] = os.path.normcase(str(Path(profile).resolve()))
+            self._profile_keys[value] = _canonical_profile(profile)
         return self._profile_keys[value]
 
     def uncertain(self, profile, *, pid=None):
@@ -72,7 +76,7 @@ class ProfileProcessSnapshot:
                     self._uncertain_profiles.add(expected)
                     continue
                 if _is_browser(args) and any(
-                        os.path.normcase(os.path.abspath(value.strip('"'))) == expected
+                        self._profile_key(value.strip('"')) == expected
                         for value in _switch_values(args, '--user-data-dir') if value):
                     result.append(process)
                 else:
@@ -85,7 +89,7 @@ class ProfileProcessSnapshot:
 
 
 def profile_processes(profile: Path, *, require_inspectable=False):
-    expected = os.path.normcase(str(profile.resolve()))
+    expected = _canonical_profile(profile)
     result = []
     for process in psutil.process_iter(['pid', 'cmdline', 'exe', 'create_time', 'name']):
         try:
@@ -94,7 +98,7 @@ def profile_processes(profile: Path, *, require_inspectable=False):
                     str(process.info.get('name') or '').casefold() == 'bitbrowser.exe' or
                     Path(process.info.get('exe') or '').name.casefold() == 'bitbrowser.exe'):
                 raise LocalBrowserError('无法核对某个比特内核的运行状态，请先正常关闭来源浏览器窗口后重试。')
-            if any(os.path.normcase(os.path.abspath(value.strip('"'))) == expected
+            if any(_canonical_profile(value.strip('"')) == expected
                    for value in _switch_values(args, '--user-data-dir') if value):
                 result.append(process)
         except (psutil.Error, OSError, ValueError):

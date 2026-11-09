@@ -34,6 +34,15 @@ jobs:
           if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Candidate digest mismatch' }
           & (Join-Path $env:ProgramFiles '7-Zip/7z.exe') x $archive "-o$package" -y -bso0 -bsp0
           if ($LASTEXITCODE -ne 0) { throw 'Candidate extraction failed' }
+          $publicFiles = git ls-files app tools
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate source enumeration failed' }
+          foreach ($relative in $publicFiles) {
+            if ($relative -notmatch '^(app|tools)/' -or $relative -match '^app/(data|engines|local-engines|ui/output|ui/\.playwright-cli)/' -or $relative -match '(^|/)\.\.(/|$)') { throw 'Unexpected candidate source path' }
+            $source = Join-Path $env:GITHUB_WORKSPACE $relative
+            $destination = Join-Path $package $relative
+            New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+          }
           "IB_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Run the complete source checks
         shell: pwsh
@@ -41,6 +50,7 @@ jobs:
           & "$env:IB_PACKAGE/runtime/python/python.exe" -B tools/check_project.py --report "$env:RUNNER_TEMP/source-check.json"
           if ($LASTEXITCODE -ne 0) { throw 'Source checks failed' }
       - name: Start a fresh manager
+        if: ${{ !cancelled() && env.IB_PACKAGE != '' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path analysis/reports -Force | Out-Null

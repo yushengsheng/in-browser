@@ -101,7 +101,7 @@ class ApplicationContracts(unittest.TestCase):
         from portable_paths import decode_record, decode_path, encode_record
         from local_state import LocalBrowserError
         with tempfile.TemporaryDirectory() as directory:
-            old, moved = Path(directory) / 'first', Path(directory) / 'moved'
+            old, moved = Path(directory).resolve() / 'first', Path(directory).resolve() / 'moved'
             old.mkdir()
             moved.mkdir()
             value = {'_runtime': {'profile_path': str(old / 'profiles/synthetic')}}

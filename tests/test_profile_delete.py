@@ -33,7 +33,7 @@ def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 class Fixture:
     def __init__(self,base,*,count=3):
-        self.root=Path(base)/'data';self.root.mkdir(parents=True,exist_ok=True)
+        self.root=Path(base).resolve()/'data';self.root.mkdir(parents=True,exist_ok=True)
         PortableVault(self.root).initialize()
         write_encrypted(self.root/'portable-mode.bin',{'format':1,'state':'ready'},root=self.root)
         self.configuration=SimpleNamespace(decode=lambda path:json.loads(Path(path).read_bytes()))
@@ -92,7 +92,7 @@ class Fixture:
 class ProfileDeleteTests(unittest.TestCase):
     def setUp(self):
         temporary=tempfile.TemporaryDirectory(prefix='profile-delete-synthetic-')
-        self.addCleanup(temporary.cleanup);self.base=Path(temporary.name);self.service=Fixture(self.base)
+        self.addCleanup(temporary.cleanup);self.base=Path(temporary.name).resolve();self.service=Fixture(self.base)
         guard=patch.object(profile_delete,'profile_processes',return_value=[])
         guard.start();self.addCleanup(guard.stop)
 

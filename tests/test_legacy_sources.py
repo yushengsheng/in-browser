@@ -38,7 +38,7 @@ def full(major='124',protection=None):
 class LegacySourceTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='legacy-source-test-');self.addCleanup(self.temp.cleanup)
-        self.base=Path(self.temp.name);self.root=self.base/'data';self.root.mkdir()
+        self.base=Path(self.temp.name).resolve();self.root=self.base/'data';self.root.mkdir()
         PortableVault(self.root).initialize()
         self.signer=LocalSigner(self.root)
         self.configuration=Configuration.__new__(Configuration)
@@ -187,7 +187,7 @@ class LegacySourceTests(unittest.TestCase):
 class FrozenSourceTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='frozen-source-test-');self.addCleanup(self.temp.cleanup)
-        self.base=Path(self.temp.name);self.root=self.base/'data';self.root.mkdir()
+        self.base=Path(self.temp.name).resolve();self.root=self.base/'data';self.root.mkdir()
         PortableVault(self.root).initialize();self.signer=LocalSigner(self.root)
         self.configuration=Configuration.__new__(Configuration)
         self.configuration._key=hashlib.sha256(b'synthetic frozen-source aes key').digest()

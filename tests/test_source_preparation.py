@@ -34,7 +34,7 @@ def full(identity=A):
 class SourcePreparationTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='source-prepare-test-');self.addCleanup(self.temp.cleanup)
-        self.base=Path(self.temp.name);self.root=self.base/'data';self.root.mkdir()
+        self.base=Path(self.temp.name).resolve();self.root=self.base/'data';self.root.mkdir()
         PortableVault(self.root).initialize()
         self.vendor=self.base/'vendor';self.vendor.mkdir()
         cache=self.vendor/'LocalCache';cache.mkdir()

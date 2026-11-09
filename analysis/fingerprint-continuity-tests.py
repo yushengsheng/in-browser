@@ -69,7 +69,7 @@ def raw_sample():
 class ContinuityTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='continuity-test-')
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.record = fixture(self.root)
         self.spawn_guard = patch('browser_core.subprocess.Popen', side_effect=AssertionError('Browser spawn forbidden'))
         self.spawn_guard.start()
