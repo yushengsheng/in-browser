@@ -56,6 +56,40 @@ def _inside(path, root, *, exists=True):
     return path.resolve()
 
 
+def _launch_core(argument, core, root):
+    """Accept an existing spelling only with file and parent identity proof."""
+    import local_engine as engine
+    candidate, core = Path(argument), Path(core)
+    _require(candidate.is_absolute() and candidate.samefile(core)
+             and candidate.parent.samefile(core.parent))
+    engine._plain_ancestors(candidate)
+    return _inside(core, root)
+
+
+def _current_core(record, store, controller, data, root):
+    """Authenticate the committed runtime after a production r1-to-r2 repair."""
+    from browser_core import sha256
+    from fingerprint_continuity import binding_for, _same_value
+    from local_engine import LocalEngineStore
+    current = store.get(IDENTITY)
+    runtime, original = current['_runtime'], record['_runtime']
+    _require(current.get('id') == IDENTITY and _same_value(current.get('_native'), record['_native'])
+             and _same_value(current.get('_continuity'), record['_continuity'])
+             and binding_for(current, data) == record['_continuity']['binding']
+             and runtime.get('signature_provider') == original.get('signature_provider') == 'local-v1'
+             and runtime.get('signature_key_id') == original.get('signature_key_id')
+             and str(runtime.get('core_major')) == str(original.get('core_major')) == CORE)
+    core = _inside(runtime['core_path'], root)
+    _require(core.is_relative_to(root / 'app/local-engines')
+             and runtime.get('core_sha256') == original.get('core_sha256') == sha256(core))
+    LocalEngineStore(root / 'app/local-engines').validate(core, original['signature_key_id'], CORE)
+    controlled = controller.profiles[IDENTITY]
+    _require(_inside(controlled['core_path'], root) == core
+             and all(controlled.get(field) == runtime.get(field) for field in (
+                 'core_sha256', 'core_major', 'signature_provider', 'signature_key_id')))
+    return core
+
+
 def _json_file(path, root, *, limit=65536):
     path = _inside(path, root)
     _require(path.is_file() and path.stat().st_size <= limit)
@@ -354,7 +388,8 @@ def main():
 
         def launch(arguments, *values, **options):
             _require(isinstance(arguments, (list, tuple)) and not options.get('shell'))
-            _require(_inside(arguments[0], ROOT) == Path(record['_runtime']['core_path']).resolve())
+            core = _current_core(record, service.store, service.controller, data, ROOT)
+            _require(_launch_core(arguments[0], core, ROOT) == core)
             profiles = [str(argument).split('=', 1)[1] for argument in arguments
                         if str(argument).startswith('--user-data-dir=')]
             _require(len(profiles) == 1)

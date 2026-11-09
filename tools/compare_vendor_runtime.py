@@ -115,13 +115,7 @@ def _stock_engine(record, fixture, root):
 
 
 def _launch_core(argument, core, fixture, root):
-    """Accept an existing spelling only with file and parent identity proof."""
-    import local_engine as engine
-    candidate, core = Path(argument), Path(core)
-    _require(candidate.is_absolute() and candidate.samefile(core)
-             and candidate.parent.samefile(core.parent))
-    engine._plain_ancestors(candidate)
-    return fixture._inside(core, root)
+    return fixture._launch_core(argument, core, root)
 
 
 def _snapshot(connection, session, record, storage, continuity):

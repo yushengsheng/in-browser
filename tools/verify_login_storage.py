@@ -273,7 +273,8 @@ def main(argv=None):
 
         def launch(arguments, *values, **kwargs):
             _require(isinstance(arguments, (list, tuple)) and not kwargs.get('shell'))
-            _require(fixture._inside(arguments[0], root) == Path(record['_runtime']['core_path']).resolve())
+            core = fixture._current_core(record, store, controller, data, root)
+            _require(fixture._launch_core(arguments[0], core, root) == core)
             profiles = [str(arg).split('=', 1)[1] for arg in arguments
                         if str(arg).startswith('--user-data-dir=')]
             _require(len(profiles) == 1)

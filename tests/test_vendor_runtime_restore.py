@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
+sys.path.insert(0, str(ROOT / 'tools'))
+import verify_portable_fixture
 import core_specs
 import local_engine as engine
 from cryptography.hazmat.primitives import serialization
@@ -24,6 +26,8 @@ specification.loader.exec_module(comparison)
 
 
 class Fixture:
+    _launch_core = staticmethod(verify_portable_fixture._launch_core)
+
     @staticmethod
     def _inside(path, root, *, exists=True):
         path = Path(path).resolve()
