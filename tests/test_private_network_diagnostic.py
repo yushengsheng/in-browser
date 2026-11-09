@@ -1,5 +1,7 @@
 """Bounded public-only network diagnostics; all transports and records synthetic."""
 import contextlib
+import base64
+import copy
 import importlib.util
 import io
 import json
@@ -76,6 +78,84 @@ class PrivateNetworkDiagnosticTests(unittest.TestCase):
         self.assertEqual(child.communicate.call_count, 2)
         self.assertNotIn('synthetic-private-host', repr(popen.call_args))
         self.assertNotIn('synthetic-private-host', json.dumps(result))
+
+    def test_http_connect_credentials_exist_only_in_the_proxy_request_before_tls(self):
+        connection=Mock();encrypted=[False]
+        incoming=b'HTTP/1.1 200 Connection Established\r\n\r\nHTTP/1.1 302 Found\r\nLocation: https://elsewhere.invalid/private\r\n\r\n'
+        connection.recv.side_effect=[bytes([value]) for value in incoming]
+        context=Mock()
+        def wrap(selected,server_hostname):
+            self.assertIs(selected,connection);self.assertEqual(server_hostname,'page.example.invalid')
+            encrypted[0]=True
+            return connection
+        context.wrap_socket.side_effect=wrap
+        requests=[]
+        def send(value):
+            requests.append((encrypted[0],value))
+        connection.sendall.side_effect=send
+        secret='synthetic-private-proxy-password'
+        proxy={'type':'http','host':'proxy.example.invalid','port':1234,'username':'fixture','password':secret}
+        payload={'mode':'upstream_http','host':'page.example.invalid','port':443,'proxy':proxy}
+        output=io.StringIO()
+        with patch.object(diagnostic.socket,'create_connection',return_value=connection) as connect, \
+                patch.object(diagnostic.ssl,'create_default_context',return_value=context), \
+                patch.object(diagnostic.threading,'Timer'),contextlib.redirect_stdout(output):
+            result=diagnostic.attempt(payload)
+        self.assertEqual(result['stage'],'complete');self.assertEqual(result['statusclass'],'3xx')
+        self.assertEqual(len(requests),2)
+        self.assertFalse(requests[0][0]);self.assertTrue(requests[1][0])
+        encoded=base64.b64encode(('fixture:'+secret).encode())
+        self.assertIn(b'Proxy-Authorization: Basic '+encoded,requests[0][1])
+        self.assertTrue(requests[0][1].startswith(b'CONNECT page.example.invalid:443 HTTP/1.1\r\n'))
+        self.assertTrue(requests[1][1].startswith(b'GET / HTTP/1.1\r\n'))
+        self.assertNotIn(b'Authorization:',requests[1][1]);self.assertNotIn(b'Cookie:',requests[1][1])
+        self.assertNotIn(b'/private',requests[1][1])
+        self.assertNotIn(secret,output.getvalue()+json.dumps(result))
+        self.assertNotIn(encoded.decode(),output.getvalue()+json.dumps(result))
+        connect.assert_called_once();connection.close.assert_called_once()
+
+    def test_http_protocol_uses_only_an_in_memory_record_and_keeps_saved_proxy(self):
+        import browser_processes,inspect_installation,manager_service,proxy_runtime,verify_private_session
+        with tempfile.TemporaryDirectory(prefix='http-protocol-unit-') as temporary:
+            root=Path(temporary).resolve();profile=root/'app/data/profiles/profile-synthetic';profile.mkdir(parents=True)
+            stable={'synthetic':True}
+            marker={'profile_id':'profile-synthetic','expected_stable_sha256':verify_private_session.digest(stable),
+                    'target_origin':'https://page.example.invalid'}
+            record={'id':'profile-synthetic','_native':{},'_portable_crypt':{'synthetic':True},
+                    '_continuity':{'stable':stable},'_runtime':{'signature_provider':'local-v1','profile_path':str(profile)},
+                    'proxy':{'type':'socks5','host':'proxy.example.invalid','port':1234,'username':'fixture','password':'synthetic'}}
+            original=copy.deepcopy(record)
+            catalog={'quick_check':True,'records':[record],'catalog_full_tables_sha256':'synthetic-fixed'}
+            service=SimpleNamespace(configuration=SimpleNamespace(independent=True),store=Mock())
+            service.store.all.return_value=[record]
+            runtime=Mock();active=[None];payloads=[]
+            runtime.state.side_effect=lambda _:active[0]
+            runtime.owned.side_effect=lambda value:active[0] is not None and value is active[0]
+            def ensure(value):
+                self.assertEqual(record,original)
+                self.assertEqual(value['proxy']['type'],'http')
+                for key in ('host','port','username','password'):self.assertEqual(value['proxy'][key],original['proxy'][key])
+                active[0]={'port':1234,'created':diagnostic.time.time()}
+                return active[0]
+            runtime.ensure.side_effect=ensure
+            runtime.control.return_value=True
+            runtime.stop_if_unused.side_effect=lambda _:active.__setitem__(0,None)
+            def bounded(payload):
+                payloads.append(copy.deepcopy(payload))
+                return {'mode':payload['mode'],'stage':'complete','seconds':0,'statusclass':'2xx','error_type':None}
+            with patch.object(verify_private_session,'load_marker',return_value=marker), \
+                    patch.object(inspect_installation,'read_catalog',return_value=catalog), \
+                    patch.object(browser_processes,'profile_processes',return_value=[]), \
+                    patch.object(manager_service,'ManagerService',return_value=service), \
+                    patch.object(proxy_runtime,'ProxyRuntime',return_value=runtime), \
+                    patch.object(diagnostic,'bounded_attempt',side_effect=bounded),contextlib.redirect_stdout(io.StringIO()):
+                report=diagnostic.run(root,'http')
+            self.assertTrue(report['success']);self.assertTrue(report['saved_proxy_unchanged'])
+            self.assertTrue(report['record_unchanged']);self.assertTrue(report['workers_closed'])
+            self.assertFalse(report['browser_started']);self.assertFalse(report['authentication_test'])
+            self.assertEqual(record,original);service.store.put.assert_not_called()
+            self.assertEqual([value['mode'] for value in payloads],['upstream_http','production_relay']*3)
+            self.assertEqual(runtime.stop_if_unused.call_count,3)
 
     def test_stage_deadline_exits_only_the_request_child_and_cleans_its_socket(self):
         import socks

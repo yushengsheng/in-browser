@@ -7,11 +7,19 @@ on:
         description: Compare the original upstream and local relay without opening the browser
         type: boolean
         default: false
+      network_protocol:
+        description: Transport to compare without changing the saved proxy
+        type: choice
+        options: [socks5, http]
+        default: socks5
   workflow_call:
     inputs:
       network_only:
         type: boolean
         default: false
+      network_protocol:
+        type: string
+        default: socks5
     secrets:
       IB_PRIVATE_ACCEPTANCE_KEY:
         required: true
@@ -123,8 +131,10 @@ jobs:
         if: ${{ inputs.network_only == true }}
         shell: pwsh
         run: |
-          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/diagnose_private_network.py" --execute --package "$env:IB_PRIVATE_PACKAGE" --report "$env:RUNNER_TEMP/private-network-diagnostic.json"
+          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/diagnose_private_network.py" --execute --package "$env:IB_PRIVATE_PACKAGE" --protocol "$env:IB_NETWORK_PROTOCOL" --report "$env:RUNNER_TEMP/private-network-diagnostic.json"
           if ($LASTEXITCODE -ne 0) { throw 'Private network diagnosis failed' }
+        env:
+          IB_NETWORK_PROTOCOL: ${{ inputs.network_protocol || 'socks5' }}
       - name: Remove the disposable private copy
         if: always()
         shell: pwsh

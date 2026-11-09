@@ -1,4 +1,4 @@
-"""Compare one private profile's original SOCKS5 and production local relay.
+"""Compare one private profile's SOCKS5/HTTP CONNECT and production local relay.
 
 Only an unauthenticated GET / of the authorized page origin is requested. No
 cookies, account requests, authorization headers, query, redirect or browser is
@@ -6,6 +6,7 @@ used. Private input travels only through local memory/anonymous child pipes.
 """
 from __future__ import annotations
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -114,6 +115,26 @@ def attempt(payload):
                                  username=proxy.get('username') or None, password=proxy.get('password') or None)
             socket_budget(connection, deadline)
             connection.connect((host, port))
+        elif mode == 'upstream_http':
+            proxy = payload['proxy']
+            require(proxy.get('type') == 'http')
+            progress('http_proxy_tcp')
+            connection = socket.create_connection((proxy['host'], int(proxy['port'])),
+                timeout=min(HANDSHAKE_TIMEOUT, deadline - time.monotonic()))
+            progress('http_proxy_connect')
+            connect_authority = ('[' + host + ']' if ':' in host else host) + ':' + str(port)
+            authorization = ''
+            if proxy.get('username') or proxy.get('password'):
+                require(not any(c in str(proxy.get('username', '')) + str(proxy.get('password', '')) for c in '\r\n\x00'))
+                encoded = base64.b64encode((proxy.get('username', '') + ':' + proxy.get('password', '')).encode('utf-8')).decode('ascii')
+                authorization = 'Proxy-Authorization: Basic ' + encoded + '\r\n'
+            socket_budget(connection, deadline)
+            connection.sendall(('CONNECT ' + connect_authority + ' HTTP/1.1\r\nHost: ' + connect_authority + '\r\n'
+                                + authorization + '\r\n').encode('ascii'))
+            status = headers(connection, deadline)
+            if status != 200:
+                result['statusclass'] = str(status // 100) + 'xx'
+                raise DiagnosticError()
         elif mode == 'production_relay':
             progress('relay_tcp')
             connection = socket.create_connection(('127.0.0.1', payload['relay_port']), timeout=min(HANDSHAKE_TIMEOUT, deadline - time.monotonic()))
@@ -178,7 +199,7 @@ def bounded_attempt(payload):
     return result
 
 
-def run(root):
+def run(root, protocol='socks5'):
     # The selected isolated package owns all defaults in the imported modules.
     sys.path[:0] = [str(root / 'app'), str(root / 'tools')]
     from inspect_installation import read_catalog
@@ -200,7 +221,12 @@ def run(root):
     require(parsed.scheme == 'https' and parsed.hostname and parsed.path in ('', '/') and not parsed.query and not parsed.fragment)
     proxy = normalize_proxy(record['proxy'])
     require(proxy['type'] == 'socks5')
+    require(protocol in ('socks5', 'http'))
+    proxy = {**proxy, 'type': protocol}
+    runtime_record = copy.deepcopy(record)
+    runtime_record['proxy'] = proxy
     report = {'success': False, 'browser_started': False, 'public_get_only': True, 'authentication_test': False,
+              'diagnostic_protocol': protocol, 'saved_proxy_unchanged': False,
               'rounds': [], 'workers_closed': False, 'record_unchanged': False}
     runtime = ProxyRuntime(data)
     prior = runtime.state(record['id'])
@@ -210,13 +236,14 @@ def run(root):
     try:
         for _ in range(3):
             require(not profile_processes(profile, require_inspectable=True))
-            payload = {'mode': 'upstream_socks5', 'host': parsed.hostname, 'port': parsed.port or 443, 'proxy': proxy}
+            payload = {'mode': 'upstream_http' if protocol == 'http' else 'upstream_socks5',
+                       'host': parsed.hostname, 'port': parsed.port or 443, 'proxy': proxy}
             direct = bounded_attempt(payload)
             report['rounds'].append(direct)
             print(json.dumps(direct), flush=True)
             require(not profile_processes(profile, require_inspectable=True))
             worker_started = time.time()
-            owned = runtime.ensure(copy.deepcopy(record))
+            owned = runtime.ensure(copy.deepcopy(runtime_record))
             require(owned and runtime.owned(owned) and runtime.control(owned))
             try:
                 relayed = bounded_attempt({'mode': 'production_relay', 'host': parsed.hostname, 'port': parsed.port or 443,
@@ -246,8 +273,9 @@ def run(root):
         after = read_catalog(data, time.monotonic() + 60)
         report['record_unchanged'] = (after['catalog_full_tables_sha256'] == before['catalog_full_tables_sha256']
                                       and len(after['records']) == 1 and digest(after['records'][0]) == saved)
+        report['saved_proxy_unchanged'] = len(after['records']) == 1 and after['records'][0].get('proxy') == record.get('proxy')
         report['browser_started'] = False
-        report['success'] &= report['workers_closed'] and report['record_unchanged']
+        report['success'] &= report['workers_closed'] and report['record_unchanged'] and report['saved_proxy_unchanged']
     return report
 
 
@@ -257,6 +285,7 @@ def main():
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--report', type=Path, default=WORK / 'private-network-diagnostic.json')
     parser.add_argument('--worker', action='store_true')
+    parser.add_argument('--protocol', choices=('socks5', 'http'), default='socks5')
     args = parser.parse_args()
     try:
         if args.worker:
@@ -270,7 +299,7 @@ def main():
             return 0
         root = args.package
         require(root is not None)
-        result = run(root.resolve())
+        result = run(root.resolve(), args.protocol)
     except Exception as error:
         result = {'success': False, 'error_type': type(error).__name__, 'browser_started': False}
     try:

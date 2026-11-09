@@ -13,6 +13,11 @@ on:
         description: Diagnose the authorized private copy network without opening a browser
         type: boolean
         default: false
+      network_protocol:
+        description: Transport to compare without changing the saved proxy
+        type: choice
+        options: [socks5, http]
+        default: socks5
 
 permissions:
   contents: write # Read the unpublished candidate release and its assets.
@@ -23,6 +28,7 @@ jobs:
     uses: ./.github/workflows/private-session-acceptance.yml
     with:
       network_only: ${{ inputs.network_only || false }}
+      network_protocol: ${{ inputs.network_protocol || 'socks5' }}
     secrets:
       IB_PRIVATE_ACCEPTANCE_KEY: ${{ secrets.IB_PRIVATE_ACCEPTANCE_KEY }}
 
