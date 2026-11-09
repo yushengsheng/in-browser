@@ -208,8 +208,12 @@ class EvidenceTests(unittest.TestCase):
                 return {'targetInfos': [{'type': 'page', 'url': TARGET + '/safe', 'targetId': str(i)} for i in range(3)]}
             if method == 'Target.attachToTarget':
                 return {'sessionId': 'page'}
+            if method == 'Target.getTargetInfo':
+                return {'targetInfo': {'type': 'page', 'url': TARGET + '/safe', 'targetId': '0'}}
             return {}
         self.assertEqual(verifier.attach_existing(Mock(call=call), marker()), ('0', 'page'))
+        self.assertEqual(calls,['Target.getTargets','Target.activateTarget','Target.getTargetInfo',
+            'Target.attachToTarget','Page.enable','Network.enable'])
         self.assertFalse(any(name in calls for name in ('Network.setCacheDisabled', 'Network.setBypassServiceWorker', 'Target.createTarget', 'Runtime.evaluate')))
 
     def test_sampling_detects_login_path_spa_route_or_target_loss(self):
@@ -285,6 +289,8 @@ class EvidenceTests(unittest.TestCase):
             if method == 'Target.getTargets':
                 return {'targetInfos': [{'type': 'page', 'url': TARGET + '/one?private=query#private-fragment', 'targetId': 'one'},
                     {'type': 'page', 'url': TARGET + '/two', 'targetId': 'two'}]}
+            if method == 'Target.getTargetInfo':
+                return {'targetInfo': {'type': 'page', 'url': TARGET + '/one?private=query#private-fragment', 'targetId': 'one'}}
             return {'sessionId': 'page'}
         connection.call.side_effect = call
         report = {}
@@ -304,6 +310,8 @@ class EvidenceTests(unittest.TestCase):
             if method == 'Target.attachToTarget':
                 self.assertEqual(params['targetId'], 'correct')
                 return {'sessionId': 'page'}
+            if method == 'Target.getTargetInfo':
+                return {'targetInfo': {'type': 'page', 'url': private_route, 'targetId': 'correct'}}
             return {}
         connection.call.side_effect = call
         value = marker()
@@ -319,6 +327,22 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(verifier.AcceptanceError):verifier.attach_existing(connection, value, report=report)
         self.assertEqual(report['page_selections'][0]['route_matching_page_count'], 0)
         self.assertEqual([args.args[0] for args in connection.call.call_args_list], ['Target.getTargets'])
+
+    def test_activation_identity_change_refuses_before_attaching_or_touching_other_pages(self):
+        for changed in (TARGET + '/changed', 'https://login.example.invalid/'):
+            calls=[]
+            def call(method,params=None,session=None):
+                calls.append((method,params))
+                if method=='Target.getTargets':
+                    return {'targetInfos':[{'targetId':'chosen','type':'page','url':TARGET+'/safe'},
+                        {'targetId':'other','type':'page','url':TARGET+'/other'}]}
+                if method=='Target.getTargetInfo':
+                    return {'targetInfo':{'targetId':'chosen','type':'page','url':changed}}
+                return {}
+            with self.subTest(changed=changed),self.assertRaises(verifier.AcceptanceError):
+                verifier.attach_existing(Mock(call=call),marker())
+            self.assertEqual(calls[1],('Target.activateTarget',{'targetId':'chosen'}))
+            self.assertFalse(any(name in ('Target.attachToTarget','Target.closeTarget','Target.createTarget','Page.navigate') for name,_ in calls))
 
 
 class EventRetentionTests(unittest.TestCase):
@@ -345,8 +369,28 @@ class EventRetentionTests(unittest.TestCase):
     def test_command_error_does_not_reflect_remote_details(self):
         connection, _socket = self.connection([{'id': 1, 'error': {'message': 'synthetic-private-detail'}}])
         with self.assertRaises(verifier.CommandRejected) as raised:
+            connection.stage='page_enable'
             connection.call('Browser.getVersion')
         self.assertEqual(str(raised.exception), '')
+        result=verifier.error_diagnostics(raised.exception)
+        self.assertEqual(result['cdp_method'],'Browser.getVersion')
+        self.assertEqual(result['cdp_stage'],'page_enable')
+
+    def test_command_timeout_records_only_allowlisted_method_and_stage(self):
+        connection,_socket=self.connection([])
+        connection.stage='page_enable'
+        with patch.object(connection,'_receive',side_effect=TimeoutError('synthetic-private-detail')):
+            with self.assertRaises(TimeoutError) as raised:connection.call('Page.enable')
+        result=verifier.error_diagnostics(raised.exception)
+        self.assertEqual(result['cdp_method'],'Page.enable')
+        self.assertEqual(result['cdp_stage'],'page_enable')
+        self.assertNotIn('synthetic-private-detail',json.dumps(result))
+        connection.stage='synthetic-private-stage'
+        with patch.object(connection,'_receive',side_effect=TimeoutError()):
+            with self.assertRaises(TimeoutError) as raised:connection.call('synthetic-private-method')
+        result=verifier.error_diagnostics(raised.exception)
+        self.assertNotIn('cdp_method',result)
+        self.assertNotIn('cdp_stage',result)
 
 
 class OwnershipAndOutputTests(unittest.TestCase):

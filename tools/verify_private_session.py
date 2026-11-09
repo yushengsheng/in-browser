@@ -29,6 +29,11 @@ MAX_BODY = 1024 * 1024
 MAX_EVENTS = 2048
 MAX_EVENT_BYTES = 4 * MAX_BODY
 AUTH_TIMEOUT = 60
+CDP_METHODS = frozenset(('Browser.getVersion', 'Target.getTargets', 'Target.getTargetInfo',
+    'Target.activateTarget', 'Target.attachToTarget', 'Target.detachFromTarget',
+    'Page.enable', 'Page.reload', 'Network.enable', 'Network.getResponseBody', 'Runtime.evaluate'))
+CDP_STAGES = frozenset(('page_selection', 'page_activation', 'page_identity_confirmation',
+    'page_attachment', 'page_enable', 'network_enable', 'authentication', 'page_diagnostic', 'continuous_hold'))
 EVENTS = frozenset(('Network.requestWillBeSent', 'Network.responseReceived',
                     'Network.loadingFinished', 'Network.loadingFailed',
                     'Network.requestServedFromCache', 'Page.frameNavigated',
@@ -67,6 +72,11 @@ def error_diagnostics(error):
     result = {'error_type': type(error).__name__, 'frames': [
         {'file': Path(frame.filename).name, 'line': frame.lineno}
         for frame in traceback.extract_tb(error.__traceback__)[-8:]]}
+    method, stage = getattr(error, 'cdp_method', None), getattr(error, 'cdp_stage', None)
+    if isinstance(method, str) and method in CDP_METHODS:
+        result['cdp_method'] = method
+    if isinstance(stage, str) and stage in CDP_STAGES:
+        result['cdp_stage'] = stage
     if getattr(error, 'code', None) == 'ip_info_failed':
         operations = frozenset(('Target.getTargets', 'Target.attachToTarget', 'Page.reload',
             'Target.detachFromTarget', 'Target.createTarget', 'Target.closeTarget', 'Target.activateTarget'))
@@ -273,6 +283,7 @@ class EventCDP:
         self.next_id = 0
         self.pending = deque()
         self.pending_bytes = 0
+        self.stage = None
 
     def _receive(self, deadline):
         import websocket
@@ -301,17 +312,24 @@ class EventCDP:
         command = {'id': self.next_id, 'method': method, 'params': params or {}}
         if session:
             command['sessionId'] = session
-        self.connection.send(json.dumps(command))
-        deadline = time.monotonic() + self.timeout
-        while True:
-            value = self._receive(deadline)
-            if value is not None and value.get('id') == self.next_id:
-                if 'error' in value:
-                    raise CommandRejected()
-                result = value.get('result', {})
-                if not isinstance(result, dict):
-                    raise AcceptanceError()
-                return result
+        try:
+            self.connection.send(json.dumps(command))
+            deadline = time.monotonic() + self.timeout
+            while True:
+                value = self._receive(deadline)
+                if value is not None and value.get('id') == self.next_id:
+                    if 'error' in value:
+                        raise CommandRejected()
+                    result = value.get('result', {})
+                    if not isinstance(result, dict):
+                        raise AcceptanceError()
+                    return result
+        except Exception as error:
+            if method in CDP_METHODS:
+                error.cdp_method = method
+            if isinstance(self.stage, str) and self.stage in CDP_STAGES:
+                error.cdp_stage = self.stage
+            raise
 
     def events(self):
         values = list(self.pending)
@@ -448,6 +466,7 @@ def body_matches(response, rule):
 
 
 def page_diagnostics(connection, session):
+    connection.stage = 'page_diagnostic'
     reply = connection.call('Runtime.evaluate', {'expression': _PAGE_DIAGNOSTIC, 'returnByValue': True}, session=session)
     value = reply.get('result', {}).get('value')
     if reply.get('exceptionDetails') or not isinstance(value, dict):
@@ -463,6 +482,7 @@ def page_diagnostics(connection, session):
 
 
 def authenticate(connection, session, rule, *, keepalive=None, report=None):
+    connection.stage = 'authentication'
     connection.events()
     responses = AuthResponses(session, rule)
     diagnostics = {'authenticated': False, 'timed_out': False}
@@ -472,6 +492,7 @@ def authenticate(connection, session, rule, *, keepalive=None, report=None):
         while time.monotonic() < deadline:
             if keepalive:
                 keepalive()
+            connection.stage = 'authentication'
             for identity in responses.consume(connection.events()):
                 try:
                     body = connection.call('Network.getResponseBody', {'requestId': identity}, session=session)
@@ -501,6 +522,7 @@ def authenticate(connection, session, rule, *, keepalive=None, report=None):
 
 
 def attach_existing(connection, marker, report=None):
+    connection.stage = 'page_selection'
     targets = connection.call('Target.getTargets').get('targetInfos', [])
     matches = []
     for target in targets:
@@ -524,8 +546,20 @@ def attach_existing(connection, marker, report=None):
     if not matches:
         raise AcceptanceError()
     target = matches[0]['targetId']
+    selected_route = _route_digest(matches[0]['url'])
+    connection.stage = 'page_activation'
+    connection.call('Target.activateTarget', {'targetId': target})
+    connection.stage = 'page_identity_confirmation'
+    current = connection.call('Target.getTargetInfo', {'targetId': target})['targetInfo']
+    if (current.get('targetId') != target or current.get('type') != 'page'
+            or origin(current.get('url')) != marker['target_origin']
+            or _route_digest(current['url']) != selected_route):
+        raise AcceptanceError()
+    connection.stage = 'page_attachment'
     session = connection.call('Target.attachToTarget', {'targetId': target, 'flatten': True})['sessionId']
+    connection.stage = 'page_enable'
     connection.call('Page.enable', session=session)
+    connection.stage = 'network_enable'
     connection.call('Network.enable', {'maxResourceBufferSize': MAX_BODY, 'maxTotalBufferSize': 2 * MAX_BODY,
                                      'maxPostDataSize': 0}, session=session)
     return target, session
@@ -599,6 +633,7 @@ def run(root, marker, duration, report):
                     nonlocal next_heartbeat
                     if not force and time.monotonic() < next_heartbeat:
                         return
+                    connection.stage = 'continuous_hold'
                     connection.call('Browser.getVersion')
                     current_route = target_route(connection, target, marker)
                     if expected_route is not None and current_route != expected_route:
