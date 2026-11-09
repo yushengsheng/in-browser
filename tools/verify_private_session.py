@@ -49,6 +49,8 @@ def error_diagnostics(error):
     result = {'error_type': type(error).__name__, 'frames': [
         {'file': Path(frame.filename).name, 'line': frame.lineno}
         for frame in traceback.extract_tb(error.__traceback__)[-8:]]}
+    if getattr(error, 'code', None) == 'engine_path_too_long':
+        result['reason_code'] = 'engine_path_too_long'
     if isinstance(fields, list) and fields:
         result['reason_code'] = 'continuity_gate'
         result['continuity_changed_fields'] = sorted({f for f in fields if isinstance(f, str) and f in DIAGNOSTIC_FIELDS})

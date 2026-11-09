@@ -78,7 +78,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $package = Join-Path $env:RUNNER_TEMP 'ib-private-acceptance'
+          $package = Join-Path $env:RUNNER_TEMP 'ib'
           if (Test-Path -LiteralPath $package) { throw 'Acceptance target must be new' }
           New-Item -ItemType Directory -Path $package | Out-Null
           Copy-Item -LiteralPath app,tools -Destination $package -Recurse
@@ -112,7 +112,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $expected = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'ib-private-acceptance'))
+          $expected = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'ib'))
           if ($env:IB_PRIVATE_PACKAGE) {
             $target = [IO.Path]::GetFullPath($env:IB_PRIVATE_PACKAGE)
             if ($target -ne $expected) { throw 'Unexpected cleanup target' }
