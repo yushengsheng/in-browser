@@ -305,9 +305,10 @@ class ManagerService:
             if not already and (getattr(self.configuration,'independent',False) or p['_runtime'].get('signature_provider')=='local-v1'):
                 from local_runtime import LocalRuntime
                 p=LocalRuntime(self).prepare(p)
+            environment_args=[]
             if not already and (self.root/'continuity-mode.bin').is_file():
                 from fingerprint_continuity import verify_continuity
-                verify_continuity(p,self.root)
+                environment_args=verify_continuity(p,self.root).get('environment_args',[])
             if not already and (self.root/'portable-mode.bin').is_file():
                 from portable_browser import prepare_profile
                 if not p.get('_portable_crypt'):raise LocalBrowserError('此窗口尚未准备便携加密资料，未启动，避免丢失登录数据。')
@@ -326,8 +327,12 @@ class ManagerService:
                     if not self.proxy_runtime.owned(route) or not self.proxy_runtime.control(route):
                         raise LocalBrowserError('本地代理在检测期间退出，未启动浏览器，也未改为直连。')
             if not already:
-                p['_runtime']=self._runtime(p,p['_runtime']); self._sync(p)
+                p['_runtime']=self._runtime(p,p['_runtime'])
+                p['_runtime'].pop('environment_args',None)
+                self._sync(p)
                 self._preferences(p)
+                p['_runtime']['environment_args']=environment_args
+                self._sync(p)
             bootstrap_blank=bool(p.get('_cookie_pending') and p['_runtime'].get('new_profile') and not p['_runtime'].get('has_launched'))
             route=None
             try:
@@ -365,6 +370,7 @@ class ManagerService:
                 if not already: p['last_opened_at']=now()
                 p['launch_verified']=True; p['_runtime']['new_profile']=False; p['_runtime']['has_launched']=True
                 p['_runtime'].pop('window_size_once',None); p['_runtime'].pop('open_urls_once',None)
+                p['_runtime'].pop('environment_args',None)
                 self.store.put(p); self._sync(p)
             except Exception:
                 if not already:

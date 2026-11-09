@@ -60,6 +60,20 @@ class BackgroundProbeTests(unittest.TestCase):
         call,_,_,_=self.launch(background=False)
         self.assertFalse(any(arg.startswith('--headless') for arg in call.args[0]))
 
+    def test_verified_environment_flags_are_shared_by_probe_and_normal_launch(self):
+        environment=['--force-prefers-no-reduced-motion','--use-angle=d3d11','--ignore-gpu-blocklist']
+        for background in (True,False):
+            with self.subTest(background=background):
+                call,_,_,_=self.launch(background=background,changes={'environment_args':environment})
+                for argument in environment:self.assertEqual(call.args[0].count(argument),1)
+                self.assertEqual(self.runtime['launch_args'],[])
+
+    def test_environment_flags_cannot_inject_proxy_or_unsupported_options(self):
+        for arguments in (['--proxy-server=http://fixture.invalid'],['--use-angle=swiftshader'],
+                          ['--ignore-gpu-blocklist'],['--force-prefers-reduced-motion','--force-prefers-no-reduced-motion']):
+            with self.subTest(arguments=arguments),self.assertRaises(core.LocalBrowserError):
+                self.launch(changes={'environment_args':arguments},expect_no_launch=True)
+
     def test_background_mode_rejects_account_or_nonisolated_launch_before_popen(self):
         cases=[{'offline':False},{'blank':False},{'urls':['https://synthetic.invalid/']},
                {'changes':{'new_profile':False}},{'changes':{'restore_session':True}},

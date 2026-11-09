@@ -68,6 +68,45 @@ jobs:
         run: |
           & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_portable_fixture.py" --execute
           if ($LASTEXITCODE -ne 0) { throw 'Cross-device acceptance failed' }
+      - name: Load synthetic login storage from the source device
+        if: ${{ !cancelled() && env.IB_PACKAGE != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download validation-v0.1.0 --repo $env:GITHUB_REPOSITORY --pattern portable-login-data-v0.1.0.zip --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Login sample download failed' }
+          $archive = Join-Path $env:RUNNER_TEMP 'portable-login-data-v0.1.0.zip'
+          $expected = (Get-Content -LiteralPath '.github/portable-login.sha256' -Raw).Trim()
+          if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Login sample digest mismatch' }
+          $data = [IO.Path]::GetFullPath((Join-Path $env:IB_PACKAGE 'app/data'))
+          $owned = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'ib/app/data'))
+          if ($data -ne $owned) { throw 'Unexpected test data target' }
+          $read = [IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            if ($read.Entries.Count -gt 40000 -or (($read.Entries | Measure-Object -Property Length -Sum).Sum -gt 512MB)) { throw 'Login sample budget exceeded' }
+            foreach ($entry in $read.Entries) {
+              if ($entry.FullName -notmatch '^app/data/' -or $entry.FullName -match '(^|/)\.\.(/|$)|:|\\') { throw 'Unexpected login sample member' }
+            }
+          } finally { $read.Dispose() }
+          $active = @(Get-CimInstance Win32_Process -Filter "Name='BitBrowser.exe'" | Where-Object {
+            -not $_.ExecutablePath -or ([IO.Path]::GetFullPath($_.ExecutablePath)).StartsWith(([IO.Path]::GetFullPath($env:IB_PACKAGE) + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)
+          })
+          if ($active.Count -ne 0) { throw 'Owned test browser still running' }
+          if (Test-Path -LiteralPath $data) {
+            if ((Get-Item -LiteralPath $data).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Linked test data target' }
+            $links = @(Get-ChildItem -LiteralPath $data -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })
+            if ($links.Count -ne 0) { throw 'Linked test data member' }
+            Remove-Item -LiteralPath $data -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:IB_PACKAGE -Force
+          "IB_LOGIN_READY=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Verify login storage on the new Windows user without accepting device compatibility
+        if: ${{ !cancelled() && env.IB_LOGIN_READY == 'true' }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_login_storage.py" --execute --storage-only-diagnostic
+          if ($LASTEXITCODE -ne 0) { throw 'Login storage preservation failed' }
       - name: Keep only anonymous acceptance reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -78,5 +117,6 @@ jobs:
             analysis/reports/clean-start.json
             ${{ env.IB_PACKAGE }}/analysis/reports/portable-device.json
             ${{ env.IB_PACKAGE }}/analysis/reports/portable-candidates.json
+            ${{ env.IB_PACKAGE }}/analysis/reports/login-storage.json
           if-no-files-found: warn
           retention-days: 14

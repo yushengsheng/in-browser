@@ -112,7 +112,7 @@ def _database_check(path, root, queries):
                 connection.close()
 
 
-def load_fixture(root):
+def load_fixture(root, *, allow_session_cookie=False):
     """Authenticate the test identity before allowing production startup code."""
     from inspect_installation import baseline_structure_valid, read_catalog
     from local_state import read_encrypted
@@ -183,11 +183,21 @@ def load_fixture(root):
              and isinstance(native.get('userAgent'), str)
              and type(native['navigator'].get('hardwareConcurrency')) is int)
     cookies = profile / 'Default/Network/Cookies'
-    _database_check(cookies, root, [
-        ('SELECT count(*) FROM cookies WHERE name != ? OR host_key NOT IN (?,?)',
-         ('portable_release', 'localhost', '.localhost'), [(0,)]),
+    cookie_queries=[
         ('SELECT count(*) FROM cookies WHERE name = ?', ('portable_release',), [(1,)]),
-    ])
+    ]
+    if allow_session_cookie:
+        cookie_queries.extend([
+            ('SELECT count(*) FROM cookies WHERE name NOT IN (?,?) OR host_key NOT IN (?,?)',
+             ('portable_release','portable_session','localhost','.localhost'),[(0,)]),
+            ('SELECT count(*) FROM cookies WHERE name=?',('portable_session',),[(1,)]),
+            ('SELECT count(*) FROM cookies WHERE name=? AND is_persistent=0 AND has_expires=0 AND expires_utc=0',
+             ('portable_session',),[(1,)]),
+        ])
+    else:
+        cookie_queries.append(('SELECT count(*) FROM cookies WHERE name != ? OR host_key NOT IN (?,?)',
+                               ('portable_release','localhost','.localhost'),[(0,)]))
+    _database_check(cookies,root,cookie_queries)
     for relative in ('Default/Login Data', 'Default/Login Data For Account'):
         if (profile / relative).exists():
             _database_check(profile / relative, root, [('SELECT count(*) FROM logins', (), [(0,)])])
@@ -361,7 +371,12 @@ def main():
                 except browser_core.LocalBrowserError as error:
                     if str(error).startswith('环境连续性检查'):
                         report['continuity_rejected'] = True
-                        _diagnose(service.store.get(IDENTITY), data, report)
+                        fields=getattr(error,'changed_fields',None)
+                        if isinstance(fields,list):
+                            import fingerprint_continuity as continuity
+                            report['continuity_changed_fields']=[field for field in fields if continuity._safe_field(field)]
+                            report['continuity_diagnosed']=True
+                        else:_diagnose(service.store.get(IDENTITY), data, report)
                     raise
                 checks = _observe(service, marker['marker'], record['_native'])
                 report['rounds'].append(checks)

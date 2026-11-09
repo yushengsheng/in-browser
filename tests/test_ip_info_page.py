@@ -106,5 +106,32 @@ class ManagerRouteTests(unittest.TestCase):
         self.assertNotIn('synthetic private detail',str(failure.exception))
         service.controller.close.assert_not_called();self.assertEqual(record['proxy'],before['proxy'])
 
+    def test_continuity_verified_arguments_reach_real_launch_without_changing_native(self):
+        service,record=self.service();record['_native']={'synthetic':True};native=copy.deepcopy(record['_native'])
+        arguments=['--force-prefers-no-reduced-motion','--use-angle=d3d11','--ignore-gpu-blocklist']
+        observed=[]
+        def launch(*values,**options):
+            observed.extend(record['_runtime'].get('environment_args',[]));options['before_launch']()
+        service.controller.open.side_effect=launch
+        with tempfile.TemporaryDirectory() as directory:
+            service.root=Path(directory);(service.root/'continuity-mode.bin').write_bytes(b'synthetic')
+            with patch('fingerprint_continuity.verify_continuity',return_value={'environment_args':arguments}) as verify:
+                self.run_open(service)
+        verify.assert_called_once();self.assertEqual(observed,arguments)
+        self.assertNotIn('environment_args',record['_runtime'])
+        service.controller.open.assert_called_once();self.assertEqual(record['_native'],native)
+
+    def test_incompatible_device_stops_before_cookie_rewrap_preferences_or_launch(self):
+        service,_=self.service()
+        with tempfile.TemporaryDirectory() as directory:
+            service.root=Path(directory)
+            for name in ('continuity-mode.bin','portable-mode.bin'):(service.root/name).write_bytes(b'synthetic')
+            with patch('fingerprint_continuity.verify_continuity',side_effect=LocalBrowserError('环境连续性检查未通过（fonts.metrics）')), \
+                    patch('portable_browser.prepare_profile') as rewrap:
+                with self.assertRaises(LocalBrowserError):service.open('synthetic')
+        rewrap.assert_not_called();service._preferences.assert_not_called()
+        service.proxy_runtime.ensure.assert_not_called();service.controller.open.assert_not_called()
+        service.store.put.assert_not_called()
+
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -23,6 +23,7 @@ import uuid
 
 from browser_core import APP_ROOT, BrowserController, CDP, sha256
 from browser_processes import profile_processes
+from environment_compatibility import compatibility_candidate, validated_environment_args
 from local_state import LocalBrowserError
 
 
@@ -260,10 +261,20 @@ def _safe_field(field):
     return isinstance(field, str) and bool(re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]{0,79}', field))
 
 
-def _blocked(fields):
+def _blocked(fields, *, environment_args=None):
     safe = sorted({field for field in fields if _safe_field(field)})
     names = '、'.join(safe[:16]) or 'probe'
-    return LocalBrowserError('环境连续性检查未通过（' + names + '），未启动真实窗口；原资料和基线已保留。')
+    categories = []
+    for prefix, category in (('fonts.', '字体'), ('canvas.', '绘图'),
+                             ('webgl', '绘图'), ('audio.', '音视频设备'),
+                             ('devices.', '音视频设备'), ('screen.', '显示偏好')):
+        if any(field.startswith(prefix) for field in safe) and category not in categories:
+            categories.append(category)
+    detail = '；涉及' + '、'.join(categories) if categories else ''
+    error = LocalBrowserError('环境连续性检查未通过（' + names + detail + '），未启动真实窗口；原资料和基线已保留。')
+    error.changed_fields = safe
+    error.environment_args = validated_environment_args({'environment_args': environment_args or []})
+    return error
 
 
 def _launch_arguments(runtime):
@@ -716,12 +727,34 @@ def verify_continuity(record, root):
     current = binding_for(record, root)
     if baseline.get('binding') != current:
         raise _blocked(['binding'])
-    actual = probe_snapshot(record, root)
-    changes = [key for key, value in stable.items() if key not in actual['values'] or actual['values'][key] != value or key in actual.get('unstable', [])]
-    if changes:
-        raise _blocked(changes)
+
+    # A previous run's choice is not evidence for this run. Always measure the
+    # original environment first, without changing the persisted record.
+    probe_record = copy.deepcopy(record)
+    probe_record['_runtime']['environment_args'] = []
+    actual = probe_snapshot(probe_record, root)
     if binding_for(record, root) != current:
         raise _blocked(['binding'])
+    missing_or_unstable = [key for key in stable
+                           if key not in actual['values'] or key in actual.get('unstable', [])]
+    if missing_or_unstable:
+        raise _blocked(missing_or_unstable)
+    changes = [key for key, value in stable.items() if actual['values'][key] != value]
+    environment_args = []
+    if changes:
+        environment_args = compatibility_candidate(stable, changes)
+        if not environment_args:
+            raise _blocked(changes)
+        probe_record['_runtime']['environment_args'] = environment_args
+        actual = probe_snapshot(probe_record, root)
+        if binding_for(record, root) != current:
+            raise _blocked(['binding'], environment_args=environment_args)
+        changes = [key for key, value in stable.items()
+                   if key not in actual['values'] or actual['values'][key] != value
+                   or key in actual.get('unstable', [])]
+        if changes:
+            raise _blocked(changes, environment_args=environment_args)
     return {'passed': True, 'stable_fields': len(stable),
             'unstable_fields': list(baseline.get('unstable') or []),
-            'unavailable_fields': list(baseline.get('unavailable') or [])}
+            'unavailable_fields': list(baseline.get('unavailable') or []),
+            'environment_args': environment_args}

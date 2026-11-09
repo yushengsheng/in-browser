@@ -458,6 +458,8 @@ class BrowserController:
             validate_launch_args(item.get('launch_args') or [],proxy_active=bool(item.get('local_proxy_mode')))
             for argument in item.get('launch_args') or []:
                 args.append(argument)
+            from environment_compatibility import validated_environment_args
+            args.extend(validated_environment_args(item))
             if item.get('account_platform') and (item.get('account_username') or item.get('account_password')):
                 args.extend(['--website-url='+item['account_platform'].rstrip('/')+'/',
                              '--website-username='+item.get('account_username',''),'--website-password='+item.get('account_password','')])
