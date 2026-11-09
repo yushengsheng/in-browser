@@ -46,6 +46,38 @@ class InfoTabTests(unittest.TestCase):
         connection=self.connection([]);connection.call.side_effect=lambda *args,**kwargs:{}
         with self.assertRaises(LocalBrowserError):show_ip_info(connection)
 
+    def test_each_cdp_failure_has_a_fixed_operation_without_original_private_text(self):
+        for operation in ('Target.getTargets','Target.attachToTarget','Page.reload',
+                          'Target.detachFromTarget','Target.createTarget','Target.activateTarget'):
+            pages=[] if operation=='Target.createTarget' else [{'type':'page','url':IP_INFO_URL,'targetId':'info'}]
+            connection=self.connection(pages);original=connection.call.side_effect
+            def call(method,params=None,session=None):
+                if method==operation:raise TimeoutError('synthetic-private-account-or-proxy')
+                return original(method,params,session)
+            connection.call.side_effect=call
+            with self.subTest(operation=operation),self.assertRaises(LocalBrowserError) as failure:
+                show_ip_info(connection)
+            self.assertEqual(failure.exception.code,'ip_info_failed')
+            self.assertEqual(failure.exception.operation,operation)
+            self.assertEqual(failure.exception.cause_type,'TimeoutError')
+            self.assertNotIn('synthetic-private',str(failure.exception))
+            if operation=='Page.reload':
+                connection.call.assert_any_call('Target.detachFromTarget',{'sessionId':'info-session'})
+
+    def test_detach_failure_cannot_mask_the_primary_reload_failure(self):
+        connection=self.connection([{'type':'page','url':IP_INFO_URL,'targetId':'info'}])
+        original=connection.call.side_effect
+        def call(method,params=None,session=None):
+            if method=='Page.reload':raise TimeoutError('synthetic-private-primary')
+            if method=='Target.detachFromTarget':raise OSError('synthetic-private-cleanup')
+            return original(method,params,session)
+        connection.call.side_effect=call
+        with self.assertRaises(LocalBrowserError) as failure:show_ip_info(connection)
+        self.assertEqual(failure.exception.operation,'Page.reload')
+        self.assertEqual(failure.exception.cause_type,'TimeoutError')
+        self.assertIs(failure.exception.cleanup_failed,True)
+        self.assertNotIn('synthetic-private',str(failure.exception))
+
 
 class ManagerRouteTests(unittest.TestCase):
     def setUp(self):
@@ -148,7 +180,24 @@ class ManagerRouteTests(unittest.TestCase):
         with patch('manager_service.require_current_signature'),patch('manager_service.CDP'),patch('ip_info_page.show_ip_info',side_effect=RuntimeError('synthetic private detail')):
             with self.assertRaisesRegex(LocalBrowserError,'浏览器已打开，但IP信息页未能打开') as failure:service.open('synthetic')
         self.assertNotIn('synthetic private detail',str(failure.exception))
+        self.assertEqual(failure.exception.code,'ip_info_failed')
+        self.assertEqual(failure.exception.operation,'unknown')
+        self.assertEqual(failure.exception.cause_type,'RuntimeError')
         service.controller.close.assert_not_called();self.assertEqual(record['proxy'],before['proxy'])
+
+    def test_ip_page_safe_diagnostics_survive_manager_wrapping_without_closing_window(self):
+        service,record=self.service();record['_native']={'synthetic':True};before=copy.deepcopy(record)
+        error=LocalBrowserError('synthetic-private-account-or-proxy')
+        error.operation='Page.reload';error.cause_type='WebSocketTimeoutException';error.cleanup_failed=True
+        with patch('manager_service.require_current_signature'),patch('manager_service.CDP'), \
+                patch('ip_info_page.show_ip_info',side_effect=error):
+            with self.assertRaises(LocalBrowserError) as failure:service.open('synthetic')
+        self.assertEqual(failure.exception.operation,'Page.reload')
+        self.assertEqual(failure.exception.cause_type,'WebSocketTimeoutException')
+        self.assertIs(failure.exception.cleanup_failed,True)
+        self.assertNotIn('synthetic-private',str(failure.exception))
+        self.assertEqual(record['_native'],before['_native'])
+        service.controller.close.assert_not_called()
 
     def test_continuity_verified_arguments_reach_real_launch_without_changing_native(self):
         service,record=self.service();record['_native']={'synthetic':True};native=copy.deepcopy(record['_native'])

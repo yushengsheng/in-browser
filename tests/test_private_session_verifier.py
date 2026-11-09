@@ -219,6 +219,73 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(verifier.CommandRejected):
             verifier.target_route(connection, 'gone', marker())
 
+    def test_timeout_keeps_anonymous_network_counts_and_fixed_readonly_page_flags(self):
+        secret = 'synthetic-private-value-not-for-report'
+        class Connection:
+            def __init__(self):
+                self.pending = []
+                self.calls = []
+            def events(self):
+                values, self.pending = self.pending, []
+                return values
+            def call(self, method, params=None, session=None):
+                self.calls.append((method, params))
+                if method == 'Page.reload':
+                    self.pending = response_events(worker=True) + [
+                        event('requestWillBeSent', identity='other', request={'method': 'GET', 'url': API + '/unmatched?' + secret}),
+                        event('loadingFailed', identity='other', errorText='net::ERR_PROXY_CONNECTION_FAILED'),
+                        event('loadingFailed', identity='private-error', errorText=secret),
+                        {'sessionId': 'page', 'method': 'Page.loadEventFired', 'params': {'private': secret}}]
+                    return {}
+                if method == 'Runtime.evaluate':
+                    self.assert_fixed = params['expression'] == verifier._PAGE_DIAGNOSTIC
+                    return {'result': {'value': {'readyComplete': True, 'hasPasswordInput': False,
+                        'loginPrompt': True, 'trafficError': False, 'bodyEmpty': False,
+                        'iframeCount': 3, 'localStorageCount': 4, 'localStorageAccessible': True,
+                        'body': secret, 'url': secret, 'extra': secret}}}
+                raise AssertionError()
+        connection = Connection()
+        report = {'counts': {'rejected_evidence': 0}}
+        with patch.object(verifier, 'AUTH_TIMEOUT', 0), self.assertRaises(verifier.EvidenceTimeout):
+            verifier.authenticate(connection, 'page', marker()['auth_rule'], report=report)
+        result = report['authentication_attempts'][0]
+        self.assertTrue(result['timed_out'])
+        self.assertFalse(result['authenticated'])
+        self.assertEqual(result['counts']['requests_total'], 2)
+        self.assertEqual(result['counts']['request_origin_matches'], 2)
+        self.assertEqual(result['counts']['request_url_matches'], 1)
+        self.assertEqual(result['counts']['status_2xx'], 1)
+        self.assertEqual(result['counts']['service_worker_skipped'], 1)
+        self.assertEqual(result['counts']['page_events'], 1)
+        self.assertEqual(result['network_errors']['net::ERR_PROXY_CONNECTION_FAILED'], 1)
+        self.assertEqual(result['network_errors']['other'], 1)
+        self.assertEqual(report['counts']['rejected_evidence'], 1)
+        self.assertEqual(result['page']['iframeCount'], 3)
+        self.assertTrue(connection.assert_fixed)
+        self.assertNotIn(secret, json.dumps(report))
+        self.assertEqual([name for name, _ in connection.calls], ['Page.reload', 'Runtime.evaluate'])
+
+    def test_page_diagnostics_filter_types_and_never_return_remote_text(self):
+        connection = Mock()
+        connection.call.return_value = {'result': {'value': {'readyComplete': 'private-text',
+            'iframeCount': True, 'localStorageCount': -1, 'body': 'private-text'}}}
+        self.assertEqual(verifier.page_diagnostics(connection, 'page'), {'available': True})
+
+    def test_selected_page_summary_reports_counts_and_flags_without_urls_or_hashes(self):
+        connection = Mock()
+        def call(method, params=None, session=None):
+            if method == 'Target.getTargets':
+                return {'targetInfos': [{'type': 'page', 'url': TARGET + '/one?private=query#private-fragment', 'targetId': 'one'},
+                    {'type': 'page', 'url': TARGET + '/two', 'targetId': 'two'}]}
+            return {'sessionId': 'page'}
+        connection.call.side_effect = call
+        report = {}
+        verifier.attach_existing(connection, marker(), report=report)
+        self.assertEqual(report, {'page_selections': [{'same_origin_page_count': 2,
+            'same_origin_routes_equal': False, 'selected_query_present': True, 'selected_fragment_present': True}]})
+        self.assertNotIn(TARGET, json.dumps(report))
+        self.assertNotIn('private', json.dumps(report))
+
 
 class EventRetentionTests(unittest.TestCase):
     def connection(self, messages):
@@ -294,6 +361,24 @@ class OwnershipAndOutputTests(unittest.TestCase):
 
 
 class DiagnosticPrivacyTests(unittest.TestCase):
+    def test_ip_info_diagnostics_allow_only_fixed_operation_and_cause_values(self):
+        secret='synthetic-private-account-or-proxy'
+        error=RuntimeError(secret);error.code='ip_info_failed'
+        error.operation='Page.reload';error.cause_type='WebSocketTimeoutException';error.cleanup_failed=True
+        result=verifier.error_diagnostics(error)
+        self.assertEqual(result['reason_code'],'ip_info_failed')
+        self.assertEqual(result['operation'],'Page.reload')
+        self.assertEqual(result['cause_type'],'WebSocketTimeoutException')
+        self.assertIs(result['cleanup_failed'],True)
+        self.assertNotIn(secret,json.dumps(result))
+        for value in (secret,[]):
+            error.operation=value;error.cause_type=value
+            result=verifier.error_diagnostics(error)
+            self.assertEqual(result['operation'],'unknown')
+            self.assertEqual(result['cause_type'],'Exception')
+            self.assertNotIn(secret,json.dumps(result))
+        self.assertIn('系统流量异常高',verifier._PAGE_DIAGNOSTIC)
+
     def test_error_messages_and_unknown_field_names_never_leave_local_classifier(self):
         secret = 'synthetic-private-credential-do-not-log'
         error = RuntimeError('代理检测未通过' + secret)

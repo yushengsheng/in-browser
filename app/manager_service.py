@@ -444,11 +444,18 @@ class ManagerService:
                     except Exception: pass
                 raise
             if not already and not offline_test and not (p.get('created_locally') and p.get('created_options',{}).get('workbench')=='disable'):
-                from ip_info_page import show_ip_info
+                from ip_info_page import show_ip_info,IP_INFO_OPERATIONS,IP_INFO_CAUSE_TYPES
                 try:
                     with CDP(self.controller.endpoint(identity),timeout=5) as connection:show_ip_info(connection)
-                except Exception:
-                    raise LocalBrowserError('浏览器已打开，但IP信息页未能打开；请手动访问 https://ifconfig.co/ 查看当前出口。原有资料和代理保持不变。') from None
+                except Exception as error:
+                    failure=LocalBrowserError('浏览器已打开，但IP信息页未能打开；请手动访问 https://ifconfig.co/ 查看当前出口。原有资料和代理保持不变。')
+                    failure.code='ip_info_failed'
+                    operation=getattr(error,'operation',None)
+                    failure.operation=operation if isinstance(operation,str) and operation in IP_INFO_OPERATIONS else 'unknown'
+                    cause=getattr(error,'cause_type',type(error).__name__)
+                    failure.cause_type=cause if isinstance(cause,str) and cause in IP_INFO_CAUSE_TYPES else 'Exception'
+                    failure.cleanup_failed=getattr(error,'cleanup_failed',False) is True
+                    raise failure from None
             return self.store.public(p,'open')
 
     def close(self,identity):

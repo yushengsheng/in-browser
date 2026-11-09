@@ -45,7 +45,7 @@ _PAGE_DIAGNOSTIC = r'''(() => {
   return {readyComplete: document.readyState === "complete",
     hasPasswordInput: !!document.querySelector('input[type="password"]'),
     loginPrompt: /请(?:先)?登录|会话(?:已)?过期|登录(?:已)?过期|session expired|sign in|log in/i.test(text),
-    trafficError: /网络(?:连接)?(?:异常|错误)|无法连接|连接失败|network error|connection failed|proxy error|traffic error/i.test(text),
+    trafficError: /系统流量异常高|网络(?:连接)?(?:异常|错误)|无法连接|连接失败|network error|connection failed|proxy error|traffic error/i.test(text),
     bodyEmpty: !text.trim(), iframeCount: document.querySelectorAll("iframe").length,
     localStorageAccessible, localStorageCount};
 })()'''
@@ -67,6 +67,19 @@ def error_diagnostics(error):
     result = {'error_type': type(error).__name__, 'frames': [
         {'file': Path(frame.filename).name, 'line': frame.lineno}
         for frame in traceback.extract_tb(error.__traceback__)[-8:]]}
+    if getattr(error, 'code', None) == 'ip_info_failed':
+        operations = frozenset(('Target.getTargets', 'Target.attachToTarget', 'Page.reload',
+            'Target.detachFromTarget', 'Target.createTarget', 'Target.activateTarget'))
+        causes = frozenset(('LocalBrowserError', 'OSError', 'TimeoutError', 'ConnectionError',
+            'ConnectionResetError', 'ConnectionAbortedError', 'ConnectionRefusedError', 'BrokenPipeError',
+            'WebSocketException', 'WebSocketTimeoutException', 'WebSocketConnectionClosedException',
+            'WebSocketBadStatusException', 'JSONDecodeError', 'ValueError', 'TypeError', 'KeyError', 'RuntimeError'))
+        result['reason_code'] = 'ip_info_failed'
+        operation, cause = getattr(error, 'operation', None), getattr(error, 'cause_type', None)
+        result['operation'] = operation if isinstance(operation, str) and operation in operations else 'unknown'
+        result['cause_type'] = cause if isinstance(cause, str) and cause in causes else 'Exception'
+        result['cleanup_failed'] = getattr(error, 'cleanup_failed', False) is True
+        return result
     if getattr(error, 'code', None) == 'engine_path_too_long':
         result['reason_code'] = 'engine_path_too_long'
     if isinstance(fields, list) and fields:
