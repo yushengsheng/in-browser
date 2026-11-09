@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 
 import browser_processes as processes
+import browser_core as core
 from local_state import LocalBrowserError
 
 
@@ -105,6 +106,26 @@ class ProcessPathAliases(unittest.TestCase):
         candidate = process(short)
         with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])):
             self.assertEqual(processes.profile_processes(self.profile), [candidate])
+        self.assert_fingerprint_identity(short)
+
+    def assert_fingerprint_identity(self, folder):
+        fingerprint=self.profile/'synthetic-fingerprint.bin'
+        fingerprint.write_bytes(b'synthetic-signature')
+        executable=self.root/'BitBrowser.exe'
+        args=[str(executable),'--user-data-dir='+str(self.profile),
+              '--fingerprint-config="'+str(folder/'synthetic-fingerprint.bin')+'"',
+              '--remote-debugging-port=9222','--remote-debugging-address=127.0.0.1']
+        candidate=SimpleNamespace(oneshot=nullcontext,create_time=lambda:100,cmdline=lambda:args,exe=lambda:str(executable))
+        controller=core.BrowserController.__new__(core.BrowserController)
+        controller.state={'fixture':{'pid':101,'created':100,'port':9222}}
+        controller.profiles={'fixture':{'core_path':str(executable),'profile_path':str(self.profile),
+                                        'fingerprint_path':str(fingerprint)}}
+        with patch.object(core.psutil,'Process',return_value=candidate),patch.object(controller,'_core_valid',return_value=True):
+            self.assertTrue(controller._record_valid('fixture'))
+
+    def test_fingerprint_path_alias_and_windows_case_keep_the_same_identity(self):
+        self.assert_fingerprint_identity(self.alias)
+        if os.name=='nt':self.assert_fingerprint_identity(Path(str(self.alias).upper()))
 
 
 if __name__ == '__main__':

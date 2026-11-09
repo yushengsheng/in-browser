@@ -155,9 +155,28 @@ def sanitize(profile,base=None):
 
 
 def parse_cookies(text,profile):
+    text=text.lstrip('\ufeff')
     if not text.strip(): return []
     try: items=json.loads(text)
     except ValueError:
+        if '\t' in text or text.lstrip().startswith('# Netscape HTTP Cookie File'):
+            items=[]
+            for line in text.splitlines():
+                http_only=line.startswith('#HttpOnly_')
+                if not line.strip() or (line.startswith('#') and not http_only):continue
+                if http_only:line=line[len('#HttpOnly_'):]
+                parts=line.split('\t')
+                if len(parts)!=7 or parts[1] not in ('TRUE','FALSE') or parts[3] not in ('TRUE','FALSE'):
+                    raise LocalBrowserError('Netscape Cookie须为7列制表符分隔格式。') from None
+                domain,subdomains,path,secure,expiry,name,value=parts
+                if not domain or not path.startswith('/') or not expiry.isdigit():
+                    raise LocalBrowserError('Netscape Cookie域名、路径或到期时间无效。') from None
+                domain=('.'+domain.lstrip('.')) if subdomains=='TRUE' else domain.lstrip('.')
+                cookie={'name':name,'value':value,'domain':domain,'path':path,'secure':secure=='TRUE','httpOnly':http_only}
+                if int(expiry)>0:cookie['expires']=int(expiry)
+                items.append(cookie)
+            if not items:raise LocalBrowserError('Netscape Cookie文件中没有有效记录。') from None
+            return parse_cookies(json.dumps(items),profile)
         website=profile.get('platform') or next(iter(profile.get('urls') or []),'')
         parsed=urlparse(website)
         if parsed.scheme not in ['http','https'] or not parsed.hostname:

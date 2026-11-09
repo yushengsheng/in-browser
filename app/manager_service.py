@@ -15,8 +15,9 @@ from local_state import LocalBrowserError,read_encrypted,write_encrypted
 from browser_processes import profile_processes
 from configuration import Configuration
 from profile_model import defaults,sanitize,parse_cookies
-from window_store import WindowStore,now
+from window_store import WindowStore,now,fingerprint_unreferenced
 from engine_store import EngineStore,executable_major
+from engine_validation import verification_scope
 from proxy_runtime import ProxyRuntime
 from signature_lifetime import signature_lifetime,require_current_signature,runtime_signature_options
 
@@ -42,6 +43,7 @@ class ManagerService:
         self.operations=threading.RLock(); self.window=None
         self.controller=BrowserController(self.root,settings={'windows':[p['_runtime'] for p in self.store.all()], 'persistent':False})
         self._synchronizer=None
+        self._creator=None
         self.proxy_runtime=ProxyRuntime(self.root)
         from profile_delete import recover_pending_deletions
         try:recover_pending_deletions(self)
@@ -86,6 +88,13 @@ class ManagerService:
                 from window_sync import WindowSynchronizer
                 self._synchronizer=WindowSynchronizer(self)
             return self._synchronizer
+
+    def creator(self):
+        with self.operations:
+            if self._creator is None:
+                from window_create import WindowCreator
+                self._creator=WindowCreator(self)
+            return self._creator
 
     def cores(self):
         found={}
@@ -142,14 +151,33 @@ class ManagerService:
         default=defaults('148' if '148' in cores else next(iter(cores),'148'))
         data.update(cores=sorted(cores,key=int),defaults=default,settings=self.settings(),
             capabilities={'signature_required':True,'signing_online':not self.configuration.independent,'signature_has_expiry':True,'signature_verified_core_majors':sorted(CORE_SPECS,key=int),'permanent_offline_confirmed':self.configuration.independent,'independent_runtime':self.configuration.independent,'portable_mode':(self.root/'portable-mode.bin').is_file(),'environment_continuity':(self.root/'continuity-mode.bin').is_file(),'encryption_provider':'folder-key' if (self.root/'portable-mode.bin').is_file() else 'windows-user','proxy_edit_requires_signing':False,'proxy_routing':'local','local_storage_only':True,'create':False,'sync_windows':True,
-                          'proxy_types':['noproxy','http','https','socks5'],'native_version':'7.2.0',
+                          'proxy_types':['noproxy','http','https','socks5','ssh'],'native_version':'7.2.0',
                           'bundled_cores':sorted(cores if self.configuration.independent else self.engines.available(),key=int),'strict_proxy_gate':True})
         data['sync_job']=self.synchronizer().latest()
+        data['capabilities']['create_windows']=True
+        data['creation_job']=self.creator().latest()
         return data
 
     def settings(self):
         base={'start_page':'','download_dir':'','browser_path':'','confirm_close':True,'close_behavior':'keep_browsers'}
         base.update(self.store.setting('application',{})); return base
+
+    def save_settings(self,incoming):
+        with self.operations:
+            settings={key:incoming.get(key,value) for key,value in self.settings().items()}
+            if settings['close_behavior'] not in ['keep_browsers','close_browsers']: raise LocalBrowserError('退出方式无效。')
+            if settings['start_page']: sanitize({'urls':[settings['start_page']]})
+            if settings['download_dir'] and not Path(settings['download_dir']).expanduser().is_absolute(): raise LocalBrowserError('下载目录须为绝对路径。')
+            if settings['browser_path'] and (not Path(settings['browser_path']).is_file() or Path(settings['browser_path']).name.casefold()!='bitbrowser.exe'): raise LocalBrowserError('请选择正确的比特内核文件。')
+            with self.store.lock,self.store.connect() as con:
+                con.execute('BEGIN IMMEDIATE')
+                rows=con.execute('SELECT id,data FROM profiles').fetchall()
+                for identity,blob in rows:
+                    record=self.store.unpack(blob)
+                    record['_prefs_dirty']=True
+                    con.execute('UPDATE profiles SET data=? WHERE id=?',(self.store.pack(record),identity))
+                con.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',('application',self.store.pack(settings)))
+            return {'settings':settings}
 
     def _closed(self,p):
         if profile_processes(Path(p['_runtime']['profile_path'])):
@@ -194,6 +222,7 @@ class ManagerService:
             launch_args=launch_args,no_system_proxy=True,account_platform=p.get('platform') or '',
             account_username=p.get('username') or '',account_password=p.get('password') or '')
         for key in ['mute_audio','disable_gpu','disable_notifications']: runtime[key]=p['preferences'].get(key,False)
+        if p.get('created_locally'):runtime['enable_background_mode']=bool(p.get('created_options',{}).get('enable_background_mode'))
         return runtime
 
     def save(self,incoming,*,allow_fingerprint=True):
@@ -204,6 +233,9 @@ class ManagerService:
             old=self.store.get(incoming['id'])
             if old.get('archived'): raise LocalBrowserError('请先从回收站恢复该窗口。')
             p=sanitize(incoming,old)
+            if old.get('created_locally') and 'created_options' in incoming:
+                from creation_fingerprint import normalize_options
+                p['created_options']=normalize_options(incoming['created_options'])
             # Imported fields may use numeric strings or spaced resolutions.
             # Normalization alone must not turn a metadata edit into re-signing.
             baseline=sanitize(self.store.public(old))
@@ -217,6 +249,8 @@ class ManagerService:
                 if any(x['id']!=p['id'] and not x.get('archived') and x.get('platform')==p.get('platform') and x.get('username')==p.get('username') for x in self.store.all()):
                     raise LocalBrowserError('已有相同平台和用户名的本地窗口。')
             needs_config=any(p.get(k)!=old.get(k) for k in ['fingerprint','preferences'])
+            if old.get('created_locally') and p.get('created_options',{}).get('image_limit_kb')!=old.get('created_options',{}).get('image_limit_kb'):
+                needs_config=True
             if old['_runtime'].get('signature_provider')=='local-v1' and p['fingerprint']!=old['fingerprint']:
                 raise LocalBrowserError('独立本地窗口保留迁移时的原指纹，不重新生成或更换指纹。')
             proxy_changed=p['proxy']!=old['proxy']
@@ -229,7 +263,7 @@ class ManagerService:
             if any(p['fingerprint'].get(k)!=old['fingerprint'].get(k) for k in ['openWidth','openHeight']):
                 runtime['window_size_once']=[p['fingerprint'].get('openWidth') or 1280,p['fingerprint'].get('openHeight') or 720]
             if p['urls']!=old.get('urls'): runtime['open_urls_once']=p['urls']
-            new_file=None; temporary=None
+            new_file=None; temporary=None; commit_attempted=False
             try:
                 if needs_config:
                     if runtime.get('signature_provider')=='local-v1':native,binary=self.configuration.build_local(p,p['_native'],previous_preferences=old.get('preferences'))
@@ -247,9 +281,12 @@ class ManagerService:
                 p.update(_runtime=runtime,_empty=False,config_status='ready',updated_at=now())
                 if proxy_changed:
                     runtime.pop('local_proxy_port',None)
+                commit_attempted=True
                 self.store.put(p,include_group=True)
             except Exception:
-                if new_file and new_file.parent.resolve()==(self.root/'fingerprints').resolve(): new_file.unlink(missing_ok=True)
+                if (new_file and new_file.parent.resolve()==(self.root/'fingerprints').resolve()
+                        and (not commit_attempted or fingerprint_unreferenced(self.store,p['id'],new_file))):
+                    new_file.unlink(missing_ok=True)
                 if temporary: temporary.unlink(missing_ok=True)
                 raise
             self._sync(p)
@@ -292,9 +329,11 @@ class ManagerService:
             raise
 
     def _preferences(self,p):
-        from profile_preferences import apply_preferences
-        return apply_preferences(self,p)
+        from profile_preferences import apply_preferences,prepare_clipboard
+        apply_preferences(self,p)
+        prepare_clipboard(p)
 
+    @verification_scope()
     def open(self,identity,*,offline_test=False,extra_urls=None):
         with self.operations:
             self._require_available(identity)
@@ -305,6 +344,12 @@ class ManagerService:
             if not already and (getattr(self.configuration,'independent',False) or p['_runtime'].get('signature_provider')=='local-v1'):
                 from local_runtime import LocalRuntime
                 p=LocalRuntime(self).prepare(p)
+            if not already and p.get('created_locally'):
+                from created_window import prepare_launch
+                if not offline_test:
+                    from dynamic_proxy import prepare_dynamic_proxy
+                    p=prepare_dynamic_proxy(self,p)
+                p=prepare_launch(self,p,offline_test=offline_test)
             environment_args=[]
             if not already and (self.root/'continuity-mode.bin').is_file():
                 from fingerprint_continuity import verify_continuity
@@ -314,6 +359,9 @@ class ManagerService:
                 if not p.get('_portable_crypt'):raise LocalBrowserError('此窗口尚未准备便携加密资料，未启动，避免丢失登录数据。')
                 prepare_profile(Path(p['_runtime']['profile_path']),p['_portable_crypt'])
             if not already:require_current_signature(p['_runtime']['fingerprint_path'],core_major=p['_runtime'].get('core_major'),**runtime_signature_options(p['_runtime'],self.root))
+            if not already and not p.get('created_locally'):
+                from import_cookies import prepare_existing
+                p=prepare_existing(self,p)
             def before_launch():
                 if already:
                     raise LocalBrowserError('窗口刚刚退出，请重新点击打开，以完成新窗口的环境和代理检查；本次未重新启动。')
@@ -322,15 +370,32 @@ class ManagerService:
                         raise LocalBrowserError('本地代理未就绪，未启动浏览器，也未改为直连。')
                     # Test the exact relay the browser will use, including its
                     # authenticated upstream, rather than a separate shortcut.
-                    checked=self.configuration.proxy_test({'type':'http','host':'127.0.0.1','port':route['port'],'username':'','password':''})
+                    probe_proxy={'type':'http','host':'127.0.0.1','port':route['port'],'username':'','password':''}
+                    if p.get('created_locally') and p.get('created_options',{}).get('stop_country_change'):
+                        from proxy_check import ProxyChecker
+                        checked=ProxyChecker(targets=[{'name':'IP环境信息','url':'https://ipapi.co/json/'}],require_geo=True).test(probe_proxy)
+                    else:checked=self.configuration.proxy_test(probe_proxy)
                     if not checked.get('success'):raise LocalBrowserError('代理检测未通过，未启动浏览器。'+checked.get('message',''))
+                    if p.get('created_locally'):
+                        from created_window import check_egress
+                        check_egress(p,checked)
                     if not self.proxy_runtime.owned(route) or not self.proxy_runtime.control(route):
                         raise LocalBrowserError('本地代理在检测期间退出，未启动浏览器，也未改为直连。')
+                elif not offline_test and p.get('created_locally') and (str(p.get('fingerprint',{}).get('webRTC'))=='0' or any(p.get('created_options',{}).get(key) for key in ('stop_ip_change','stop_country_change'))):
+                    from proxy_check import ProxyChecker
+                    from created_window import check_egress
+                    country=p.get('created_options',{}).get('stop_country_change')
+                    checked=ProxyChecker(targets=[{'name':'IP环境信息','url':'https://ipapi.co/json/'}] if country else None,require_geo=bool(country)).test(p['proxy'])
+                    if not checked.get('success'):raise LocalBrowserError('无法核实当前出口，已按设置停止打开。')
+                    check_egress(p,checked)
             if not already:
                 p['_runtime']=self._runtime(p,p['_runtime'])
                 p['_runtime'].pop('environment_args',None)
                 self._sync(p)
                 self._preferences(p)
+                if p.get('created_locally'):
+                    from created_window import apply_launch_cleanup
+                    apply_launch_cleanup(self,p)
                 p['_runtime']['environment_args']=environment_args
                 self._sync(p)
             bootstrap_blank=bool(p.get('_cookie_pending') and p['_runtime'].get('new_profile') and not p['_runtime'].get('has_launched'))
@@ -369,6 +434,7 @@ class ManagerService:
                     p['_cookie_pending']=False
                 if not already: p['last_opened_at']=now()
                 p['launch_verified']=True; p['_runtime']['new_profile']=False; p['_runtime']['has_launched']=True
+                if p.get('_pending_creation_egress'):p['_last_creation_egress']=p.pop('_pending_creation_egress')
                 p['_runtime'].pop('window_size_once',None); p['_runtime'].pop('open_urls_once',None)
                 p['_runtime'].pop('environment_args',None)
                 self.store.put(p); self._sync(p)
@@ -377,7 +443,7 @@ class ManagerService:
                     try: self.controller.close(identity)
                     except Exception: pass
                 raise
-            if not already and not offline_test:
+            if not already and not offline_test and not (p.get('created_locally') and p.get('created_options',{}).get('workbench')=='disable'):
                 from ip_info_page import show_ip_info
                 try:
                     with CDP(self.controller.endpoint(identity),timeout=5) as connection:show_ip_info(connection)

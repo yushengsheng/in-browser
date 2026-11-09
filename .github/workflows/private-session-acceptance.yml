@@ -1,0 +1,138 @@
+name: Private Windows session acceptance
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    secrets:
+      IB_PRIVATE_ACCEPTANCE_KEY:
+        required: true
+
+permissions:
+  contents: write # Download authenticated draft assets; no release is published.
+
+concurrency:
+  group: private-real-session-acceptance
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Load the audited candidate runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download validation-v0.2.0-private --repo $env:GITHUB_REPOSITORY --pattern acceptance-runtime-v0.2.0.zip --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime download failed' }
+          $archive = Join-Path $env:RUNNER_TEMP 'acceptance-runtime-v0.2.0.zip'
+          $expected = (Get-Content -LiteralPath '.github/acceptance-runtime.sha256' -Raw).Trim()
+          if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Runtime digest mismatch' }
+          $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            if ($zip.Entries.Count -gt 20000 -or (($zip.Entries | Measure-Object -Property Length -Sum).Sum -gt 2GB)) { throw 'Runtime budget exceeded' }
+            foreach ($entry in $zip.Entries) {
+              if ($entry.FullName -notmatch '^runtime/' -or $entry.FullName -match '(^|/)\.\.(/|$)|:|\\') { throw 'Unexpected runtime member' }
+            }
+          } finally { $zip.Dispose() }
+          Expand-Archive -LiteralPath $archive -DestinationPath $env:GITHUB_WORKSPACE
+      - name: Run the complete source checks
+        shell: pwsh
+        run: |
+          & runtime/python/python.exe -B tools/check_project.py --report "$env:RUNNER_TEMP/clean-check.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Source checks failed' }
+      - name: Start an empty manager in a fresh user directory
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          & runtime/python/python.exe -B tools/verify_clean_start.py --execute | Out-File -FilePath "$env:RUNNER_TEMP/clean-start.json" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Empty manager acceptance failed' }
+      - name: Keep anonymous clean-environment reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clean-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/clean-check.json
+            ${{ runner.temp }}/clean-start.json
+          if-no-files-found: error
+          retention-days: 7
+
+  real-session:
+    runs-on: windows-2025
+    timeout-minutes: 160
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare an isolated folder and download authenticated assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'ib-private-acceptance'
+          if (Test-Path -LiteralPath $package) { throw 'Acceptance target must be new' }
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item -LiteralPath app,tools -Destination $package -Recurse
+          gh release download validation-v0.2.0-private --repo $env:GITHUB_REPOSITORY --pattern acceptance-runtime-v0.2.0.zip --pattern private-window11.enc --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance asset download failed' }
+          $archive = Join-Path $env:RUNNER_TEMP 'acceptance-runtime-v0.2.0.zip'
+          $expected = (Get-Content -LiteralPath '.github/acceptance-runtime.sha256' -Raw).Trim()
+          if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Runtime digest mismatch' }
+          $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            if ($zip.Entries.Count -gt 20000 -or (($zip.Entries | Measure-Object -Property Length -Sum).Sum -gt 2GB)) { throw 'Runtime budget exceeded' }
+            foreach ($entry in $zip.Entries) {
+              if ($entry.FullName -notmatch '^runtime/' -or $entry.FullName -match '(^|/)\.\.(/|$)|:|\\') { throw 'Unexpected runtime member' }
+            }
+          } finally { $zip.Dispose() }
+          Expand-Archive -LiteralPath $archive -DestinationPath $package
+          "IB_PRIVATE_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Authenticate and decrypt the single-profile copy
+        env:
+          IB_PRIVATE_ACCEPTANCE_KEY: ${{ secrets.IB_PRIVATE_ACCEPTANCE_KEY }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B tools/unpack_private_acceptance.py --source "$env:RUNNER_TEMP/private-window11.enc" --target "$env:IB_PRIVATE_PACKAGE" --sha256-file .github/private-fixture.sha256
+          if ($LASTEXITCODE -ne 0) { throw 'Private transport authentication failed' }
+      - name: Keep the real session open for two hours and reopen it normally
+        shell: pwsh
+        run: |
+          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/verify_private_session.py" --execute --duration-seconds 7200 --report "$env:RUNNER_TEMP/private-session-live.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Real-session acceptance failed' }
+      - name: Remove the disposable private copy
+        if: always()
+        shell: pwsh
+        run: |
+          $expected = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'ib-private-acceptance'))
+          if ($env:IB_PRIVATE_PACKAGE) {
+            $target = [IO.Path]::GetFullPath($env:IB_PRIVATE_PACKAGE)
+            if ($target -ne $expected) { throw 'Unexpected cleanup target' }
+            $active = @(Get-CimInstance Win32_Process -Filter "Name='BitBrowser.exe'" | Where-Object {
+              -not $_.ExecutablePath -or ([IO.Path]::GetFullPath($_.ExecutablePath)).StartsWith(($target + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($active.Count -ne 0) { throw 'Owned browser has not closed; disposable runner will be discarded' }
+            if (Test-Path -LiteralPath $target) {
+              $links = @(Get-Item -LiteralPath $target; Get-ChildItem -LiteralPath $target -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })
+              if (@($links | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count -ne 0) { throw 'Linked cleanup target' }
+              Remove-Item -LiteralPath $target -Recurse -Force
+            }
+          }
+          $ciphertext = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'private-window11.enc'))
+          if (Test-Path -LiteralPath $ciphertext) { Remove-Item -LiteralPath $ciphertext -Force }
+      - name: Keep only the anonymous result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: private-session-result
+          path: ${{ runner.temp }}/private-session-live.json
+          if-no-files-found: error
+          retention-days: 7

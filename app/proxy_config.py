@@ -5,7 +5,7 @@ from urllib.parse import unquote,urlsplit
 
 from local_state import LocalBrowserError
 
-PROTOCOLS={'http':'http','https':'https','socks5':'socks5','socks5h':'socks5','socks':'socks5'}
+PROTOCOLS={'http':'http','https':'https','socks5':'socks5','socks5h':'socks5','socks':'socks5','ssh':'ssh'}
 
 def _fields(kind,host,port,username='',password=''):
     host=str(host or '').strip().strip('[]')
@@ -16,7 +16,7 @@ def _fields(kind,host,port,username='',password=''):
     try: port=int(port)
     except (TypeError,ValueError): raise LocalBrowserError('代理端口必须是整数。') from None
     if not 1<=port<=65535: raise LocalBrowserError('代理端口须在1到65535之间。')
-    if kind not in ['http','https','socks5']: raise LocalBrowserError('不支持此代理协议。')
+    if kind not in ['http','https','socks5','ssh']: raise LocalBrowserError('不支持此代理协议。')
     if any(c in str(username)+str(password) for c in '\r\n\x00'): raise LocalBrowserError('代理认证信息不能包含换行或空字符。')
     return {'type':kind,'host':host,'port':port,'username':str(username),'password':str(password),'enable_socks5_udp':False}
 
@@ -24,10 +24,10 @@ def parse_proxy(text,default_type='socks5'):
     if not isinstance(text,str) or not text.strip() or len(text)>8192: raise LocalBrowserError('请粘贴一条有效代理，最多8192字符。')
     text=text.strip().replace('：',':')
     if '\n' in text or '\r' in text: raise LocalBrowserError('一次只能识别一条代理。')
-    kind=default_type if default_type in ['http','https','socks5'] else 'socks5';scheme=re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*)://',text)
+    kind=default_type if default_type in ['http','https','socks5','ssh'] else 'socks5';scheme=re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*)://',text)
     if scheme:
         kind=PROTOCOLS.get(scheme.group(1).lower())
-        if not kind: raise LocalBrowserError('只支持HTTP、HTTPS和SOCKS5代理。')
+        if not kind: raise LocalBrowserError('只支持HTTP、HTTPS、SOCKS5和SSH代理。')
         text=text[scheme.end():]
     ignored=0
     if '|' in text:

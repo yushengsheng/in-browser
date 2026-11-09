@@ -13,6 +13,15 @@ from portable_vault import PortableVault
 
 
 class CoreCompatibilityTests(unittest.TestCase):
+    def test_104_runtime_dictionary_exception_is_empty_and_exact_only(self):
+        from local_engine import _runtime_directories
+        files={'chrome.dll':{}};expected=['version'];actual=['Dictionaries','version']
+        self.assertEqual(_runtime_directories('104',files,actual,expected),expected)
+        self.assertEqual(_runtime_directories('112',files,actual,expected),actual)
+        self.assertEqual(_runtime_directories('104',{**files,'Dictionaries/extra.bdic':{}},actual,expected),actual)
+        nested=['Dictionaries','Dictionaries/nested','version']
+        self.assertEqual(_runtime_directories('104',files,nested,expected),nested)
+
     def test_exact_twenty_one_major_registry_and_unknown_refusal(self):
         expected=('104','112','118','122','124','126','128','130','132','134','136','138','140','142','144','146','148','150','152','154','156')
         self.assertEqual(majors(),expected)

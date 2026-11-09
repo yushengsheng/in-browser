@@ -1,4 +1,5 @@
 bottle==0.13.4
+asyncssh==2.24.0
 certifi==2026.10.23
 cffi==2.1.1
 charset-normalizer==3.5.2
@@ -13,5 +14,6 @@ pythonnet==3.0.5
 pywebview==6.1
 requests==2.34.2
 typing_extensions==4.15.0
+tzdata==2026.6
 urllib3==2.8.0
 websocket-client==1.9.0

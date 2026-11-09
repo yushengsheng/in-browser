@@ -37,7 +37,7 @@ def _profile_backup(name,identity):
 
 
 def _proxy_name(name,identity):
-    return re.fullmatch(re.escape(identity)+r'\.(?:request|state)(?:\.[A-Za-z0-9_-]+\.tmp)?',name) is not None
+    return re.fullmatch(re.escape(identity)+r'\.(?:request|state|ssh-hosts\.bin)(?:\.[A-Za-z0-9_-]+\.tmp)?',name) is not None
 
 
 def _digest(path):
@@ -389,6 +389,18 @@ def prune_database(path,root,store,plan,*,prepared=False):
             con.execute('DELETE FROM profiles WHERE id IN ('+_in_clause(selected)+')',selected)
             if 'source_bindings' in tables:
                 con.execute('DELETE FROM source_bindings WHERE profile_id IN ('+_in_clause(selected)+')',selected)
+            if 'creation_items' in tables:
+                creation_condition='profile_id IN ('+_in_clause(selected)+')'
+                creation_values=selected
+                if keys:
+                    creation_condition+=' OR source_key IN ('+_in_clause(keys)+')'
+                    creation_values=selected+keys
+                jobs=[row[0] for row in con.execute('SELECT DISTINCT job_id FROM creation_items WHERE '+creation_condition,creation_values)]
+                con.execute('DELETE FROM creation_items WHERE '+creation_condition,creation_values)
+                if 'creation_jobs' in tables:
+                    for job in jobs:
+                        if not con.execute('SELECT 1 FROM creation_items WHERE job_id=? LIMIT 1',(job,)).fetchone():
+                            con.execute('DELETE FROM creation_jobs WHERE job_id=?',(job,))
             if 'import_intents' in tables:
                 condition='profile_id IN ('+_in_clause(selected)+')'
                 if keys:condition+=' OR source_key IN ('+_in_clause(keys)+')'
@@ -427,12 +439,21 @@ def compact(path,root):
     if wal.exists() and wal.stat().st_size:raise DeleteError('删除后的数据库日志仍被占用，重试会继续清理。')
 
 
+def _require_cookie_seeds_closed(path,root):
+    from browser_processes import profile_processes
+    for profile in path.glob('cookie-seed-*/profile'):
+        checked(profile,root,tree=True)
+        if profile_processes(profile,require_inspectable=True):
+            raise DeleteError('Cookie恢复验证仍在正常退出，暂存资料已保留，请稍后重试清理。')
+
+
 def _remove_work(service,path,root,owner):
     checked(path,root,tree=True)
     if not path.exists():return
+    _require_cookie_seeds_closed(path,root)
     marker=checked(path/'.sync-owner.bin',root)
     if not marker.exists():
-        # Only an authenticated deletion plan can reach here. A prior attempt
+        # Only an authenticated intent or deletion plan can reach here. A prior attempt
         # may have removed the final marker and stopped before the final rmdir.
         if any(path.iterdir()):raise DeleteError('非空同步暂存目录缺少归属凭据，清理尚未完成。')
         checked(path,root).rmdir();return
@@ -477,6 +498,7 @@ def execute_plan(service,plan):
             raise DeleteError('删除目标与其他窗口共享资料树，清理尚未完成。')
     for value in plan['targets']:
         path=from_relative(value,root)
+        if path.is_dir():_require_cookie_seeds_closed(path,root)
         if value in plan['signature_paths'] and path.exists() and _digest(path)!=plan['signature_paths'][value]:
             raise DeleteError('删除期间历史签名发生变化，清理尚未完成。')
         owner=plan['work_owners'].get(value)

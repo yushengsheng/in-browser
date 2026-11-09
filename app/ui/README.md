@@ -50,7 +50,7 @@ bootstrap的`sync_job`恢复持久任务；`interrupted`停止轮询并显示“
 | `export_profiles` | 加密配置导出，不含完整浏览器资料 |
 | `window_control` | 受限的管理器窗口操作 |
 
-本地新建、随机指纹、复制窗口及旧配置新建导入的前后端实现已移除；对应旧动作按未知操作拒绝。来源窗口导入、已有窗口编辑和加密配置导出继续保留。
+新增`creation_options/create_windows/creation_status/cancel_creation/resume_creation/creation_randomize`动作。创建复用详情抽屉，仅新建草稿允许编辑指纹；提交使用同一请求ID重试，批次进度持久恢复，迟到bootstrap/轮询不能回退新状态。旧`create/copy/randomize/import_profiles`动作仍拒绝，来源同步和已有窗口只读指纹保留。
 
 代理粘贴只判断是否完整地址，具体语法交给后端，避免维护第二套解析规则。变更参数会使旧检测失效；同表单不并发检测，只为最新代理保留一次待检测。保存等待当前解析完成，失败不无限重试。代理修改须先关闭窗口，保存后重开。
 

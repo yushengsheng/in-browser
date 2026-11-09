@@ -61,7 +61,7 @@ def _prepare(work):
             _ordinary(source)
             shutil.copy2(source, app / source.name)
     for name, filenames in (('ui', ('app.js', 'index.html', 'style.css')),
-                            ('resources', ('electron-main.js', 'crypto.worker.js', 'defaults.json','signature-verification-public.der'))):
+                            ('resources', ('electron-main.js', 'crypto.worker.js', 'defaults.json','signature-verification-public.der','creation-catalog.json'))):
         (app/name).mkdir()
         for filename in filenames:
             source=ROOT/'app'/name/filename

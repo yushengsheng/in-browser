@@ -4,12 +4,24 @@ on:
   push:
     branches: ['release/validation-*']
   workflow_dispatch:
+    inputs:
+      private_session:
+        description: Run the explicitly authorized encrypted real-session acceptance
+        type: boolean
+        default: false
 
 permissions:
   contents: write # Read the unpublished candidate release and its assets.
 
 jobs:
+  private-session:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.private_session == true }}
+    uses: ./.github/workflows/private-session-acceptance.yml
+    secrets:
+      IB_PRIVATE_ACCEPTANCE_KEY: ${{ secrets.IB_PRIVATE_ACCEPTANCE_KEY }}
+
   windows:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.private_session != true }}
     strategy:
       fail-fast: false
       matrix:

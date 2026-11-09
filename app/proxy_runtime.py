@@ -1,6 +1,7 @@
 """Per-window loopback proxy workers; upstream credentials never enter argv."""
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
@@ -15,6 +16,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -29,6 +31,7 @@ from browser_policy import PROXY_SWITCHES,verify_running_proxy_args,verify_proxy
 SCRIPT = Path(__file__).resolve()
 CONTROL = '/__local_browser_proxy__/'
 RELAY_IDLE_TIMEOUT = 600
+WORKER_SHUTDOWN_TIMEOUT = 6
 
 
 def proxy_digest(proxy):
@@ -176,7 +179,7 @@ class ProxyRuntime:
 
 
 class Worker:
-    def __init__(self, root, config):
+    def __init__(self, root, config, *, on_shutdown=None):
         self.root = root
         self.config = config
         self.proxy = normalize_proxy(config['proxy'])
@@ -187,6 +190,9 @@ class Worker:
         self.state = None
         self.browser = None
         self.tls_context = None
+        self.ssh_connector = None
+        self.on_shutdown = on_shutdown
+        self.browser_checks = ThreadPoolExecutor(max_workers=1, thread_name_prefix='proxy-browser-check')
 
     def matches_browser(self, process):
         args=process.cmdline()
@@ -220,15 +226,19 @@ class Worker:
         except (psutil.Error,OSError,ValueError):
             return False
 
+    async def check_browser(self, operation):
+        # Slow SOCKS handshakes must not occupy the worker's lifecycle checks.
+        return await asyncio.get_running_loop().run_in_executor(self.browser_checks, operation)
+
     async def watch(self):
         deadline = time.monotonic() + 60
         missing_since = None
         while not self.stop.is_set():
             alive = False
             if self.browser:
-                alive=await asyncio.to_thread(self.bound_browser_alive)
+                alive=await self.check_browser(self.bound_browser_alive)
             else:
-                matches=await asyncio.to_thread(self.matching_browsers)
+                matches=await self.check_browser(self.matching_browsers)
                 if matches:
                     try:self.browser=(matches[0].pid,matches[0].create_time());alive=True
                     except psutil.Error:pass
@@ -244,6 +254,11 @@ class Worker:
 
     async def upstream(self, host, port, tunnel):
         proxy = self.proxy
+        if proxy['type']=='ssh':
+            if self.ssh_connector is None:
+                from ssh_proxy import SSHConnector
+                self.ssh_connector=SSHConnector(self.root,self.config,transient=self.config.get('transient_ssh') is True)
+            return await self.ssh_connector.open(host,port)
         if proxy['type'] == 'socks5':
             def connect():
                 connection = socks.create_connection((host,port),timeout=8,proxy_type=socks.SOCKS5,
@@ -345,7 +360,7 @@ class Worker:
                     await self.reply(writer, 403)
                     return
                 if target == CONTROL + 'stop':
-                    if await asyncio.to_thread(self.matching_browsers):
+                    if await self.check_browser(self.matching_browsers):
                         await self.reply(writer, 409)
                         return
                     self.stop.set()
@@ -406,6 +421,15 @@ class Worker:
                     except Exception:
                         pass
 
+    def cleanup_runtime_files(self):
+        for suffix in ('.state', '.request'):
+            path = self.root / (self.config['identity'] + suffix)
+            try:
+                if read_encrypted(path).get('instance') == self.config['instance']:
+                    path.unlink()
+            except (OSError, LocalBrowserError, ValueError):
+                pass
+
     async def run(self):
         server = await asyncio.start_server(self.handle, '127.0.0.1', self.config['port'], limit=32768)
         process = psutil.Process()
@@ -419,7 +443,10 @@ class Worker:
         try:
             await self.stop.wait()
         finally:
+            if self.stop.is_set() and self.on_shutdown is not None:
+                self.on_shutdown()
             server.close()
+            self.cleanup_runtime_files()
             await server.wait_closed()
             watch.cancel()
             await asyncio.gather(watch, return_exceptions=True)
@@ -427,25 +454,35 @@ class Worker:
                 writer.close()
             handlers=list(self.handlers)
             for task in handlers:task.cancel()
-            await asyncio.gather(*handlers,return_exceptions=True)
-            for path in (state_path, self.root / (self.config['identity'] + '.request')):
+            try:
+                await asyncio.gather(*handlers,return_exceptions=True)
+            finally:
                 try:
-                    if read_encrypted(path).get('instance') == self.config['instance']:
-                        path.unlink()
-                except (OSError, LocalBrowserError, ValueError):
-                    pass
+                    if self.ssh_connector is not None:await self.ssh_connector.close()
+                finally:self.browser_checks.shutdown(wait=True, cancel_futures=True)
 
 
 def main():
+    shutdown_timer = None
+    def start_shutdown_timeout():
+        nonlocal shutdown_timer
+        if shutdown_timer is None:
+            # Only this independent relay exits; no browser process is controlled.
+            shutdown_timer = threading.Timer(WORKER_SHUTDOWN_TIMEOUT, lambda: os._exit(0))
+            shutdown_timer.daemon = True
+            shutdown_timer.start()
     try:
         root = Path(sys.argv[1]).resolve()
         identity = sys.argv[2]
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', identity):
             return
         config = read_encrypted(root / (identity + '.request'))
-        asyncio.run(Worker(root, config).run())
+        asyncio.run(Worker(root, config, on_shutdown=start_shutdown_timeout).run())
     except Exception:
         pass
+    finally:
+        if shutdown_timer is not None:
+            shutdown_timer.cancel()
 
 
 if __name__ == '__main__':

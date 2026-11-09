@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -15,6 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import engine_store
 import local_engine
+from engine_validation import digest_file, verification_scope
 from local_state import LocalBrowserError
 
 
@@ -64,6 +66,81 @@ class LocalEngineTests(unittest.TestCase):
 
     def deploy(self):
         return self.store.ensure(self.major, self.executable, self.own)
+
+    def delayed_resource(self):
+        # An independent synthetic encoding of the resource's public-key span.
+        header = bytearray(78)
+        header[16:24] = (123456789).to_bytes(8, 'big')
+        header[24] = 0
+        # ((0 & 63) ^ 0x15) + 0x39 == 78.
+        state = 123456789
+        encoded = bytearray()
+        for octet in self.vendor:
+            state ^= state >> 33
+            state = state * 0xff51afd7ed558ccd & ((1 << 64) - 1)
+            state ^= state >> 33
+            state = state * 0xc4ceb9fe1a85ec53 & ((1 << 64) - 1)
+            state ^= state >> 33
+            encoded.append(octet ^ (state & 255))
+        resource = self.source / 'version/resources.pak'
+        raw = b'unchanged index' + header + encoded + b'unchanged other resources'
+        resource.write_bytes(raw)
+        self.specs[self.major]['resource_root'] = {
+            'file':'version/resources.pak','id':24703,'offset':len(b'unchanged index'),
+            'length':372,'key_offset':78,'sha256':hashlib.sha256(raw).hexdigest()}
+        return resource
+
+    def test_delayed_root_upgrade_preserves_old_tree_and_existing_binding(self):
+        resource = self.delayed_resource()
+        original = resource.read_bytes()
+        legacy = self.deploy()
+        manifest = json.loads((legacy.parent/'manifest.json').read_text())
+        repaired = self.store.ensure_current(legacy,self.own_id,self.major)
+        self.assertNotEqual(legacy,repaired)
+        self.assertTrue(repaired.parent.name.endswith('-r2'))
+        self.assertEqual(self.store.validate(legacy,self.own_id,self.major),legacy)
+        self.assertEqual((legacy.parent/'version/resources.pak').read_bytes(),original)
+        self.assertEqual(local_engine._resource_key(repaired.parent,self.specs[self.major]),self.own)
+        current = json.loads((repaired.parent/'manifest.json').read_text())
+        self.assertEqual(local_engine.continuity_manifest(current,repaired),manifest)
+        self.assertEqual(self.store.ensure_current(legacy,self.own_id,self.major),repaired)
+        self.assertEqual(self.store.ensure_current(repaired,self.own_id,self.major),repaired)
+        spec = self.specs[self.major]['resource_root']
+        start = spec['offset']+spec['key_offset']
+        patched = (repaired.parent/spec['file']).read_bytes()
+        self.assertEqual(patched[:start],original[:start])
+        self.assertEqual(patched[start+294:],original[start+294:])
+        self.assert_no_staging()
+
+    def test_delayed_resource_tampering_cannot_be_hidden_in_manifest(self):
+        self.delayed_resource()
+        repaired = self.store.ensure_current(self.deploy(),self.own_id,self.major)
+        resource = repaired.parent/'version/resources.pak'
+        resource.write_bytes(resource.read_bytes()[:-1]+b'!')
+        path = repaired.parent/'manifest.json'
+        data = json.loads(path.read_text())
+        data['files']['version/resources.pak']['sha256']=hashlib.sha256(resource.read_bytes()).hexdigest()
+        path.write_text(json.dumps(data))
+        with self.assertRaises(LocalBrowserError):
+            self.store.validate(repaired,self.own_id,self.major)
+        with self.assertRaises(LocalBrowserError):
+            local_engine.continuity_manifest(data,repaired)
+
+    def test_legacy_104_empty_runtime_dictionary_directory_does_not_block_repair(self):
+        self.major='104';self.write_chrome();self.delayed_resource()
+        legacy=self.deploy();(legacy.parent/'Dictionaries').mkdir()
+        repaired=self.store.ensure_current(legacy,self.own_id,self.major)
+        self.assertEqual(self.store.validate(repaired,self.own_id,self.major),repaired)
+
+    def test_delayed_upgrade_failure_leaves_legacy_and_no_published_copy(self):
+        self.delayed_resource()
+        legacy = self.deploy()
+        with patch.object(local_engine,'_resource_key',side_effect=OSError('synthetic')):
+            with self.assertRaises(LocalBrowserError):
+                self.store.ensure_current(legacy,self.own_id,self.major)
+        self.assertEqual(self.store.validate(legacy,self.own_id,self.major),legacy)
+        self.assertFalse(legacy.parent.with_name(legacy.parent.name+'-r2').exists())
+        self.assert_no_staging()
 
     def assert_no_staging(self):
         self.assertFalse(list(self.store.root.glob('*/.install-*')))
@@ -261,6 +338,47 @@ class LocalEngineTests(unittest.TestCase):
         finally:
             link.unlink()
         self.assertFalse(self.store.root.exists())
+
+
+@unittest.skipUnless(os.name=='nt','Windows read-sharing contract')
+class EngineValidationScopeTests(unittest.TestCase):
+    def test_pinned_hash_blocks_mutation_then_releases_and_rechecks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'immutable.dll';path.write_bytes(b'old bytes')
+            with verification_scope():
+                first=digest_file(path)
+                with self.assertRaises(PermissionError):path.write_bytes(b'new bytes')
+                with patch.object(Path,'open',side_effect=AssertionError('cached file must stay pinned')):
+                    self.assertEqual(digest_file(path),first)
+            path.write_bytes(b'new bytes')
+            with verification_scope():
+                self.assertNotEqual(digest_file(path),first)
+
+    def test_existing_writer_never_gets_a_cached_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'writer.dll';path.write_bytes(b'old bytes')
+            with path.open('r+b') as writer,verification_scope():
+                first=digest_file(path)
+                writer.seek(0);writer.write(b'new bytes');writer.flush()
+                self.assertNotEqual(digest_file(path),first)
+
+    def test_exception_and_nested_scope_do_not_leak_handles(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'nested.dll';path.write_bytes(b'native')
+            with self.assertRaisesRegex(RuntimeError,'synthetic'):
+                with verification_scope():
+                    with verification_scope():digest_file(path)
+                    with self.assertRaises(PermissionError):path.unlink()
+                    raise RuntimeError('synthetic')
+            path.unlink()
+
+    def test_restored_hash_preserves_every_other_byte(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'root.dll';path.write_bytes(b'prefix'+b'x'*294+b'suffix')
+            with verification_scope():
+                expected=hashlib.sha256(b'prefix'+b'y'*294+b'suffix').hexdigest()
+                self.assertEqual(digest_file(path,offset=6,replacement=b'y'*294),expected)
+                self.assertEqual(digest_file(path),hashlib.sha256(path.read_bytes()).hexdigest())
 
 
 if __name__ == '__main__':

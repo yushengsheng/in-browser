@@ -26,6 +26,19 @@ def source_time(value,fallback=None):
     except ValueError: return fallback
 
 
+def fingerprint_unreferenced(store,identity,path):
+    """Only authorize cleanup after an authoritative, unambiguous catalog read."""
+    try:
+        record=store.get(identity)
+        current=record['_runtime']['fingerprint_path']
+        if record.get('id')!=identity or not isinstance(current,str) or not current or not Path(current).is_absolute():
+            return False
+        return Path(current).resolve()!=Path(path).resolve()
+    except Exception:
+        # A failed commit may already be durable. Keep its file if readback is unavailable.
+        return False
+
+
 class WindowStore:
     def __init__(self,configuration,root=DATA_ROOT):
         self.root=Path(root).resolve(); self.root.mkdir(parents=True,exist_ok=True)

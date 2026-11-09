@@ -272,6 +272,55 @@ class SyncReliabilityTests(unittest.TestCase):
         service._sync=lambda value:None;sync._recover_intents()
         self.assertEqual(list(sync.state.intents()),[])
 
+    def copying_work(self,folder):
+        service,sync,items=fixture(folder,count=1,encrypted=True)
+        intent=sync.state.intent('a'*32,items[0]['source_key'],'profile-'+'b'*32,'c'*32)
+        work,_,_=sync._intent_paths(intent);work.mkdir(parents=True)
+        marker=work/'.sync-owner.bin'
+        marker.write_bytes(service.store.pack({'format':1,'ownership':sync.state.validate_intent(intent)}))
+        (work/'profile').mkdir();(work/'profile/proof').write_bytes(b'synthetic')
+        (work/'fingerprint.bin').write_bytes(b'synthetic-signature')
+        return service,sync,intent,work,marker
+
+    def test_copying_cleanup_keeps_owner_until_every_child_is_removed(self):
+        actual=os.unlink
+        for crash in (False,True):
+            with self.subTest(crash=crash):
+                _,sync,intent,work,marker=self.copying_work(self.root/str(crash))
+                def fail(path,*args,**kwargs):
+                    if Path(path).name=='fingerprint.bin':
+                        if crash:raise SystemExit(37)
+                        raise PermissionError('synthetic signature lock')
+                    return actual(path,*args,**kwargs)
+                with patch.object(os,'unlink',side_effect=fail):
+                    with self.assertRaises(SystemExit if crash else PermissionError):sync._clean_work(intent)
+                self.assertTrue(marker.is_file());self.assertTrue((work/'fingerprint.bin').is_file())
+                sync._recover_intents(intent['source_key'])
+                self.assertFalse(work.exists());self.assertEqual(list(sync.state.intents()),[])
+
+    def test_copying_cleanup_recovers_empty_tail_after_final_rmdir_failure(self):
+        _,sync,intent,work,marker=self.copying_work(self.root)
+        actual=os.rmdir
+        def fail(path,*args,**kwargs):
+            if Path(path)==work:raise PermissionError('synthetic final directory lock')
+            return actual(path,*args,**kwargs)
+        with patch.object(os,'rmdir',side_effect=fail):
+            with self.assertRaises(PermissionError):sync._clean_work(intent)
+        self.assertTrue(work.is_dir());self.assertFalse(marker.exists());self.assertEqual(list(work.iterdir()),[])
+        sync._recover_intents(intent['source_key'])
+        self.assertFalse(work.exists());self.assertEqual(list(sync.state.intents()),[])
+
+    def test_copying_cleanup_rejects_nonempty_missing_or_changed_owner(self):
+        service,sync,intent,work,marker=self.copying_work(self.root)
+        original=marker.read_bytes();marker.unlink()
+        with self.assertRaises(LocalBrowserError):sync._recover_intents(intent['source_key'])
+        changed=copy.deepcopy(service.store.unpack(original));changed['ownership']['work_id']='d'*32
+        marker.write_bytes(service.store.pack(changed))
+        with self.assertRaises(LocalBrowserError):sync._recover_intents(intent['source_key'])
+        self.assertTrue((work/'profile/proof').is_file());self.assertTrue((work/'fingerprint.bin').is_file())
+        marker.write_bytes(original);sync._recover_intents(intent['source_key'])
+        self.assertFalse(work.exists());self.assertEqual(list(sync.state.intents()),[])
+
     def test_cancel_is_constant_size_and_stops_only_following_items(self):
         service,sync,items=fixture(self.root,count=3);entered=threading.Event();release=threading.Event()
         copy_profile=service._copy_profile

@@ -16,10 +16,11 @@ import browser_processes as processes
 
 
 class Process:
-    def __init__(self, pid, profile, executable, *, created=100, port=9222, args=None, name=None):
+    def __init__(self, pid, profile, executable, *, fingerprint, created=100, port=9222, args=None, name=None):
         self.pid = pid
         self.args = (list(args) if args is not None else
                      [str(executable), '--user-data-dir=' + str(profile),
+                      '--fingerprint-config=' + str(fingerprint),
                       '--remote-debugging-port=' + str(port), '--remote-debugging-address=127.0.0.1'])
         self.created = created
         self.executable = str(executable)
@@ -63,10 +64,13 @@ class BatchStatusTests(unittest.TestCase):
         self.executable = self.root / 'BitBrowser.exe'
         self.executable.write_bytes(b'synthetic-core')
         self.digest = core.sha256(self.executable)
+        self.fingerprint = self.root / 'synthetic-fingerprint.bin'
+        self.fingerprint.write_bytes(b'synthetic-signature')
 
     def controller(self, count):
         windows = [{'alias': 'p' + str(index), 'profile_path': str(self.root / ('profile-' + str(index))),
-                    'core_path': str(self.executable), 'core_sha256': self.digest}
+                    'core_path': str(self.executable), 'core_sha256': self.digest,
+                    'fingerprint_path': str(self.fingerprint)}
                    for index in range(count)]
         controller = core.BrowserController(self.root, settings={'windows': windows, 'persistent': False})
         controller._save = Mock()
@@ -74,7 +78,8 @@ class BatchStatusTests(unittest.TestCase):
         return controller
 
     def process(self, controller, index, pid, **kwargs):
-        return Process(pid, controller.profiles['p' + str(index)]['profile_path'], self.executable, **kwargs)
+        return Process(pid, controller.profiles['p' + str(index)]['profile_path'], self.executable,
+                       fingerprint=self.fingerprint, **kwargs)
 
     def record(self, process, **kwargs):
         return {'pid': process.pid, 'created': process.created, 'port': process.port,
@@ -297,6 +302,36 @@ class BatchStatusTests(unittest.TestCase):
                 self.assertEqual(scans, 1)
                 self.assertEqual(controller.state, {})
                 controller._save.assert_not_called()
+
+    def test_fingerprint_identity_is_required_for_adoption_and_existing_records(self):
+        for saved in (False,True):
+            for change in ('missing','different','duplicate','duplicate_empty','duplicate_missing','empty'):
+                with self.subTest(saved=saved,change=change):
+                    controller=self.controller(1)
+                    candidate=self.process(controller,0,101)
+                    if change=='missing':candidate.args.pop(2)
+                    elif change=='different':candidate.args[2]='--fingerprint-config='+str(self.root/'other.bin')
+                    elif change=='duplicate':candidate.args.append(candidate.args[2])
+                    elif change=='duplicate_empty':candidate.args.append('--fingerprint-config=')
+                    elif change=='duplicate_missing':candidate.args.append('--fingerprint-config')
+                    else:candidate.args[2]='--fingerprint-config='
+                    candidate.info['cmdline']=list(candidate.args)
+                    if saved:controller.state['p0']=self.record(candidate)
+                    result,scans,_=self.run_statuses(controller,[candidate],visible={101})
+                    self.assertEqual(result,{'p0':'已在其他进程打开'})
+                    self.assertEqual(scans,1)
+                    self.assertEqual(controller.state,{})
+
+    def test_quoted_and_separate_fingerprint_parameter_keeps_valid_process_identity(self):
+        for separate in (False,True):
+            with self.subTest(separate=separate):
+                controller=self.controller(1)
+                candidate=self.process(controller,0,101)
+                value='"'+str(self.fingerprint)+'"'
+                candidate.args[2:3]=['--fingerprint-config',value] if separate else ['--fingerprint-config='+value]
+                candidate.info['cmdline']=list(candidate.args)
+                result,_,_=self.run_statuses(controller,[candidate],visible={101})
+                self.assertEqual(result,{'p0':'已打开'})
 
     def test_partial_enumeration_failure_preserves_saved_record(self):
         controller = self.controller(1)

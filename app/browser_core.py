@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import hashlib
+from http.client import HTTPConnection, HTTPException
 import json
 import os
 import re
@@ -13,7 +14,6 @@ import subprocess
 import threading
 import time
 from urllib.parse import urlparse
-from urllib.request import build_opener, ProxyHandler
 
 import psutil
 import websocket
@@ -33,19 +33,48 @@ def sha256(path: Path):
     return digest.hexdigest()
 
 
+def _short_executable_path(executable):
+    """Use an existing Windows spelling only; never create a link or copy."""
+    try:
+        api=ctypes.WinDLL('kernel32',use_last_error=True).GetShortPathNameW
+        api.argtypes=[wintypes.LPCWSTR,wintypes.LPWSTR,wintypes.DWORD]
+        api.restype=wintypes.DWORD
+        output=ctypes.create_unicode_buffer(32768)
+        size=api(str(executable),output,len(output))
+        if not 0<size<len(output):return None
+        alias=Path(output.value)
+        if (alias.is_absolute() and alias.resolve()==executable.resolve()
+                and alias.samefile(executable) and alias.parent.samefile(executable.parent)):
+            return alias
+    except (OSError,ValueError,AttributeError):pass
+    return None
+
+
 def _check_launch_paths(executable):
-    if os.name!='nt':return
+    executable=Path(executable)
+    if os.name!='nt':return executable
     # Chromium also loads nested resources in its utility/network processes.
     # A short executable path alone does not ensure those files are accessible.
     manifest=executable.parent/'manifest.json'
-    paths=[executable]
+    relative=[]
     if manifest.is_file():
         with manifest.open('rb') as stream:raw=stream.read(16*1024*1024+1)
         if len(raw)>16*1024*1024:raise LocalBrowserError('内核清单不完整，未启动浏览器。')
-        try:paths.extend(executable.parent/name for name in json.loads(raw).get('files',{}))
+        try:
+            relative=[Path(name) for name in json.loads(raw).get('files',{})]
+            if any(path.is_absolute() or '..' in path.parts for path in relative):raise ValueError()
         except (ValueError,TypeError):raise LocalBrowserError('内核清单不完整，未启动浏览器。') from None
-    if any(len(str(path.resolve()).encode('utf-16-le'))//2>=260 for path in paths):
-        raise LocalBrowserError('程序目录层级过深，内核资源超过Windows的路径限制；请将整个文件夹移到磁盘根目录附近后重试。')
+    def fits(candidate):
+        # Resolving here would expand an 8.3 spelling back to the long path.
+        return all(len(str(path).encode('utf-16-le'))//2<260
+                   for path in (candidate,*(candidate.parent/name for name in relative)))
+    canonical=executable.resolve()
+    if fits(canonical):return canonical
+    alias=_short_executable_path(canonical)
+    if alias is not None and fits(alias):return alias
+    error=LocalBrowserError('程序目录层级过深，内核资源超过Windows的路径限制，且当前磁盘无法提供可用短路径；请将整个文件夹移到磁盘根目录附近后重试。')
+    error.code='engine_path_too_long'
+    raise error
 
 
 def _visible_windows(pid):
@@ -78,8 +107,18 @@ def _free_port():
 
 
 def _endpoint(port: int, timeout=1):
-    with build_opener(ProxyHandler({})).open(f'http://127.0.0.1:{int(port)}/json/version', timeout=timeout) as response:
-        data = json.loads(response.read(65536))
+    connection = HTTPConnection('127.0.0.1', int(port), timeout=timeout)
+    try:
+        connection.request('GET', '/json/version')
+        response = connection.getresponse()
+        raw = response.read(65537)
+        if response.status != 200 or len(raw) > 65536:
+            raise LocalBrowserError('浏览器本地控制接口尚未就绪。')
+        data = json.loads(raw)
+    except HTTPException:
+        raise LocalBrowserError('浏览器本地控制接口尚未就绪。') from None
+    finally:
+        connection.close()
     parsed = urlparse(data['webSocketDebuggerUrl'])
     if parsed.scheme != 'ws' or parsed.hostname not in ('127.0.0.1', 'localhost') or parsed.port != port:
         raise LocalBrowserError('浏览器调试接口返回了意外地址。')
@@ -164,9 +203,13 @@ class BrowserController:
                 if not _is_browser(args) or os.path.normcase(str(Path(process.exe()).resolve())) != os.path.normcase(str(Path(item['core_path']).resolve())):
                     return False
             profiles = _switch_values(args, '--user-data-dir')
+            fingerprints = _switch_values(args, '--fingerprint-config')
+            fingerprint_switches = sum(arg == '--fingerprint-config' or arg.startswith('--fingerprint-config=') for arg in args)
             ports = _switch_values(args, '--remote-debugging-port')
             return (len(profiles) == 1
                     and os.path.normcase(str(Path(profiles[0].strip('"')).resolve())) == os.path.normcase(str(Path(item['profile_path']).resolve()))
+                    and fingerprint_switches == 1 and len(fingerprints) == 1 and bool(fingerprints[0].strip('"'))
+                    and os.path.normcase(str(Path(fingerprints[0].strip('"')).resolve())) == os.path.normcase(str(Path(item['fingerprint_path']).resolve()))
                     and ports == [str(record['port'])] and 0 < int(record['port']) < 65536
                     and _switch_values(args, '--remote-debugging-address') == ['127.0.0.1']
                     and self._core_valid(item))
@@ -238,6 +281,8 @@ class BrowserController:
             with self.lock:
                 current = self.state.get(alias)
                 if not current or (current['pid'], current['created']) != identity or not self._record_valid(alias):
+                    return
+                if self.profiles[alias].get('enable_background_mode'):
                     return
                 if _visible_windows(current['pid']):
                     current['window_observed'] = True
@@ -352,6 +397,8 @@ class BrowserController:
                 return '已打开'
             if not self.state[alias].get('window_observed') and time.time() - self.state[alias]['created'] < 25:
                 return '启动未完成'
+            if self.profiles[alias].get('enable_background_mode') and self.state[alias].get('window_observed') and self.state[alias].get('ready'):
+                return '已打开'
             self._queue_windowless_close(alias)
             return '正在关闭'
         if snapshot is not None:
@@ -413,6 +460,10 @@ class BrowserController:
                     self.state[alias]['window_observed']=True
                     self._save()
                     return self.state[alias]
+                if current.get('enable_background_mode') and record.get('window_observed') and record.get('ready'):
+                    self.endpoint(alias)
+                    self.activate(alias)
+                    return record
                 # Finish saving the old instance before launching a new window.
                 self.close(alias)
             item = self.profiles[alias]
@@ -437,6 +488,7 @@ class BrowserController:
                     f'--remote-debugging-port={port}', '--remote-debugging-address=127.0.0.1',
                     f'--file-url-path-alias=/gen={executable.parent / "gen"}', '--no-default-browser-check',
                     '--no-first-run', '--disable-background-mode', '--disable-blink-features=AutomationControlled']
+            if item.get('enable_background_mode'):args.remove('--disable-background-mode')
             if item.get('restore_session',True) and not bootstrap_blank:
                 args.append('--restore-last-session')
             if item.get('window_size_once'):
@@ -496,11 +548,17 @@ class BrowserController:
             if before_launch is not None:
                 before_launch()
             require_current_signature(config,core_major=item.get('core_major'),**runtime_signature_options(item,self.root))
-            _check_launch_paths(executable)
+            launch_executable=_check_launch_paths(executable)
+            args[0]=str(launch_executable)
+            resource_alias=f'--file-url-path-alias=/gen={executable.parent / "gen"}'
+            args[args.index(resource_alias)]=f'--file-url-path-alias=/gen={launch_executable.parent / "gen"}'
+            if not background_probe and not bootstrap_blank:
+                from session_recovery import prepare_session
+                prepare_session(profile,restore=item.get('restore_session',True))
             presentation={'startupinfo':background_desktop.startupinfo()} if background_desktop is not None else {}
             # Older Chromium writes debug.log in its working directory even
             # during startup failures; keep that out of the immutable engine.
-            working_directory=profile if str(item.get('core_major'))=='104' else executable.parent
+            working_directory=profile if str(item.get('core_major'))=='104' else launch_executable.parent
             process = subprocess.Popen(args, cwd=working_directory, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,**presentation)
@@ -539,8 +597,17 @@ class BrowserController:
                     if profile_processes(profile):
                         raise LocalBrowserError('运行记录保存失败，窗口已保留；重开管理器可重新识别，也可直接正常关闭浏览器。')
                     raise LocalBrowserError('运行记录保存失败，已正常关闭本次窗口；请检查磁盘和文件占用。')
+                visible = bool(_visible_windows(process.pid))
+                if not background_probe:
+                    # The control listener can be ready before a real window appears.
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if not visible:
+                        time.sleep(min(.2, remaining))
+                        continue
                 self.state[alias]['ready'] = True
-                self.state[alias]['window_observed'] = bool(_visible_windows(process.pid))
+                self.state[alias]['window_observed'] = visible
                 try:
                     self._save()
                     item['has_launched'] = True
@@ -579,6 +646,8 @@ class BrowserController:
         with CDP(self.endpoint(alias)) as connection:
             targets = connection.call('Target.getTargets').get('targetInfos', [])
             page = next((item for item in targets if item.get('type') == 'page'), None)
+            if page is None and self.profiles[alias].get('enable_background_mode'):
+                page=connection.call('Target.createTarget',{'url':'about:blank','newWindow':True})
             if page:
                 connection.call('Target.activateTarget', {'targetId': page['targetId']})
         record = self.state.get(alias)

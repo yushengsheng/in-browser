@@ -7,6 +7,7 @@ from pathlib import Path
 import runpy
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -75,6 +76,51 @@ class RunnerContracts(unittest.TestCase):
 
 
 class ApplicationContracts(unittest.TestCase):
+    def test_settings_save_rolls_back_all_profiles_if_one_write_fails(self):
+        from manager_service import ManagerService
+        from window_store import WindowStore
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('window_store.protect', side_effect=lambda value, **kwargs: value):
+            service = ManagerService.__new__(ManagerService)
+            service.operations = threading.RLock()
+            service.store = WindowStore(None, Path(directory))
+            for index in range(3):
+                service.store.put({'id': str(index), 'seq': index + 1, 'created_at': 'fixture', '_prefs_dirty': False})
+            original = service.settings()
+            pack = service.store.pack
+
+            def failing_pack(record):
+                if record.get('id') == '1':
+                    raise OSError('synthetic storage failure')
+                return pack(record)
+
+            with patch.object(service.store, 'pack', side_effect=failing_pack):
+                result = service.request('settings_save', {'settings': {'confirm_close': False}})
+            self.assertFalse(result['ok'])
+            self.assertEqual(service.settings(), original)
+            self.assertTrue(all(not row['_prefs_dirty'] for row in service.store.all()))
+
+    def test_settings_save_uses_one_write_transaction_and_keeps_record_fields(self):
+        from manager_service import ManagerService
+        from window_store import WindowStore
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('window_store.protect', side_effect=lambda value, **kwargs: value):
+            service = ManagerService.__new__(ManagerService)
+            service.operations = threading.RLock()
+            service.store = WindowStore(None, Path(directory))
+            for index in range(30):
+                service.store.put({'id': str(index), 'seq': index + 1, 'created_at': 'fixture',
+                                   '_prefs_dirty': False, '_native': {'fixture': index}})
+            before = service.store.all()
+            with patch.object(service.store, 'connect', wraps=service.store.connect) as connect:
+                result = service.request('settings_save', {'settings': {'confirm_close': False}})
+            self.assertTrue(result['ok'])
+            self.assertLessEqual(connect.call_count, 2)
+            self.assertFalse(service.settings()['confirm_close'])
+            for row in before:
+                row['_prefs_dirty'] = True
+            self.assertEqual(service.store.all(), before)
+
     def test_public_bridge_preserves_disabled_creation_and_restricted_save(self):
         from manager_service import ManagerService
         service = ManagerService.__new__(ManagerService)

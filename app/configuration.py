@@ -296,12 +296,20 @@ class Configuration:
         with _SOURCE_ENGINE_LOCK:
             archive=self._archive_data();engines=archive.get('engines',{})
             store=LocalEngineStore()
-            if major in engines:return store.validate(engines[major],archive['key_id'],major)
+            if major in engines:
+                existing=store.ensure_current(engines[major],archive['key_id'],major)
+                if str(existing)==engines[major]:return existing
+                updated=copy.deepcopy(archive)
+                updated['engines'][major]=str(existing)
+                write_encrypted(self.root/'local-source-archive.bin',encode_archive(updated,self.root),root=self.root)
+                self._source_archive_cache=None
+                return existing
             signer=LocalSigner(self.root,load_private=False)
             if signer.key_id!=archive['key_id']:raise LocalBrowserError('本地内核与签名根不匹配，未更新映射。')
             reader=copy.copy(self);reader.independent=False
             source=BitSource(reader)._core_path(major)
             path=store.ensure(major,source,signer.public_der)
+            path=store.ensure_current(path,archive['key_id'],major)
             path=store.validate(path,archive['key_id'],major)
             updated=copy.deepcopy(archive)
             updated.setdefault('engines',{})[major]=str(path)
@@ -405,6 +413,8 @@ class Configuration:
             output['MemorySaverModeEnabled']=bool(prefs.get('memory_saver'))
         if previous_preferences is None or prefs.get('abort_images')!=previous_preferences.get('abort_images'):
             output['maxImageBytes']=0 if prefs.get('abort_images') else None
+        if profile.get('created_locally'):
+            output['maxImageBytes']=int(profile.get('created_options',{}).get('image_limit_kb',0))*1024 if prefs.get('abort_images') else None
         if previous_preferences is None or prefs.get('disable_notifications')!=previous_preferences.get('disable_notifications'):
             output.pop('notificationsMode',None)
         core=(profile.get('_runtime') or {}).get('core_major') or (profile.get('fingerprint') or {}).get('coreVersion')

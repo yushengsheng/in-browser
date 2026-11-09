@@ -215,6 +215,9 @@ const state = {
   settingsDirty: false,
   settingsSaving: false,
   settingsLoaded: false,
+  settingsRevision: 0,
+  creatingDraft: false,
+  creation: { job: null, requestId: null, revision: 0, timer: null, reading: false, opening: false },
   operationIds: new Set(),
   operationActions: new Map(),
   batchBusy: false,
@@ -817,16 +820,21 @@ async function cancelSyncJob() {
 async function bootstrap({ quiet = false } = {}) {
   if (state.loading) return;
   state.loading = true;
-  state.statusRevision++;
+  const revision = ++state.statusRevision;
   const syncRevision = state.sync.requestRevision;
+  const creationRevision = state.creation.revision;
+  const settingsRevision = state.settingsRevision;
   $("#refresh-button").disabled = true;
   try {
     const data = await api("bootstrap", { include_archived: true });
-    acceptBootstrap(data, { preserveDrafts: quiet, syncRevision });
+    const profilesCurrent = revision === state.statusRevision;
+    acceptBootstrap(data, { preserveDrafts: quiet || !profilesCurrent, syncRevision, creationRevision, profilesCurrent,
+      settingsCurrent: settingsRevision === state.settingsRevision && !state.settingsSaving });
     setConnection(true);
-    showServiceError("");
-    if (!quiet && state.panel !== "profiles") renderPanel(state.panel);
+    if (profilesCurrent) showServiceError("");
+    if (profilesCurrent && !quiet && state.panel !== "profiles") renderPanel(state.panel);
   } catch (error) {
+    if (revision !== state.statusRevision) return;
     setConnection(false);
     showServiceError(error.message);
   } finally {
@@ -835,15 +843,17 @@ async function bootstrap({ quiet = false } = {}) {
     renderProfiles();
   }
 }
-function acceptBootstrap(data = {}, { preserveDrafts = true, syncRevision = state.sync.requestRevision } = {}) {
-  state.profiles = Array.isArray(data.profiles) ? data.profiles.filter((profile) => !state.deletedIds.has(String(profile.id))) : [];
-  state.groups = Array.isArray(data.groups) ? data.groups : [];
-  state.tags = Array.isArray(data.tags) ? data.tags : [];
+function acceptBootstrap(data = {}, { preserveDrafts = true, syncRevision = state.sync.requestRevision, creationRevision = state.creation.revision, profilesCurrent = true, settingsCurrent = true } = {}) {
+  if (profilesCurrent) {
+    state.profiles = Array.isArray(data.profiles) ? data.profiles.filter((profile) => !state.deletedIds.has(String(profile.id))) : [];
+    state.groups = Array.isArray(data.groups) ? data.groups : [];
+    state.tags = Array.isArray(data.tags) ? data.tags : [];
+  }
   state.cores = Array.isArray(data.cores) ? data.cores : [];
   state.defaults = mergedDefaults(data.defaults);
   state.capabilities = data.capabilities || {};
   renderSourceGuidance();
-  if (data.settings) {
+  if (data.settings && settingsCurrent) {
     state.settings = copy(data.settings);
     if (!preserveDrafts || (!state.settingsDirty && !state.settingsSaving)) {
       state.settingsDraft = copy(data.settings);
@@ -855,6 +865,7 @@ function acceptBootstrap(data = {}, { preserveDrafts = true, syncRevision = stat
     if (data.sync_job === null && state.sync.jobId && !state.sync.starting && !state.sync.cancelling) clearSyncJob();
     else restoreSyncJob(data.sync_job);
   }
+  if (creationRevision === state.creation.revision && !state.creation.mutating && !state.saving && "creation_job" in data) acceptCreationJob(data.creation_job);
   pruneSelection();
   renderFilters();
   renderProfiles();
@@ -869,8 +880,9 @@ function mergedDefaults(value = {}) {
   };
 }
 async function refreshProfiles() {
-  state.statusRevision++;
+  const revision = ++state.statusRevision;
   const data = await api("list", { include_archived: true });
+  if (revision !== state.statusRevision) return;
   if (Array.isArray(data)) state.profiles = data.filter((profile) => !state.deletedIds.has(String(profile.id)));
   else if (Array.isArray(data?.profiles)) state.profiles = data.profiles.filter((profile) => !state.deletedIds.has(String(profile.id)));
   else throw new Error("本地服务未返回窗口列表。");
@@ -1060,7 +1072,7 @@ function renderProfiles() {
     : "暂无浏览器窗口";
   $("#empty-state p").textContent = filtered
     ? "尝试更换筛选条件，或重置筛选"
-    : sourceGuidance().listEmpty;
+    : state.capabilities.create_windows ? "点击“新建窗口”创建本地窗口，或点击“同步窗口”导入本机来源" : sourceGuidance().listEmpty;
   $("#selected-count").textContent = state.selected.size;
   $$("[data-batch]").forEach(
     (button) => (button.disabled = state.batchBusy || state.deleteBusy || state.selected.size === 0 || (button.dataset.batch === "open" && active.some((profile) => state.selected.has(String(profile.id)) && isDeletePending(profile)))),
@@ -1267,14 +1279,17 @@ function renderRecycle() {
 }
 
 async function loadSettings() {
+  const revision = state.settingsRevision;
   try {
     const data = await api("settings_get");
+    if (revision !== state.settingsRevision || state.settingsSaving) return;
     state.settings = copy(data?.settings || data || {});
     state.settingsDraft = copy(state.settings);
     state.settingsLoaded = true;
     state.settingsDirty = false;
     renderSettings();
   } catch (error) {
+    if (revision !== state.settingsRevision || state.settingsSaving) return;
     $("#settings-form").innerHTML =
       `<div class="inline-error">${esc(error.message)}</div>`;
     $("#save-settings").disabled = true;
@@ -1292,10 +1307,12 @@ async function saveSettings() {
   const draft = state.settingsDraft;
   const snapshot = copy(draft);
   state.settingsSaving = true;
+  state.settingsRevision++;
   button.disabled = true;
   try {
     const result = await api("settings_save", { settings: snapshot });
     state.settings = copy(result?.settings || snapshot);
+    state.settingsLoaded = true;
     if (state.settingsDraft === draft) {
       state.settingsDirty = JSON.stringify(draft) !== JSON.stringify(snapshot);
       if (!state.settingsDirty) state.settingsDraft = copy(state.settings);
@@ -1305,6 +1322,7 @@ async function saveSettings() {
     toast(error.message, "error");
   } finally {
     state.settingsSaving = false;
+    state.settingsRevision++;
     button.disabled = false;
   }
 }
@@ -1394,7 +1412,8 @@ function buildProfileForm() {
   const lifetimeNotice = state.draft?.signature_status
     ? `<div class="info-banner" data-signature-notice>${esc(signatureNoticeText(state.draft))}</div>`
     : "";
-  const basic = `<div class="form-intro"><div><h3>基础设置</h3><p>为窗口设置独立的名称和使用信息</p></div></div><div class="form-grid">${field("name", "窗口名称", "text", { required: true, placeholder: "请输入窗口名称" })}${field("group", "分组", "select", { options: [["", "未分组"], ...state.groups.map((group) => [group, group])], help: "分组可在左侧“分组管理”中添加或修改。" })}${field("tags", "标签", "text", { valueType: "list", placeholder: "输入标签，使用逗号分隔", help: "同一窗口可以设置多个标签。" })}${field("platform", "账号平台", "text", { placeholder: "例如：自定义平台名称" })}${field("username", "账号 / 用户名", "text", { placeholder: "可选，仅保存在本机" })}${field("password", "账号密码", "password", { placeholder: "请输入账号密码" })}${field("duplicate_check", "重复校验", "checkbox", { text: "校验重复窗口信息", help: "保存时由本地服务校验重复配置。" })}${field("fa_secret", "2FA 密钥", "password", { placeholder: "可选，双重验证密钥", help: "仅在本地保存；请妥善管理。" })}${field("allow_multi_open", "多开设置", "checkbox", { text: "保留多开兼容设置", help: "不同窗口使用独立资料可同时运行，同一资料再次打开会前置。此选项仅保留兼容值。" })}${field("remark", "备注", "textarea", { placeholder: "为窗口添加备注", rows: 3, full: true })}${field("urls", "启动网址", "textarea", { placeholder: "每行一个网址，例如 https://example.com", valueType: "lines", lines: true, full: true, hint: "打开窗口时按顺序访问；留空使用默认启动页。", rows: 3 })}</div>`;
+  const creationFields = state.creatingDraft ? `<div class="form-grid">${field("creation.count", "创建数量", "number", { min: 1, max: 1000, help: "单个或批量创建，最多1000个。批量名称按前缀追加序号。" })}${field("creation.random_each", "批量指纹", "checkbox", { text: "每个窗口使用不同随机指纹", help: "关闭时所有窗口使用当前表单指纹；各窗口的资料和加密密钥仍独立。" })}${field("creation.proxy_lines", "批量代理", "textarea", { valueType: "lines", full: true, rows: 3, help: "留空使用代理设置；1行共用或每个窗口1行，支持现有代理格式。" })}</div><button id="creation-randomize" class="button" type="button">一键随机生成指纹配置</button><div class="form-divider"></div>` : "";
+  const basic = `${creationFields}<div class="form-intro"><div><h3>基础设置</h3><p>为窗口设置独立的名称和使用信息</p></div></div><div class="form-grid">${field("name", "窗口名称", "text", { required: true, placeholder: "请输入窗口名称" })}${field("group", "分组", "select", { options: [["", "未分组"], ...state.groups.map((group) => [group, group])], help: "分组可在左侧“分组管理”中添加或修改。" })}${field("tags", "标签", "text", { valueType: "list", placeholder: "输入标签，使用逗号分隔", help: "同一窗口可以设置多个标签。" })}${field("platform", "账号平台", "text", { placeholder: "例如：自定义平台名称" })}${field("username", "账号 / 用户名", "text", { placeholder: "可选，仅保存在本机" })}${field("password", "账号密码", "password", { placeholder: "请输入账号密码" })}${field("duplicate_check", "重复校验", "checkbox", { text: "校验重复窗口信息", help: "保存时由本地服务校验重复配置。" })}${field("fa_secret", "2FA 密钥", "password", { placeholder: "可选，双重验证密钥", help: "仅在本地保存；请妥善管理。" })}${field("allow_multi_open", "多开设置", "checkbox", { text: "保留多开兼容设置", help: "不同窗口使用独立资料可同时运行，同一资料再次打开会前置。此选项仅保留兼容值。" })}${field("remark", "备注", "textarea", { placeholder: "为窗口添加备注", rows: 3, full: true })}${field("urls", "启动网址", "textarea", { placeholder: "每行一个网址，例如 https://example.com", valueType: "lines", lines: true, full: true, hint: "打开窗口时按顺序访问；留空使用默认启动页。", rows: 3 })}</div>`;
   const proxy = `${lifetimeNotice}<div class="form-intro"><div><h3>代理设置</h3><p>本地独立代理，修改无需比特签名；请先关闭窗口再修改，重新打开后生效。</p></div></div><div class="form-grid">${field(
     "proxy.type",
     "代理类型",
@@ -1405,6 +1424,7 @@ function buildProfileForm() {
         ["http", "HTTP"],
         ["https", "HTTPS"],
         ["socks5", "SOCKS5"],
+        ["ssh", "SSH"],
       ],
     },
   )}${field("proxy.host", "代理主机", "text", { placeholder: "主机名 / IP，或粘贴完整代理自动分填", help: "支持协议地址、主机:端口:用户名:密码，以及竖线分隔格式。未带协议时沿用当前代理类型。", hint: "可直接粘贴完整代理；尾部到期信息会自动忽略。" })}${field("proxy.port", "代理端口", "number", { min: 1, max: 65535, placeholder: "1–65535" })}${field("proxy.username", "代理用户名", "text", { placeholder: "无认证时留空" })}${field("proxy.password", "代理密码", "password", { placeholder: "无认证时留空" })}</div><div id="proxy-parse-result" class="test-result proxy-parse-result" role="status"></div><div class="proxy-test-area"><button class="button primary" id="drawer-proxy-test" type="button">检测代理</button><span id="drawer-proxy-result" class="test-result" role="status"></span></div><div class="form-divider"></div><div class="info-banner">检测通过仅代表当前代理连接可用。每次打开窗口前都会重新检测已保存的代理，检测不通过则不会启动；认证信息只在本机使用。</div>`;
@@ -1424,8 +1444,10 @@ function buildProfileForm() {
       ["Win32", "Windows"],
       ["MacIntel", "macOS"],
       ["Linux x86_64", "Linux"],
+      ["Linux armv81", "Android"],
+      ["iPhone", "iOS"],
     ],
-  })}${fp("coreVersion", "浏览器内核", "select", { options: [["", "自动选择"], ...state.cores.map((core) => (typeof core === "string" ? [core, core] : [core.version || core.name, core.name || core.version]))], help: "必须与本机已安装的兼容浏览器内核匹配。" })}${fp("osVersion", "系统版本", "text", { placeholder: "由内核或随机化生成" })}${fp("userAgent", "User-Agent", "textarea", { full: true, rows: 3, placeholder: "浏览器用户代理字符串", help: "应与设备类型、操作系统和内核版本一致。" })}${fp("platformVersion", "平台版本", "text", { placeholder: "Client Hints 平台版本" })}${fp(
+  })}${fp("coreVersion", "浏览器内核", "select", { options: [["", "自动选择"], ...(state.creatingDraft ? state.creation.cores || [] : state.cores).map((core) => (typeof core === "string" ? [core, core] : [core.version || core.name, core.name || core.version]))], help: "必须与本机已安装的兼容浏览器内核匹配。" })}${fp("osVersion", "系统版本", "text", { placeholder: "由内核或随机化生成" })}${fp("userAgent", "User-Agent", "textarea", { full: true, rows: 3, placeholder: "浏览器用户代理字符串", help: "应与设备类型、操作系统和内核版本一致。" })}${fp("platformVersion", "平台版本", "text", { placeholder: "Client Hints 平台版本" })}${fp(
     "architecture",
     "CPU 架构",
     "select",
@@ -1444,6 +1466,7 @@ function buildProfileForm() {
       options: [
         ["0", "使用系统分辨率"],
         ["1", "自定义分辨率"],
+        ["2", "创建时随机固定"],
       ],
     },
   )}${fp("resolution", "屏幕分辨率", "text", { placeholder: "1920x1080", help: "自定义模式时使用，格式为宽x高。" })}${fp("openWidth", "窗口宽度", "number", { min: 320, max: 16384 })}${fp("openHeight", "窗口高度", "number", { min: 240, max: 16384 })}${fp(
@@ -1467,7 +1490,7 @@ function buildProfileForm() {
       options: [
         ["0", "系统字体"],
         ["1", "自定义字体"],
-        ["2", "匹配本机已有字体"],
+        ["2", "随机选用本机字体"],
       ],
       help: "自定义仅支持本机已安装字体；匹配模式从本机字体中选择。原内核的额外跨系统字体文件加载存在兼容限制，未安装字体会明确报错。",
     },
@@ -1533,8 +1556,8 @@ function buildProfileForm() {
     "select",
     {
       options: [
-        ["1", "启用"],
-        ["0", "关闭"],
+        ["0", "启用"],
+        ["1", "关闭"],
       ],
     },
   )}${fp("portWhiteList", "端口白名单", "text", { placeholder: "例如 80,443", help: "允许网页访问的本机端口。" })}${fp("deviceInfoEnabled", "设备信息", "checkbox", { text: "使用自定义设备标识" })}${fp("computerName", "计算机名称", "text", { placeholder: "自定义计算机名称" })}${fp("macAddr", "MAC 地址", "text", { placeholder: "00:00:00:00:00:00" })}${fp("launchArgs", "自定义启动参数", "textarea", { full: true, rows: 3, placeholder: "多个参数使用逗号分隔", help: "直接交给本地启动服务检查；受保护参数可能被拒绝。" })}</div></div><div class="form-card"><h4 class="form-subtitle">高级环境参数</h4><div class="form-grid">${fp("coreProduct", "内核类型", "select", { options: [["chrome", "Chromium / Chrome"]], help: "本地启动仅支持兼容的 Chromium 内核。" })}${fp("version", "浏览器完整版本", "text", { placeholder: "由有效模板或随机化生成", help: "用于生成与内核一致的 User-Agent。" })}${fp(
@@ -1549,7 +1572,17 @@ function buildProfileForm() {
       ],
     },
   )}${fp("iswow64", "WOW64", "checkbox", { text: "32 位应用运行在 64 位系统" })}${fp("uamodel", "设备型号", "text", { placeholder: "桌面设备通常留空" })}${fp("navigatorVendor", "浏览器厂商", "text", { placeholder: "Google Inc." })}${fp("timeZoneOffset", "时区偏移兼容值", "number", { help: "兼容字段；Chromium 的时区以 IANA 时区名称为准。" })}${fp("precisionData", "手动位置精度 (米)", "number", { min: 0, step: "any", help: "手动指定经纬度时使用。" })}${fp("hostIP", "WebRTC 替换地址", "text", { placeholder: "WebRTC 选择“替换”时使用" })}${fp("webglparameterscode", "WebGL 参数代码", "text", { placeholder: "有效模板中的参数代码", help: "需与 GPU 厂商、渲染器和完整参数匹配；不自动推断。" })}${fp("modelName", "设备型号名称", "text", { placeholder: "留空沿用模板默认值" })}${fp("manufacturerName", "设备制造商", "text", { placeholder: "留空沿用模板默认值" })}${fp("totalDiskSpace", "磁盘配额 (KiB)", "number", { min: 0, help: "空或 0 使用内核默认值。" })}${fp("ignoreHttpsErrors", "HTTPS 证书", "checkbox", { text: "允许忽略证书错误", help: "启用后可能接受不可信或过期的证书。" })}</div></div>`;
-  const preferences = `<div class="form-intro"><div><h3>偏好设置</h3><p>按需调整此窗口的浏览器行为，实际效果取决于内核支持</p></div></div><div class="form-grid">${preferenceDefinitions.map(([key, label, hint]) => field(`preferences.${key}`, label, "checkbox", { text: "启用", help: hint })).join("")}</div>`;
+  const launchOptions = state.creatingDraft || state.draft?.created_locally ? `<div class="form-divider"></div><h4 class="form-subtitle">启动与清理</h4><div class="form-grid">${field("created_options.workbench", "打开时显示IP信息页", "select", {options:[["localserver","显示"],["disable","不显示"]]})}${field("created_options.dynamic_proxy_url", "动态代理提取链接", "text", {full:true,help:"可选。每次打开先提取1条代理，再经过正常转发和10秒检测。支持单条文本或JSON；失败不回退直连。"})}${field("created_options.dynamic_proxy_type", "提取代理协议", "select", {options:[["socks5","SOCKS5"],["http","HTTP"],["https","HTTPS"],["ssh","SSH"]]})}${[
+    ["clear_cache", "启动前清理缓存", "只清理此窗口的受管缓存。"],
+    ["clear_cache_without_extensions", "清理时保留扩展缓存", "配合清理缓存使用。"],
+    ["clear_cookies", "启动前清理 Cookie", "会清除此窗口的登录Cookie，已登录网站可能需要重新登录。"],
+    ["clear_history", "启动前清理历史", "清除此窗口的历史与访问索引。"],
+    ["random_each_open", "每次打开随机指纹", "仅本地新建窗口支持；开启会改变环境，网站可能要求重新验证。"],
+    ["stop_ip_change", "出口 IP 改变时停止打开", "与上次成功打开的出口比较。"],
+    ["stop_country_change", "出口国家改变时停止打开", "无法核实国家时也停止打开。"],
+    ["enable_background_mode", "允许浏览器后台运行", "关闭最后一个标签后仍可能由浏览器扩展保持进程。"],
+  ].map(([key,label,hint])=>field(`created_options.${key}`,label,"checkbox",{text:"启用",help:hint})).join("")}${field("created_options.image_limit_kb", "禁止加载图片的大小下限（KiB）", "number", {min:0,max:102400,help:"配合禁止加载图片；0表示所有图片，大于0交由原生内核按大小限制。"})}</div>` : "";
+  const preferences = `<div class="form-intro"><div><h3>偏好设置</h3><p>按需调整此窗口的浏览器行为，实际效果取决于内核支持</p></div></div><div class="form-grid">${preferenceDefinitions.map(([key, label, hint]) => field(`preferences.${key}`, label, "checkbox", { text: "启用", help: hint })).join("")}</div>${launchOptions}`;
   const cookies = `<div class="form-intro"><div><h3>Cookie 设置</h3><p>编辑或导入此窗口的 Cookie 文本</p></div></div><div class="cookie-toolbar"><span>支持格式以本地服务校验结果为准</span><button id="import-cookie" type="button" class="button small">${svg("import")}从文本文件导入</button></div>${field("cookie_text", "Cookie 内容", "textarea", { full: true, class: "cookie-editor", rows: 17, placeholder: "在此粘贴 Cookie 文本", help: "Cookie 可能包含登录状态，内容仅保留在本机。" })}<div class="info-banner" style="margin-top:20px">保存后由本地服务校验并应用 Cookie。请只导入你有权使用的登录信息。</div><input id="cookie-file-input" type="file" accept=".txt,.json,.cookies" hidden>`;
   $("#profile-form").innerHTML = Object.entries({
     basic,
@@ -1563,11 +1596,16 @@ function buildProfileForm() {
         `<section class="form-section ${state.section === key ? "active" : ""}" data-form-section="${key}">${content}</section>`,
     )
     .join("");
-  $$("[data-form-section='fingerprint'] input,[data-form-section='fingerprint'] select,[data-form-section='fingerprint'] textarea", $("#profile-form")).forEach((control) => { control.disabled = true; });
+  $$("[data-form-section='fingerprint'] input,[data-form-section='fingerprint'] select,[data-form-section='fingerprint'] textarea", $("#profile-form")).forEach((control) => { control.disabled = !state.creatingDraft; });
+  if (state.creatingDraft) {
+    const notice = $(".fingerprint-overview", $("#profile-form"));
+    if (notice) notice.textContent = "为新窗口选择内核和指纹；提交后固定保存，日常打开不重新生成。";
+  }
 }
 
-function openDrawer(profile, section = "basic", focusField = null) {
+function openDrawer(profile, section = "basic", focusField = null, creating = false) {
   if (!profile || isDeletePending(profile) || state.deletedIds.has(String(profile.id)) || state.operationActions.get(String(profile.id)) === "delete" || !$("#profile-drawer").hidden) return;
+  state.creatingDraft = creating;
   state.draft = mergedProfile(profile);
   state.drawerSession++;
   state.dirty = false;
@@ -1577,7 +1615,7 @@ function openDrawer(profile, section = "basic", focusField = null) {
   state.proxyParseRequest++;
   state.proxyParsePromise = null;
   state.proxyTestQueued = null;
-  $("#drawer-title").textContent = "编辑窗口";
+  $("#drawer-title").textContent = creating ? "创建窗口" : "编辑窗口";
   showDrawerError("");
   buildProfileForm();
   setDrawerSection(section);
@@ -1622,6 +1660,7 @@ async function closeDrawer() {
   $(".app-shell").inert = false;
   document.body.style.overflow = "";
   state.draft = null;
+  state.creatingDraft = false;
   state.drawerSession++;
   state.dirty = false;
   state.proxyParseRequest++;
@@ -1654,6 +1693,49 @@ function readField(control) {
   if (Array.isArray(previous) && control.dataset.type === "string")
     value = splitList(value);
   setPath(state.draft, control.dataset.field, value);
+  if (state.creatingDraft && previous !== value && ["fingerprint.coreVersion","fingerprint.os","fingerprint.ostype"].includes(control.dataset.field)) {
+    const fp = state.draft.fingerprint;
+    const deviceChanged = control.dataset.field === "fingerprint.ostype";
+    if (deviceChanged) {
+      const mobile = fp.ostype !== "PC";
+      fp.openWidth = mobile ? 500 : 1280;
+      fp.openHeight = mobile ? 950 : 720;
+      fp.devicePixelRatio = fp.ostype === "Android" ? 2 : fp.ostype === "IOS" ? 3 : 1;
+      fp.resolutionType = mobile ? "1" : "0";
+      const resolutions = state.creation.resolutions?.[fp.ostype] || [];
+      fp.resolution = mobile ? resolutions[Math.floor(Math.random() * resolutions.length)] || "" : "1920x1080";
+      fp.osVersion = "";
+    }
+    if (fp.ostype === "Android") { fp.os = "Linux armv81"; fp.platformVersion = "14"; }
+    else if (fp.ostype === "IOS") { fp.os = "iPhone"; fp.platformVersion = "18.0"; }
+    else if (control.dataset.field === "fingerprint.ostype") { fp.os = "Win32"; fp.platformVersion = "10.0.0"; }
+    else if (control.dataset.field === "fingerprint.os") fp.platformVersion = fp.os === "MacIntel" ? "10.15.7" : fp.os === "Win32" ? "10.0.0" : "";
+    const major = fp.coreVersion || "148";
+    const platform = fp.os === "MacIntel" ? "Macintosh; Intel Mac OS X 10_15_7" : String(fp.os).startsWith("Linux") ? "X11; Linux x86_64" : "Windows NT 10.0; Win64; x64";
+    fp.userAgent = fp.ostype === "Android" ? `Mozilla/5.0 (Linux; Android ${fp.platformVersion}; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Mobile Safari/537.36`
+      : fp.ostype === "IOS" ? `Mozilla/5.0 (iPhone; CPU iPhone OS ${String(fp.platformVersion).replaceAll(".","_")} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/${major}.0.0.0 Mobile/15E148 Safari/604.1`
+      : `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+    const presets = (state.creation.presets || []).filter(p => p.ostype === fp.ostype && p.os === fp.os);
+    const matched = presets.find(p => p.core === major) || presets[0];
+    if (matched) {
+      Object.assign(fp, copy(matched.values));
+      const version = state.creation.builds?.[major] || `${major}.0.0.0`;
+      fp.userAgent = fp.userAgent.replace(/(Chrome\/|CriOS\/)[0-9.]+/, `$1${version}`);
+      for (const key of ["architecture","uamodel","webGLManufacturer","webGLRender","webgpu"]) {
+        const control = $("#field-fingerprint-" + key);
+        if (control) control.value = key === "webgpu" && fp[key] ? JSON.stringify(fp[key]) : fp[key] || "";
+      }
+    }
+    const ua = $("#field-fingerprint-userAgent"); if (ua) ua.value = fp.userAgent;
+    const os = $("#field-fingerprint-os"); if (os) os.value = fp.os;
+    const version = $("#field-fingerprint-platformVersion"); if (version) version.value = fp.platformVersion;
+    if (deviceChanged) {
+      for (const key of ["openWidth","openHeight","devicePixelRatio","resolutionType","resolution","osVersion"]) {
+        const target = $("#field-fingerprint-" + key);
+        if (target) target.value = fp[key];
+      }
+    }
+  }
   if (control.dataset.field === "cookie_text" && previous !== value) {
     state.cookieReadRequest++;
     const input = $("#cookie-file-input");
@@ -1833,6 +1915,7 @@ async function saveProfile() {
   profile.core_version =
     profile.fingerprint.coreVersion || profile.core_version;
   profile.os = profile.fingerprint.os;
+  if (state.creatingDraft) return submitCreation(profile);
   state.saving = true;
   setDrawerBusy(true, "正在保存窗口…");
   showDrawerError("");
@@ -2267,7 +2350,154 @@ async function exportProfiles(button) {
   }
 }
 
+async function openCreation(batch = false) {
+  if (state.creation.opening || !$("#profile-drawer").hidden) return;
+  state.creation.opening = true;
+  try {
+    const options = await api("creation_options");
+    if (options.latest && ["running", "interrupted", "failed"].includes(options.latest.state)) {
+      acceptCreationJob(options.latest);
+      showCreationProgress();
+      return;
+    }
+    const draft = mergedProfile(options.defaults);
+    draft.creation = { count: batch ? 10 : 1, random_each: batch, proxy_lines: [] };
+    state.creation.cores = options.cores;
+    state.creation.presets = options.presets || [];
+    state.creation.builds = options.builds || {};
+    state.creation.resolutions = options.resolutions || {};
+    state.creation.requestId = window.crypto.randomUUID().replaceAll("-", "");
+    openDrawer(draft, "basic", null, true);
+  } catch (error) { toast(error.message, "error"); }
+  finally { state.creation.opening = false; }
+}
+
+async function randomizeCreation() {
+  if (!state.creatingDraft || state.saving) return;
+  const draft = state.draft, session = state.drawerSession;
+  state.saving = true; setDrawerBusy(true, "生成指纹…");
+  try {
+    const result = await api("creation_randomize", { fingerprint: draft.fingerprint });
+    if (draft !== state.draft || session !== state.drawerSession) return;
+    draft.fingerprint = result.fingerprint;
+    state.dirty = true;
+    buildProfileForm();
+  } catch (error) { showDrawerError(error.message); }
+  finally { state.saving = false; setDrawerBusy(false); }
+}
+
+async function submitCreation(profile) {
+  const options = profile.creation || {};
+  const count = Number(options.count);
+  if (!Number.isInteger(count) || count < 1 || count > 1000) return showDrawerError("创建数量须为1至1000的整数。");
+  delete profile.creation;
+  state.saving = true; setDrawerBusy(true, "提交创建任务…");
+  state.creation.revision++;
+  try {
+    const job = await api("create_windows", { request_id: state.creation.requestId,
+      profile, count, random_each: options.random_each === true, proxy_lines: options.proxy_lines || [] });
+    acceptCreationJob(job);
+    state.dirty = false;
+    state.saving = false; setDrawerBusy(false);
+    await closeDrawer();
+    showCreationProgress();
+    if (job.state !== "running") await refreshCreatedProfiles();
+  } catch (error) {
+    showDrawerError(error.message + " 若提交结果未确认，请保持表单原样重试；相同请求不会重复创建。");
+  } finally { state.saving = false; setDrawerBusy(false); }
+}
+
+async function refreshCreatedProfiles() {
+  const revision = state.creation.revision;
+  try { await refreshProfiles(); }
+  catch {
+    if (revision !== state.creation.revision) return;
+    $("#creation-error").textContent = "创建进度已更新，但窗口列表刷新失败，请刷新窗口列表。";
+    $("#creation-error").hidden = false;
+  }
+}
+
+function acceptCreationJob(job) {
+  state.creation.revision++;
+  state.creation.job = job;
+  $("#creation-progress-button").hidden = !job;
+  clearTimeout(state.creation.timer);
+  if (!job) {
+    $("#creation-summary").textContent = "没有待处理的创建任务。";
+    $("#creation-progress").max = 1;
+    $("#creation-progress").value = 0;
+    $("#creation-results").innerHTML = "";
+    $("#creation-cancel").hidden = true;
+    $("#creation-resume").hidden = true;
+    return;
+  }
+  const labels = { running: "创建中", interrupted: "已中断，可继续", completed: "创建完成", failed: "部分失败，可重试", cancelled: "已取消剩余项" };
+  $("#creation-summary").textContent = `${labels[job.state] || job.state} · 成功 ${job.completed} / ${job.total}，失败 ${job.failed}`;
+  $("#creation-progress").max = Math.max(1, job.total);
+  $("#creation-progress").value = job.completed + job.failed;
+  $("#creation-results").innerHTML = (job.items || []).map((item) => `<p>${esc(item.index)} · ${esc(item.message)}</p>`).join("");
+  $("#creation-cancel").hidden = !["running", "interrupted", "failed"].includes(job.state);
+  $("#creation-cancel").disabled = job.cancel_requested;
+  $("#creation-resume").hidden = !["interrupted", "failed"].includes(job.state);
+  clearTimeout(state.creation.timer);
+  if (job.state === "running") state.creation.timer = setTimeout(() => pollCreation(), 1000);
+}
+
+function showCreationProgress() {
+  if (!$("#creation-dialog").open) $("#creation-dialog").showModal();
+  pollCreation(true);
+}
+
+async function pollCreation(manual = false) {
+  const creation = state.creation;
+  if (!creation.job || creation.reading) return;
+  creation.reading = true;
+  let failed = false;
+  const jobId = creation.job.job_id, revision = creation.revision;
+  try {
+    const job = await api("creation_status", { job_id: jobId, missing_ok: true });
+    if (jobId !== creation.job?.job_id || revision !== creation.revision) return;
+    const finished = creation.job.state === "running" && job?.state !== "running";
+    $("#creation-error").hidden = true;
+    acceptCreationJob(job);
+    if (finished) await refreshCreatedProfiles();
+  } catch (error) {
+    if (jobId !== creation.job?.job_id || revision !== creation.revision) return;
+    failed = true;
+    $("#creation-error").textContent = error.message + "，请刷新进度。";
+    $("#creation-error").hidden = false;
+  } finally {
+    creation.reading = false;
+    if (!failed && creation.job?.state === "running" && !creation.mutating) {
+      clearTimeout(creation.timer);
+      creation.timer = setTimeout(() => pollCreation(), 1000);
+    }
+  }
+}
+
+async function mutateCreation(action) {
+  const job = state.creation.job;
+  if (!job || state.creation.mutating) return;
+  state.creation.mutating = true;
+  state.creation.revision++;
+  clearTimeout(state.creation.timer);
+  try {
+    const updated = await api(action, { job_id: job.job_id });
+    acceptCreationJob(updated);
+    if (updated.state !== "running") await refreshCreatedProfiles();
+  }
+  catch (error) { $("#creation-error").textContent = error.message; $("#creation-error").hidden = false; }
+  finally { state.creation.mutating = false; }
+}
+
 function bindEvents() {
+  $("#new-window-button").onclick = () => openCreation(false);
+  $("#batch-create-button").onclick = () => openCreation(true);
+  $("#creation-progress-button").onclick = showCreationProgress;
+  $("#creation-close").onclick = () => $("#creation-dialog").close();
+  $("#creation-cancel").onclick = () => mutateCreation("cancel_creation");
+  $("#creation-resume").onclick = () => mutateCreation("resume_creation");
+  $("#creation-refresh").onclick = () => pollCreation(true);
   $$(".nav-item").forEach((button) =>
     button.addEventListener("click", () => navigate(button.dataset.panel)),
   );
@@ -2469,6 +2699,7 @@ function bindEvents() {
     saveProfile();
   };
   $("#profile-form").addEventListener("click", (event) => {
+    if (event.target.closest("#creation-randomize")) randomizeCreation();
     const reveal = event.target.closest("[data-reveal]");
     if (reveal) {
       const input = document.getElementById(reveal.dataset.reveal);
@@ -2638,9 +2869,12 @@ function initializeBridge() {
   bootstrap({ quiet: true }).then(async () => {
     if (!state.settingsLoaded) {
       try {
+        const revision = state.settingsRevision;
         const settings = await api("settings_get");
-        state.settings = settings?.settings || settings || {};
-        state.settingsLoaded = true;
+        if (revision === state.settingsRevision && !state.settingsSaving) {
+          state.settings = settings?.settings || settings || {};
+          state.settingsLoaded = true;
+        }
       } catch {
         /* The settings panel presents its own read error. */
       }

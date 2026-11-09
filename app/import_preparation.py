@@ -20,6 +20,9 @@ def prepare_import(service,record,candidate,staged,work):
     if portable:
         record['_portable_crypt']=capture_profile(Path(staged))
         record['_portable_app']=str(APP_ROOT)
+    if record.get('_source_info'):
+        from import_cookies import materialize
+        materialize(service,record,staged,signature=Path(work)/'fingerprint.bin',work_parent=Path(work))
     if continuity:
         probe=copy.deepcopy(record)
         signature=Path(work)/'fingerprint.bin'

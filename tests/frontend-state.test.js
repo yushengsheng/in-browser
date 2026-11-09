@@ -27,6 +27,181 @@ test("independent import discloses first enrollment when historical seed is miss
   assert.doesNotThrow(() => context.signatureNoticeText(profile));
 });
 
+test("new window entry preserves source sync and keeps imported fingerprints read-only", async () => {
+  const h=fixture();
+  h.context.window.crypto={randomUUID:()=>"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"};
+  h.context.api=async(action)=>({cores:["104","148"],defaults:{name:"新窗口",fingerprint:{coreVersion:"148"}}});
+  await h.context.openCreation(true);
+  assert.equal(h.state.creatingDraft,true);
+  assert.equal(h.state.draft.creation.count,10);
+  assert.equal(h.state.creation.requestId,"aaaaaaaabbbbccccddddeeeeeeeeeeee");
+  assert.ok(h.element("#create-button").onclick);
+  await h.context.closeDrawer();
+  h.context.openDrawer({id:"existing",name:"existing",fingerprint:{coreVersion:"148"}});
+  assert.equal(h.state.creatingDraft,false);
+  assert.match(source,/control.disabled = !state.creatingDraft/);
+});
+
+test("port scan protection labels preserve the native mode values", () => {
+  const h = fixture();
+  for (const [mode, label] of [["0", "启用"], ["1", "关闭"]]) {
+    h.state.draft = h.context.mergedProfile({ fingerprint: { portScanProtect: mode } });
+    h.state.creatingDraft = true;
+    h.context.buildProfileForm();
+    const select = h.element("#profile-form").innerHTML.match(/<select id="field-fingerprint-portScanProtect"[^>]*>(.*?)<\/select>/s);
+    assert.ok(select);
+    assert.match(select[1], new RegExp(`<option value="${mode}" selected>${label}</option>`));
+    h.context.readField({ dataset: { field: "fingerprint.portScanProtect", type: "string" }, value: mode });
+    assert.equal(h.state.draft.fingerprint.portScanProtect, mode);
+  }
+});
+
+test("explicit creation device changes apply the stock mobile screen defaults and preserve later manual edits", () => {
+  const h = fixture();
+  const catalog = JSON.parse(fs.readFileSync(path.join(root, "app/resources/creation-catalog.json"), "utf8"));
+  h.state.creatingDraft = true;
+  h.state.creation.resolutions = catalog.MobileResolutions;
+  h.state.creation.presets = catalog.Presets;
+  h.state.creation.builds = catalog.BuildVersions;
+  h.state.draft = h.context.mergedProfile({ fingerprint: { coreVersion: "104", ostype: "PC", os: "Win32" } });
+  const edit = (field, value) => h.context.readField({ dataset: { field: "fingerprint." + field, type: "string" }, value });
+  for (const [device, dpr] of [["Android", 2], ["IOS", 3]]) {
+    edit("ostype", device);
+    const fp = h.state.draft.fingerprint;
+    assert.equal(fp.openWidth, 500);
+    assert.equal(fp.openHeight, 950);
+    assert.equal(fp.devicePixelRatio, dpr);
+    assert.equal(fp.resolutionType, "1");
+    assert.ok(catalog.MobileResolutions[device].includes(fp.resolution));
+    assert.equal(h.element("#field-fingerprint-resolution").value, fp.resolution);
+    edit("resolution", "400x850");
+    edit("devicePixelRatio", 2.5);
+    edit("openWidth", 520);
+    edit("openHeight", 980);
+    edit("coreVersion", fp.coreVersion === "104" ? "148" : "104");
+    assert.equal(fp.resolution, "400x850");
+    assert.equal(fp.devicePixelRatio, 2.5);
+    assert.equal(fp.openWidth, 520);
+    assert.equal(fp.openHeight, 980);
+  }
+  edit("ostype", "PC");
+  const fp = h.state.draft.fingerprint;
+  assert.equal(fp.openWidth, 1280);
+  assert.equal(fp.openHeight, 720);
+  assert.equal(fp.devicePixelRatio, 1);
+  assert.equal(fp.resolutionType, "0");
+  assert.equal(fp.resolution, "1920x1080");
+  const before = JSON.stringify(h.state.draft);
+  h.state.creatingDraft = false;
+  h.context.readField({ disabled: true, dataset: { field: "fingerprint.ostype", type: "string" }, value: "Android" });
+  assert.equal(JSON.stringify(h.state.draft), before);
+});
+
+test("creation with an interrupted task opens its progress instead of a second draft", async () => {
+  const h=fixture();
+  h.context.api=async(action)=>({latest:{job_id:"fixture",state:"interrupted",total:3,completed:1,failed:0,items:[]}});
+  h.context.pollCreation=async()=>{};
+  await h.context.openCreation();
+  assert.equal(h.state.creation.job.job_id,"fixture");
+  assert.equal(h.element("#creation-dialog").open,true);
+  assert.equal(h.state.draft,null);
+});
+
+test("failed creation keeps an accessible retry and explicit cancel", async () => {
+  const h=fixture();
+  h.context.api=async()=>({latest:{job_id:"failed",state:"failed",total:2,completed:1,failed:1,items:[]}});
+  h.context.pollCreation=async()=>{};
+  await h.context.openCreation();
+  assert.equal(h.state.draft,null);
+  assert.equal(h.element("#creation-cancel").hidden,false);
+  assert.equal(h.element("#creation-resume").hidden,false);
+});
+
+test("creation completed before its submission response refreshes the new window list", async () => {
+  const h=fixture();
+  const job={job_id:"fixture",state:"completed",total:1,completed:1,failed:0,items:[]};
+  let refreshes=0;
+  h.context.api=async()=>job;
+  h.context.refreshProfiles=async()=>refreshes++;
+  h.context.pollCreation=async()=>{};
+  await h.context.submitCreation({name:"synthetic",creation:{count:1}});
+  assert.equal(refreshes,1);
+  assert.equal(h.state.creation.job.state,"completed");
+  assert.equal(h.element("#creation-dialog").open,true);
+  assert.equal(h.state.saving,false);
+});
+
+test("cancel recognizing a committed window and immediate resume completion refresh the list", async () => {
+  for (const [action,state] of [["cancel_creation","cancelled"],["resume_creation","completed"]]) {
+    const h=fixture();
+    const job={job_id:"fixture",state:"interrupted",total:2,completed:0,failed:0,items:[]};
+    let refreshes=0;
+    h.context.acceptCreationJob(job);
+    h.context.api=async()=>({...job,state,completed:1,cancel_requested:state==="cancelled"});
+    h.context.refreshProfiles=async()=>refreshes++;
+    await h.context.mutateCreation(action);
+    assert.equal(refreshes,1);
+    assert.equal(h.state.creation.job.state,state);
+    assert.equal(h.state.creation.job.completed,1);
+    assert.equal(h.state.creation.mutating,false);
+  }
+});
+
+test("a list refresh failure keeps the confirmed creation result", async () => {
+  const h=fixture();
+  h.context.api=async()=>({job_id:"fixture",state:"completed",total:1,completed:1,failed:0,items:[]});
+  h.context.refreshProfiles=async()=>{throw new Error("synthetic failure");};
+  h.context.pollCreation=async()=>{};
+  await h.context.submitCreation({name:"synthetic",creation:{count:1}});
+  assert.equal(h.state.creation.job.state,"completed");
+  assert.equal(h.state.draft,null);
+  assert.equal(h.element("#creation-error").hidden,false);
+  assert.doesNotMatch(h.element("#creation-error").textContent,/结果未确认/);
+});
+
+test("late creation status cannot roll back a confirmed cancel", async () => {
+  const h=fixture(),pending=deferred();
+  const job={job_id:"fixture",state:"running",total:3,completed:1,failed:0,items:[]};
+  h.context.acceptCreationJob(job);
+  h.context.api=async(action)=>action==="creation_status"?pending.promise:{...job,state:"cancelled",cancel_requested:true};
+  const polling=h.context.pollCreation();
+  await h.context.mutateCreation("cancel_creation");
+  pending.resolve({...job,completed:0});await polling;
+  assert.equal(h.state.creation.job.state,"cancelled");
+  assert.equal(h.state.creation.job.completed,1);
+  assert.equal(h.state.creation.reading,false);
+});
+
+test("late bootstrap cannot replace newer creation progress", async () => {
+  const h=fixture(),pending=deferred();
+  h.context.api=async()=>pending.promise;
+  const reading=h.context.bootstrap({quiet:true});
+  h.context.acceptCreationJob({job_id:"new",state:"completed",total:1,completed:1,failed:0,items:[]});
+  pending.resolve({creation_job:null});await reading;
+  assert.equal(h.state.creation.job.job_id,"new");
+});
+
+test("missing creation status clears deleted history and stops polling", async () => {
+  const h=fixture();
+  h.context.acceptCreationJob({job_id:"deleted",state:"running",total:1,completed:0,failed:0,items:[]});
+  h.context.api=async(action,payload)=>{assert.equal(action,"creation_status");assert.equal(payload.missing_ok,true);return null;};
+  await h.context.pollCreation(true);
+  assert.equal(h.state.creation.job,null);
+  assert.equal(h.element("#creation-progress-button").hidden,true);
+  assert.equal(h.timers.size,0);
+});
+
+test("uncertain creation submission retries the same request with an intact draft", async () => {
+  const h=fixture(),requests=[];
+  h.state.creatingDraft=true;h.state.creation.requestId="a".repeat(32);
+  h.state.draft={name:"synthetic",fingerprint:{},creation:{count:2,random_each:true,proxy_lines:[]}};
+  h.context.api=async(action,payload)=>{requests.push(JSON.parse(JSON.stringify(payload)));throw new Error("synthetic failure");};
+  for(let i=0;i<2;i++)await h.context.submitCreation(JSON.parse(JSON.stringify(h.state.draft)));
+  assert.deepEqual(requests[0],requests[1]);
+  assert.equal(h.state.draft.creation.count,2);
+  assert.equal(h.state.saving,false);
+});
+
 function fixture() {
   const nodes = new Map();
   const timers = new Map();
@@ -57,6 +232,8 @@ function fixture() {
     clearTimeout(id) { timers.delete(id); },
   });
   vm.runInContext(source.slice(0, entry), context, { filename: "app/ui/app.js" });
+  vm.runInContext(source.slice(source.indexOf("let initialized = false;"),
+    source.indexOf('document.addEventListener("visibilitychange"')), context);
   const renderProfiles = context.renderProfiles;
   const refreshProfiles = context.refreshProfiles;
   const nativeConfirmAction = context.confirmAction;
@@ -1162,6 +1339,115 @@ test("late list and bootstrap responses cannot resurrect a deleted profile", asy
   h.context.acceptBootstrap({ profiles: original });
   assert.deepEqual(Array.from(h.state.profiles, (profile) => profile.id), ["fixture-1"]);
   assert.equal(h.state.selected.has("fixture-0"), false);
+});
+
+test("late list replies cannot overwrite a newer profile list or groups", async () => {
+  const h = fixture(), stale = deferred();
+  let calls = 0;
+  h.context.api = async () => ++calls === 1 ? stale.promise : {
+    profiles: [{ id: "fixture", name: "new", archived: true }], groups: ["new"],
+  };
+  const first = h.refreshProfiles();
+  await h.refreshProfiles();
+  stale.resolve({ profiles: [{ id: "fixture", name: "old", archived: false }], groups: ["old"] });
+  await first;
+  assert.equal(h.state.profiles[0].name, "new");
+  assert.equal(h.state.profiles[0].archived, true);
+  assert.deepEqual(Array.from(h.state.groups), ["new"]);
+});
+
+test("bootstrap requested before a list refresh cannot restore stale metadata", async () => {
+  const h = fixture(), stale = deferred();
+  let connected = false;
+  h.context.setConnection = (value) => { connected = value; };
+  h.context.api = async (action) => action === "bootstrap" ? stale.promise : {
+    profiles: [{ id: "fixture", name: "saved" }], groups: ["saved"],
+  };
+  const bootstrap = h.context.bootstrap({ quiet: true });
+  await h.refreshProfiles();
+  stale.resolve({ profiles: [{ id: "fixture", name: "old" }], groups: ["old"],
+    cores: ["148"], capabilities: { sync_windows: true }, settings: { confirm_close: true },
+    sync_job: { job_id: "fixture-job", state: "interrupted" } });
+  await bootstrap;
+  assert.equal(h.state.profiles[0].name, "saved");
+  assert.deepEqual(Array.from(h.state.groups), ["saved"]);
+  assert.equal(h.state.loading, false);
+  assert.equal(connected, true);
+  assert.equal(h.state.capabilities.sync_windows, true);
+  assert.deepEqual(Array.from(h.state.cores), ["148"]);
+  assert.equal(h.state.settingsLoaded, true);
+  assert.equal(h.state.sync.jobId, "fixture-job");
+  assert.equal(h.state.sync.status.state, "interrupted");
+});
+
+test("stale bootstrap cannot undo settings saved while its list was superseded", async () => {
+  const h = fixture(), stale = deferred();
+  h.context.api = async (action) => action === "bootstrap" ? stale.promise : { profiles: [] };
+  const bootstrap = h.context.bootstrap({ quiet: true });
+  h.state.settingsLoaded = true;
+  h.state.settingsRevision++;
+  h.state.settings = { confirm_close: false };
+  h.state.settingsDraft = { confirm_close: false };
+  await h.refreshProfiles();
+  stale.resolve({ profiles: [], settings: { confirm_close: true } });
+  await bootstrap;
+  assert.equal(h.state.settings.confirm_close, false);
+  assert.equal(h.state.settingsDraft.confirm_close, false);
+});
+
+for (const read of ["bootstrap", "loadSettings"]) {
+  test(`late ${read} cannot overwrite a newer confirmed settings save`, async () => {
+    const h = fixture(), stale = deferred();
+    h.state.settings = { confirm_close: true };
+    h.state.settingsDraft = { confirm_close: false };
+    h.state.settingsDirty = true;
+    h.context.api = async (action, payload) => action === "settings_save"
+      ? { settings: payload.settings } : stale.promise;
+    const reading = h.context[read]({ quiet: true });
+    await h.context.saveSettings();
+    stale.resolve({ profiles: [], settings: { confirm_close: true } });
+    await reading;
+    assert.equal(h.state.settings.confirm_close, false);
+    assert.equal(h.state.settingsDraft.confirm_close, false);
+    assert.equal(h.state.settingsLoaded, true);
+  });
+}
+
+test("initial bootstrap and settings read still render the settings panel", async () => {
+  const h = fixture(), bootstrapReply = deferred(), settingsReply = deferred();
+  let rendered = 0;
+  h.state.panel = "settings";
+  h.context.renderSettings = () => { rendered++; };
+  h.context.api = async (action) => action === "bootstrap" ? bootstrapReply.promise : settingsReply.promise;
+  const bootstrap = h.context.bootstrap({ quiet: true });
+  const settings = h.context.loadSettings();
+  bootstrapReply.resolve({ profiles: [], settings: { confirm_close: true } });
+  await bootstrap;
+  settingsReply.resolve({ confirm_close: true });
+  await settings;
+  assert.equal(rendered, 1);
+  assert.equal(h.state.settingsLoaded, true);
+});
+
+test("bridge fallback settings read cannot overwrite a confirmed save", async () => {
+  const h = fixture(), stale = deferred();
+  let readStarted = false;
+  h.context.apiAvailable = () => true;
+  h.context.bootstrap = async () => {};
+  h.context.api = async (action, payload) => {
+    if (action === "settings_save") return { settings: payload.settings };
+    readStarted = true;
+    return stale.promise;
+  };
+  h.context.initializeBridge();
+  await Promise.resolve();
+  assert.equal(readStarted, true);
+  h.state.settingsDraft = { confirm_close: false };
+  await h.context.saveSettings();
+  stale.resolve({ confirm_close: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.state.settings.confirm_close, false);
+  assert.equal(h.state.settingsLoaded, true);
 });
 
 test("source preview requested before deletion cannot overwrite the refreshed preview", async () => {

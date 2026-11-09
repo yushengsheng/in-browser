@@ -92,6 +92,50 @@ class ManagerRouteTests(unittest.TestCase):
         show.assert_called_once();service.configuration.proxy_test.assert_not_called()
         self.assertEqual(record['_runtime']['local_proxy_mode'],'direct')
 
+    def test_created_direct_webrtc_replacement_checks_actual_egress_before_launch(self):
+        service,record=self.service(direct=True)
+        record.update(created_locally=True,fingerprint={'webRTC':'0'},created_options={},
+                      _native={'WebRTC':{'PublicIP':'192.0.2.1'}})
+        with patch('created_window.prepare_launch',side_effect=lambda s,p,**kw:p), \
+                patch('created_window.apply_launch_cleanup'), \
+                patch('dynamic_proxy.prepare_dynamic_proxy',side_effect=lambda s,p:p), \
+                patch('proxy_check.ProxyChecker') as checker:
+            checker.return_value.test.return_value={'success':True,'egress_ip':'192.0.2.1'}
+            self.run_open(service)
+            checker.return_value.test.assert_called_once_with(record['proxy'])
+        self.assertEqual(record['_pending_creation_egress'] if '_pending_creation_egress' in record else record['_last_creation_egress'],
+                         {'ip':'192.0.2.1','country':None})
+
+    def test_created_direct_webrtc_mismatch_refuses_launch_and_skips_info_tab(self):
+        service,record=self.service(direct=True)
+        record.update(created_locally=True,fingerprint={'webRTC':'0'},created_options={},
+                      _native={'WebRTC':{'PublicIP':'192.0.2.1'}})
+        with patch('created_window.prepare_launch',side_effect=lambda s,p,**kw:p), \
+                patch('created_window.apply_launch_cleanup'), \
+                patch('dynamic_proxy.prepare_dynamic_proxy',side_effect=lambda s,p:p), \
+                patch('proxy_check.ProxyChecker') as checker, \
+                patch('manager_service.require_current_signature'), \
+                patch('manager_service.profile_processes',return_value=[]), \
+                patch('ip_info_page.show_ip_info') as show:
+            checker.return_value.test.return_value={'success':True,'egress_ip':'192.0.2.2'}
+            with self.assertRaises(LocalBrowserError):service.open('synthetic')
+            show.assert_not_called();service.store.put.assert_not_called()
+
+    def test_local_maintenance_precedes_created_environment_probe(self):
+        service,record=self.service(direct=True)
+        record.update(created_locally=True,fingerprint={'webRTC':'3'},created_options={})
+        record['_runtime']['signature_provider']='local-v1'
+        order=[]
+        def maintain(p):order.append('maintenance');return p
+        def prepare(s,p,**kw):order.append('created_environment');return p
+        with patch('local_runtime.LocalRuntime') as runtime, \
+                patch('created_window.prepare_launch',side_effect=prepare), \
+                patch('created_window.apply_launch_cleanup'), \
+                patch('dynamic_proxy.prepare_dynamic_proxy',side_effect=lambda s,p:p):
+            runtime.return_value.prepare.side_effect=maintain
+            self.run_open(service)
+        self.assertEqual(order,['maintenance','created_environment'])
+
     def test_route_failure_stops_before_info_tab_and_never_retries_direct(self):
         service,_=self.service();service.configuration.proxy_test.return_value={'success':False,'message':'synthetic failure'}
         with patch('manager_service.require_current_signature'),patch('manager_service.profile_processes',return_value=[]),patch('ip_info_page.show_ip_info') as show:

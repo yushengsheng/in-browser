@@ -345,12 +345,14 @@ def _engine_binding(runtime):
     chrome = executable.parent.joinpath(*relative.parts).resolve()
     if not chrome.is_relative_to(executable.parent):
         raise _blocked(['core.manifest'])
-    dll_hash = sha256(chrome)
+    from engine_validation import digest_file
+    dll_hash = digest_file(chrome)
     if dll_hash != (files[names[0]] or {}).get('sha256'):
         raise _blocked(['core.chrome'])
     # Existing engine validation remains authoritative for the complete tree.
     # Binding its manifest also covers resources other than the executable/DLL.
-    return {'executable': actual, 'chrome': dll_hash, 'manifest': _digest(data)}
+    from local_engine import continuity_manifest
+    return {'executable': actual, 'chrome': dll_hash, 'manifest': _digest(continuity_manifest(data,executable))}
 
 
 def binding_for(record, root=None):
@@ -649,7 +651,7 @@ def probe_snapshot(record, root):
                 samples.append(_normalize_sample(reply.get('result', {}).get('value')))
             result = _merge_samples(*samples)
     except LocalBrowserError as exc:
-        if str(exc).startswith('环境连续性检查'):
+        if str(exc).startswith('环境连续性检查') or getattr(exc,'code',None)=='engine_path_too_long':
             raise
         raise LocalBrowserError(_FAILURE) from None
     except Exception:

@@ -31,7 +31,7 @@ def source_files(root=ROOT):
     files=[root/name for name in TOP]
     files.extend(p for p in (root/'app').iterdir() if p.suffix in ('.py','.pyw','.js') and p.is_file())
     files.extend(root/'app/ui'/name for name in ('app.js','index.html','style.css','README.md'))
-    files.extend(root/'app/resources'/name for name in ('electron-main.js','crypto.worker.js','defaults.json','signature-verification-public.der'))
+    files.extend(root/'app/resources'/name for name in ('electron-main.js','crypto.worker.js','defaults.json','signature-verification-public.der','creation-catalog.json'))
     for directory in ('docs','tests','tools','.github'):
         for path in (root/directory).rglob('*'):
             if path.is_file() and '__pycache__' not in path.parts and path.suffix in ('.py','.pyw','.js','.json','.md','.html','.css','.yml','.yaml','.sha256','.svg','.png','.ico'):

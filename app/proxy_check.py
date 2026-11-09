@@ -31,13 +31,14 @@ def _failure(*,timed_out=False,attempts=None):
     return result
 
 class ProxyChecker:
-    def __init__(self,targets=None):
+    def __init__(self,targets=None,*,require_geo=False):
         self.targets=targets or PROBE_TARGETS
+        self.require_geo=require_geo
 
     def test(self,value):
         started=time.monotonic();deadline=started+CHECK_TIMEOUT
         proxy=normalize_proxy(value)
-        payload=json.dumps({'proxy':proxy,'targets':self.targets,'deadline':deadline},ensure_ascii=False).encode('utf-8')
+        payload=json.dumps({'proxy':proxy,'targets':self.targets,'deadline':deadline,'require_geo':self.require_geo},ensure_ascii=False).encode('utf-8')
         if len(payload)>_MAX_INPUT_BYTES:return _failure()
         executable=Path(sys.executable)
         if executable.name.casefold()=='pythonw.exe':executable=executable.with_name('python.exe')
@@ -70,6 +71,10 @@ class ProxyChecker:
 
     def _probe(self,value,deadline):
         proxy=normalize_proxy(value);kind=proxy['type'];mapping={}
+        if kind=='ssh':
+            from ssh_proxy import probe_route
+            with probe_route(proxy) as port:
+                return self._probe({'type':'http','host':'127.0.0.1','port':port},deadline)
         if kind!='noproxy':
             host=proxy['host'];host='['+host+']' if ':' in host else host
             auth=''
@@ -94,8 +99,12 @@ class ProxyChecker:
                         data=json.loads(raw)
                         ip=str(data.get('ip') or data.get('query') or data.get('address') or '')
                         ipaddress.ip_address(ip)
-                return {'success':True,'egress_ip':ip,'message':'代理连接与出口检测通过' if kind!='noproxy' else '网络连接成功',
+                result={'success':True,'egress_ip':ip,'message':'代理连接与出口检测通过' if kind!='noproxy' else '网络连接成功',
                         'source':target['name'],'elapsed_ms':round((time.monotonic()-started)*1000)}
+                if self.require_geo:
+                    from creation_fingerprint import geo_result
+                    result['geo']=geo_result(data)
+                return result
             except Exception:continue
         return _failure(timed_out=time.monotonic()>=deadline,attempts=attempts)
 
@@ -110,7 +119,7 @@ def _worker():
     # Also expire if the manager disappears while a socket/DNS operation blocks.
     watchdog=threading.Timer(remaining,lambda:os._exit(2));watchdog.daemon=True;watchdog.start()
     try:
-        return ProxyChecker(targets=payload['targets'])._probe(payload['proxy'],deadline)
+        return ProxyChecker(targets=payload['targets'],require_geo=payload.get('require_geo') is True)._probe(payload['proxy'],deadline)
     finally:watchdog.cancel()
 
 

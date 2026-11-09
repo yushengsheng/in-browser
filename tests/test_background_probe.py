@@ -26,20 +26,30 @@ class BackgroundProbeTests(unittest.TestCase):
             'fingerprint_path':str(self.config),'fingerprint_sha256':core.sha256(self.config),
             'new_profile':True,'restore_session':False,'launch_args':[]}
 
-    def launch(self,*,background=True,changes=None,offline=True,blank=True,urls=None,expect_no_launch=False,desktop=None):
+    def launch(self,*,background=True,changes=None,offline=True,blank=True,urls=None,expect_no_launch=False,desktop=None,
+               visibility=None,expect_timeout=False,launch_path=None):
         runtime=copy.deepcopy(self.runtime);runtime.update(changes or {})
         controller=core.BrowserController(self.root,settings={'windows':[runtime],'persistent':False})
         controller._save=Mock();controller.endpoint=Mock(return_value='synthetic-endpoint')
-        process=SimpleNamespace(pid=12345,poll=lambda:None)
+        process=Mock(pid=12345);process.poll.return_value=None
+        visible=Mock(return_value=[] if background else [1]) if visibility is None else visibility
         with patch.object(controller,'_ensure_record',return_value=False), \
+                patch.object(core,'_check_launch_paths',wraps=core._check_launch_paths) as paths, \
                 patch.object(core,'_profile_browsers',return_value=[]), \
-                patch.object(core,'_visible_windows',return_value=[]), \
+                patch.object(core,'_visible_windows',side_effect=visible), \
                 patch('signature_lifetime.require_current_signature') as signature, \
                 patch.object(core.subprocess,'Popen',return_value=process) as popen, \
                 patch.object(core.psutil,'Process',return_value=SimpleNamespace(create_time=lambda:100)):
             if expect_no_launch:popen.side_effect=AssertionError('A refused launch must not create a process')
-            result=controller.open(runtime['alias'],offline_test=offline,extra_urls=['about:blank'] if urls is None else urls,
-                                   bootstrap_blank=blank,background_probe=background,background_desktop=desktop)
+            if launch_path is not None:paths.return_value=launch_path
+            def open_browser():
+                return controller.open(runtime['alias'],offline_test=offline,extra_urls=['about:blank'] if urls is None else urls,
+                                       bootstrap_blank=blank,background_probe=background,background_desktop=desktop)
+            if expect_timeout:
+                with self.assertRaisesRegex(core.LocalBrowserError,'窗口启动超时'):open_browser()
+                result=None
+                process.kill.assert_not_called();process.terminate.assert_not_called()
+            else:result=open_browser()
         return popen.call_args,signature.call_count,result,controller
 
     def test_background_probe_retains_offline_signature_and_profile_checks(self):
@@ -57,8 +67,50 @@ class BackgroundProbeTests(unittest.TestCase):
         controller.endpoint.assert_called_once()
 
     def test_normal_browser_launch_keeps_existing_visible_mode(self):
-        call,_,_,_=self.launch(background=False)
+        call,_,result,_=self.launch(background=False)
         self.assertFalse(any(arg.startswith('--headless') for arg in call.args[0]))
+        self.assertTrue(result['ready']);self.assertTrue(result['window_observed'])
+
+    def test_launch_alias_is_used_by_executable_resources_and_working_directory(self):
+        alias=self.root/'short-spelling'/'BitBrowser.exe'
+        call,_,_,controller=self.launch(launch_path=alias)
+        self.assertEqual(call.args[0][0],str(alias))
+        self.assertIn('--file-url-path-alias=/gen='+str(alias.parent/'gen'),call.args[0])
+        self.assertEqual(call.kwargs['cwd'],alias.parent)
+        self.assertEqual(controller.profiles[self.runtime['alias']]['core_path'],str(self.executable))
+
+    def test_path_limit_cause_survives_environment_probe_wrapping(self):
+        import fingerprint_continuity as continuity
+        error=core.LocalBrowserError('程序目录层级过深');error.code='engine_path_too_long'
+        before=copy.deepcopy(self.runtime)
+        controller=Mock();controller.profiles={'synthetic':{}};controller.open.side_effect=error
+        with patch.object(continuity,'BrowserController',return_value=controller), \
+                patch.object(continuity,'profile_processes',return_value=[]):
+            with self.assertRaises(core.LocalBrowserError) as caught:
+                continuity.probe_snapshot({'_runtime':self.runtime},self.root)
+        self.assertIs(caught.exception,error)
+        self.assertEqual(self.runtime,before)
+
+    def test_normal_launch_waits_for_visible_window_after_control_is_ready(self):
+        visible=Mock(side_effect=[[],[],[1]])
+        with patch.object(core.time,'sleep') as sleep:
+            _,_,result,controller=self.launch(background=False,visibility=visible)
+        self.assertTrue(result['ready']);self.assertTrue(result['window_observed'])
+        self.assertEqual(controller.endpoint.call_count,3)
+        self.assertEqual(sleep.call_count,2)
+
+    def test_normal_launch_without_visible_window_uses_existing_deadline_and_keeps_process(self):
+        elapsed=[0.0]
+        def sleep(delay):elapsed[0]+=delay
+        with patch.object(core.time,'monotonic',side_effect=lambda:elapsed[0]), \
+                patch.object(core.time,'sleep',side_effect=sleep):
+            _,_,result,controller=self.launch(background=False,visibility=lambda pid:[],expect_timeout=True)
+        self.assertIsNone(result)
+        self.assertAlmostEqual(elapsed[0],25)
+        self.assertEqual(controller.state[self.runtime['alias']]['pid'],12345)
+        self.assertFalse(controller.state[self.runtime['alias']]['ready'])
+        self.assertFalse(controller.state[self.runtime['alias']]['window_observed'])
+        self.assertNotIn('has_launched',controller.profiles[self.runtime['alias']])
 
     def test_verified_environment_flags_are_shared_by_probe_and_normal_launch(self):
         environment=['--force-prefers-no-reduced-motion','--use-angle=d3d11','--ignore-gpu-blocklist']

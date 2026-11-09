@@ -155,14 +155,14 @@ class LegacySourceTests(unittest.TestCase):
         return path
 
     def test_existing_engine_mapping_is_validated_and_never_replaced(self):
-        self.archive();store=Mock();store.validate.return_value=self.root/'old-engine.exe'
+        self.archive();store=Mock();store.ensure_current.return_value=self.root/'old-engine.exe'
         with patch('local_engine.LocalEngineStore',return_value=store),patch.object(BitSource,'_core_path') as source:
             self.assertEqual(self.configuration.local_core('148'),self.root/'old-engine.exe')
         source.assert_not_called();store.ensure.assert_not_called()
 
     def test_new_engine_mapping_is_atomic_encrypted_and_keeps_existing_values(self):
         path=self.archive();source=self.base/'stock.exe';deployed=self.root/'new-engine.exe'
-        store=Mock();store.ensure.return_value=deployed;store.validate.return_value=deployed
+        store=Mock();store.ensure.return_value=deployed;store.ensure_current.return_value=deployed;store.validate.return_value=deployed
         with patch('local_engine.LocalEngineStore',return_value=store),patch.object(BitSource,'_core_path',return_value=source):
             self.assertEqual(self.configuration.local_core('124'),deployed)
         store.ensure.assert_called_once_with('124',source,self.signer.public_der)

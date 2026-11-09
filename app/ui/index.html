@@ -72,6 +72,9 @@
         >
           <div class="workspace-card">
             <div class="card-toolbar">
+              <button id="new-window-button" class="button primary"><span data-icon="windows"></span>新建窗口</button>
+              <button id="batch-create-button" class="button">批量创建</button>
+              <button id="creation-progress-button" class="button" hidden>创建进度</button>
               <button id="create-button" class="button primary">
                 <span data-icon="refresh"></span>同步窗口</button
               ><button id="sync-preview-button" class="button">
@@ -380,6 +383,11 @@
       <footer class="sync-footer"><span id="sync-footer-note" class="muted">其他云端窗口不在本次同步范围内</span><div class="footer-buttons"><button id="sync-cancel-job" class="button danger-text" hidden>取消剩余同步</button><button id="sync-retry-status" class="button" hidden>继续读取进度</button><button id="sync-dismiss" class="button">关闭</button><button id="sync-start" class="button primary" disabled>同步所选窗口</button></div></footer>
     </dialog>
     <div id="row-menu" class="row-menu" role="menu" hidden></div>
+    <dialog id="creation-dialog" class="sync-dialog" aria-labelledby="creation-title">
+      <header class="sync-header"><h2 id="creation-title">创建窗口</h2><button id="creation-close" class="icon-button" aria-label="关闭创建进度">×</button></header>
+      <div class="sync-content"><p id="creation-summary" role="status"></p><progress id="creation-progress" max="1" value="0"></progress><p id="creation-error" class="inline-error" hidden></p><div id="creation-results" class="sync-result-list" role="log"></div></div>
+      <footer class="sync-footer"><span class="muted">已创建窗口会保留；取消仅停止后续项</span><div class="footer-buttons"><button id="creation-cancel" class="button danger-text">取消剩余</button><button id="creation-resume" class="button">继续未完成项</button><button id="creation-refresh" class="button">刷新进度</button></div></footer>
+    </dialog>
     <div id="toast-region" class="toast-region" aria-live="polite"></div>
     <dialog id="confirm-dialog" class="confirm-dialog">
       <form method="dialog">

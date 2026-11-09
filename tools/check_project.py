@@ -280,6 +280,19 @@ def main(argv=None):
                 entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
             installation = ROOT / 'tests/test_installation_inspector.py'
             entries.append(run_command('installation-inspector', [python, '-B', str(installation)], 'unittest', env))
+            recovery = ROOT / 'tests/test_local_runtime_recovery.py'
+            entries.append(run_command('local-runtime-recovery', [python, '-B', str(recovery)], 'unittest', env))
+            creation = ROOT / 'tests/test_window_creation.py'
+            entries.append(run_command('window-creation', [python, '-B', str(creation)], 'unittest', env))
+            entries.append(run_command('creation-parity', [python, '-B', str(ROOT/'tests/test_creation_parity.py')], 'unittest', env))
+            ssh = ROOT / 'tests/test_ssh_proxy.py'
+            entries.append(run_command('ssh-proxy', [python, '-B', str(ssh)], 'unittest', env))
+            dynamic = ROOT / 'tests/test_dynamic_proxy.py'
+            entries.append(run_command('dynamic-proxy', [python, '-B', str(dynamic)], 'unittest', env))
+            entries.append(run_command('import-cookies', [python, '-B', str(ROOT/'tests/test_import_cookies.py')], 'unittest', env))
+            entries.append(run_command('session-recovery', [python, '-B', str(ROOT/'tests/test_session_recovery.py')], 'unittest', env))
+            entries.append(run_command('private-acceptance-transport', [python, '-B', str(ROOT/'tests/test_private_acceptance_transport.py')], 'unittest', env))
+            entries.append(run_command('private-session-verifier', [python, '-B', str(ROOT/'tests/test_private_session_verifier.py')], 'unittest', env))
             for name, style in FIXTURES:
                 path = ROOT / 'analysis' / name
                 if not path.is_file():

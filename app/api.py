@@ -1,6 +1,4 @@
 """Public bridge action dispatch; use cases remain in ManagerService."""
-from pathlib import Path
-
 from local_state import LocalBrowserError
 from profile_model import sanitize
 from proxy_config import parse_proxy
@@ -17,6 +15,14 @@ def dispatch(service,action,payload=None):
         elif action=='sync_status':result=service.synchronizer().status(payload['job_id'],after=payload.get('after'),missing_ok=payload.get('missing_ok') is True)
         elif action=='cancel_sync':result=service.synchronizer().cancel(payload['job_id'])
         elif action=='resume_sync':result=service.synchronizer().resume(payload['job_id'])
+        elif action=='creation_options':result=service.creator().options()
+        elif action=='create_windows':result=service.creator().start(payload)
+        elif action=='creation_status':result=service.creator().status(payload['job_id'],missing_ok=payload.get('missing_ok') is True)
+        elif action=='cancel_creation':result=service.creator().cancel(payload['job_id'])
+        elif action=='resume_creation':result=service.creator().resume(payload['job_id'])
+        elif action=='creation_randomize':
+            from creation_fingerprint import random_fingerprint
+            result={'fingerprint':random_fingerprint(sanitize({'fingerprint':payload.get('fingerprint') or {}})['fingerprint'])}
         elif action=='detail': result=service.detail(payload['id'])
         elif action=='save': result=service.save(payload['profile'],allow_fingerprint=False)
         elif action=='proxy_test': result=service.configuration.proxy_test(sanitize({'proxy':payload['proxy']})['proxy'])
@@ -50,17 +56,7 @@ def dispatch(service,action,payload=None):
                 result={'completed':completed,'errors':errors}
         elif action=='groups_save': result=service.groups_save(payload)
         elif action=='settings_get': result=service.settings()
-        elif action=='settings_save':
-            settings={k:payload.get('settings',payload).get(k,v) for k,v in service.settings().items()}
-            if settings['close_behavior'] not in ['keep_browsers','close_browsers']: raise LocalBrowserError('退出方式无效。')
-            if settings['start_page']: sanitize({'urls':[settings['start_page']]})
-            if settings['download_dir'] and not Path(settings['download_dir']).expanduser().is_absolute(): raise LocalBrowserError('下载目录须为绝对路径。')
-            if settings['browser_path'] and (not Path(settings['browser_path']).is_file() or Path(settings['browser_path']).name.casefold()!='bitbrowser.exe'): raise LocalBrowserError('请选择正确的比特内核文件。')
-            with service.operations:
-                for p in service.store.all():
-                    p['_prefs_dirty']=True; service.store.put(p)
-                service.store.set_setting('application',settings)
-            result={'settings':settings}
+        elif action=='settings_save': result=service.save_settings(payload.get('settings',payload))
         elif action in ['choose_folder','choose_file']:
             import webview
             if not service.window: raise LocalBrowserError('请在桌面窗口选择文件。')

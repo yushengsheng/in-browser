@@ -15,7 +15,7 @@ class ReleaseBoundary(unittest.TestCase):
             root=Path(directory)
             names=list(build_release.TOP)+['app/main.py','app/ui/app.js','app/ui/index.html',
                 'app/ui/style.css','app/ui/README.md','app/resources/electron-main.js',
-                'app/resources/crypto.worker.js','app/resources/defaults.json','app/resources/signature-verification-public.der']
+                'app/resources/crypto.worker.js','app/resources/defaults.json','app/resources/signature-verification-public.der','app/resources/creation-catalog.json']
             names+=['analysis/'+name for name in build_release.FIXTURES]
             excluded=['app/data/profile.bin','app/ui/output/playwright/private.png',
                 'app/ui/.playwright-cli/session.json','app/resources/unexpected.json','analysis/private/credentials.py']

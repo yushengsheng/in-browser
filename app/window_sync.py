@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import threading
 import traceback
@@ -302,19 +301,13 @@ class WindowSynchronizer:
                 raise LocalBrowserError('同步副本包含特殊链接，未发布或清理资料。')
 
     def _clean_work(self,intent):
+        from delete_stores import _remove_work
         work,_,_=self._intent_paths(intent)
         if work.exists():
-            marker=work/'.sync-owner.bin'
-            if not marker.is_file() or marker.stat().st_size>16384:
-                raise LocalBrowserError('同步暂存目录的所有权无法认证，已保留全部资料。')
-            ownership=self.service.store.unpack(marker.read_bytes())
-            if ownership!={'format':1,'ownership':self.state.validate_intent(intent)}:
-                raise LocalBrowserError('同步暂存目录的所有权不匹配，已保留全部资料。')
             if profile_processes(work/'profile',require_inspectable=True):
                 raise LocalBrowserError('同步暂存副本仍在使用，已保留等待恢复。')
-            self._plain_tree(work)
             work,_,_=self._intent_paths(intent)
-            shutil.rmtree(work)
+            _remove_work(self.service,work,self.service.root,self.state.validate_intent(intent))
 
     @staticmethod
     def _publish(source,target):
