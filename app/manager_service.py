@@ -308,7 +308,7 @@ class ManagerService:
             environment_args=[]
             if not already and (self.root/'continuity-mode.bin').is_file():
                 from fingerprint_continuity import verify_continuity
-                environment_args=verify_continuity(p,self.root).get('environment_args',[])
+                environment_args=verify_continuity(p,self.root,allow_device_variance=True).get('environment_args',[])
             if not already and (self.root/'portable-mode.bin').is_file():
                 from portable_browser import prepare_profile
                 if not p.get('_portable_crypt'):raise LocalBrowserError('此窗口尚未准备便携加密资料，未启动，避免丢失登录数据。')

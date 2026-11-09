@@ -23,7 +23,7 @@ import uuid
 
 from browser_core import APP_ROOT, BrowserController, CDP, sha256
 from browser_processes import profile_processes
-from environment_compatibility import compatibility_candidate, validated_environment_args
+from environment_compatibility import compatibility_candidate, validated_environment_args, vendor_device_differences
 from local_state import LocalBrowserError
 
 
@@ -255,6 +255,14 @@ def _json(value):
 
 def _digest(value):
     return hashlib.sha256(_json(value)).hexdigest()
+
+
+def _same_value(first, second):
+    # Python considers True == 1; browser JSON types must remain distinct.
+    try:
+        return _json(first) == _json(second)
+    except (ValueError, TypeError, OverflowError):
+        return False
 
 
 def _safe_field(field):
@@ -585,7 +593,8 @@ def _blank_target(connection):
 
 def _merge_samples(first, second):
     a, b = first['values'], second['values']
-    unstable = sorted(key for key in a.keys() | b.keys() if key not in a or key not in b or a[key] != b[key])
+    unstable = sorted(key for key in a.keys() | b.keys()
+                      if key not in a or key not in b or not _same_value(a[key], b[key]))
     return {'values': {key: value for key, value in a.items() if key not in unstable},
             'unstable': unstable,
             'unavailable': sorted(set(first.get('unavailable', [])) | set(second.get('unavailable', [])))}
@@ -706,8 +715,8 @@ def create_baseline(record, root, *, progress=None):
             'unavailable': merged['unavailable']}
 
 
-def verify_continuity(record, root):
-    """Fail closed on a missing/mismatched baseline; never learn a new machine."""
+def verify_continuity(record, root, *, allow_device_variance=False):
+    """Keep strict enrollment; normal opens may accept stock-verified variations."""
     baseline = record.get('_continuity')
     if not isinstance(baseline, dict) or baseline.get('format') != FORMAT or baseline.get('probe_version') != PROBE_VERSION:
         raise _blocked(['baseline'])
@@ -739,9 +748,11 @@ def verify_continuity(record, root):
                            if key not in actual['values'] or key in actual.get('unstable', [])]
     if missing_or_unstable:
         raise _blocked(missing_or_unstable)
-    changes = [key for key, value in stable.items() if actual['values'][key] != value]
+    changes = [key for key, value in stable.items() if not _same_value(actual['values'][key], value)]
+    accepted = (vendor_device_differences(record['_runtime'], stable, actual['values'])
+                if allow_device_variance is True else [])
     environment_args = []
-    if changes:
+    if set(changes) - set(accepted):
         environment_args = compatibility_candidate(stable, changes)
         if not environment_args:
             raise _blocked(changes)
@@ -749,12 +760,20 @@ def verify_continuity(record, root):
         actual = probe_snapshot(probe_record, root)
         if binding_for(record, root) != current:
             raise _blocked(['binding'], environment_args=environment_args)
-        changes = [key for key, value in stable.items()
-                   if key not in actual['values'] or actual['values'][key] != value
-                   or key in actual.get('unstable', [])]
-        if changes:
+        missing_or_unstable = [key for key in stable
+                               if key not in actual['values'] or key in actual.get('unstable', [])]
+        if missing_or_unstable:
+            raise _blocked(missing_or_unstable, environment_args=environment_args)
+        changes = [key for key, value in stable.items() if not _same_value(actual['values'][key], value)]
+        accepted = (vendor_device_differences(record['_runtime'], stable, actual['values'])
+                    if allow_device_variance is True else [])
+        if set(changes) - set(accepted):
             raise _blocked(changes, environment_args=environment_args)
     return {'passed': True, 'stable_fields': len(stable),
             'unstable_fields': list(baseline.get('unstable') or []),
             'unavailable_fields': list(baseline.get('unavailable') or []),
-            'environment_args': environment_args}
+            'environment_args': environment_args,
+            'device_variance_fields': accepted,
+            'verification_policy': ('vendor-compatible-148' if allow_device_variance is True
+                                    and record['_runtime'].get('signature_provider') == 'local-v1'
+                                    and str(record['_runtime'].get('core_major')) == '148' else 'strict')}

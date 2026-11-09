@@ -312,7 +312,7 @@ def main():
         return 0
     sys.dont_write_bytecode = True
     sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tools')]
-    report = {'success': False, 'executed': True, 'checks': {}, 'rounds': []}
+    report = {'success': False, 'executed': True, 'checks': {}, 'rounds': [], 'continuity_rounds': []}
     service = server = server_thread = None
     owned = []
     marker_valid = False
@@ -324,6 +324,7 @@ def main():
         from browser_processes import profile_processes
         from manager_service import ManagerService
         import browser_core
+        import fingerprint_continuity as continuity
         import portable_browser
         _require(not profile_processes(profile, require_inspectable=True))
         report['checks']['fixture_validated'] = True
@@ -341,6 +342,15 @@ def main():
         if report['ci_environment']:
             _require(not report['source_wrapper_decryptable'])
         original_popen = browser_core.subprocess.Popen
+        original_verify = continuity.verify_continuity
+
+        def verify(*values, **options):
+            _require(options.get('allow_device_variance') is True)
+            result = original_verify(*values, **options)
+            _require(result.get('passed') is True and result.get('verification_policy') == 'vendor-compatible-148')
+            report['continuity_rounds'].append({key: result[key] for key in (
+                'verification_policy', 'device_variance_fields', 'environment_args')})
+            return result
 
         def launch(arguments, *values, **options):
             _require(isinstance(arguments, (list, tuple)) and not options.get('shell'))
@@ -361,7 +371,8 @@ def main():
         server = _PageServer(('127.0.0.1', PORT), _PageHandler)
         server_thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .1}, daemon=True)
         server_thread.start()
-        with patch.object(browser_core.subprocess, 'Popen', side_effect=launch):
+        with patch.object(browser_core.subprocess, 'Popen', side_effect=launch), \
+                patch.object(continuity, 'verify_continuity', side_effect=verify):
             service = ManagerService(data)
             _require(service.configuration.independent)
             _require(service.store.get(IDENTITY)['_continuity'] == baseline)
@@ -389,6 +400,7 @@ def main():
             report['checks']['current_wrapper_matches_fixture_key'] = hmac.compare_digest(current_key, private_key)
             report['checks']['baseline_unchanged'] = service.store.get(IDENTITY)['_continuity'] == baseline
             report['checks']['two_cold_reopens_passed'] = len(report['rounds']) == 2
+            report['checks']['production_continuity_checked_twice'] = len(report['continuity_rounds']) == 2
             _require(all(report['checks'].values()))
             report['success'] = True
     except Exception as error:

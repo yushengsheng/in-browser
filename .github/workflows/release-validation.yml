@@ -101,11 +101,11 @@ jobs:
           }
           Expand-Archive -LiteralPath $archive -DestinationPath $env:IB_PACKAGE -Force
           "IB_LOGIN_READY=true" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - name: Verify login storage on the new Windows user without accepting device compatibility
+      - name: Verify login storage through the production manager on the new Windows user
         if: ${{ !cancelled() && env.IB_LOGIN_READY == 'true' }}
         shell: pwsh
         run: |
-          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_login_storage.py" --execute --storage-only-diagnostic
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_login_storage.py" --execute --verify
           if ($LASTEXITCODE -ne 0) { throw 'Login storage preservation failed' }
       - name: Load the genuine signature of the synthetic native configuration
         if: ${{ !cancelled() && env.IB_LOGIN_READY == 'true' }}

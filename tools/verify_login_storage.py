@@ -220,7 +220,7 @@ def main(argv=None):
               'diagnostic_only': options.storage_only_diagnostic,
               'device_compatibility_not_accepted': options.seed or options.storage_only_diagnostic,
               'continuity_gate_enforced': not options.seed and not options.storage_only_diagnostic,
-              'checks': {}, 'rounds': []}
+              'checks': {}, 'rounds': [], 'continuity_rounds': []}
     fixture = service = controller = server = server_thread = None
     profile = data = saved = None
     validated = False
@@ -240,6 +240,7 @@ def main(argv=None):
         from configuration import Configuration
         from window_store import WindowStore
         import browser_core
+        import fingerprint_continuity as continuity
         import portable_browser
         _require(not profile_processes(profile, require_inspectable=True))
         saved = _protection(record, fixture, root)
@@ -260,6 +261,15 @@ def main(argv=None):
             original_key = portable_browser._unwrap(state.get('os_crypt', {}).get('encrypted_key'))
             _require(hmac.compare_digest(original_key, portable_browser._private_key(record['_portable_crypt'])))
         original_popen = browser_core.subprocess.Popen
+        original_verify = continuity.verify_continuity
+
+        def verify(*values, **kwargs):
+            _require(kwargs.get('allow_device_variance') is True)
+            result = original_verify(*values, **kwargs)
+            _require(result.get('passed') is True and result.get('verification_policy') == 'vendor-compatible-148')
+            report['continuity_rounds'].append({key: result[key] for key in (
+                'verification_policy', 'device_variance_fields', 'environment_args')})
+            return result
 
         def launch(arguments, *values, **kwargs):
             _require(isinstance(arguments, (list, tuple)) and not kwargs.get('shell'))
@@ -284,7 +294,8 @@ def main(argv=None):
         server_thread = threading.Thread(target=server.serve_forever,
                                          kwargs={'poll_interval': .1}, daemon=True)
         server_thread.start()
-        with patch.object(browser_core.subprocess, 'Popen', side_effect=launch):
+        with patch.object(browser_core.subprocess, 'Popen', side_effect=launch), \
+                patch.object(continuity, 'verify_continuity', side_effect=verify):
             if options.seed or options.storage_only_diagnostic:
                 store = WindowStore(Configuration(data), data)
                 if options.seed:
@@ -346,6 +357,9 @@ def main(argv=None):
                 # exactly the two synthetic cookies, after every cold round.
                 fixture.load_fixture(root, allow_session_cookie=True)
             report['checks']['seed_completed' if options.seed else 'two_cold_reopens_passed'] = True
+            if report['continuity_gate_enforced']:
+                report['checks']['production_continuity_checked_twice'] = len(report['continuity_rounds']) == 2
+                _require(report['checks']['production_continuity_checked_twice'])
             current_state,_=portable_browser._read_state(profile)
             current_key=portable_browser._unwrap(current_state.get('os_crypt',{}).get('encrypted_key'))
             report['checks']['current_wrapper_matches_fixture_key']=hmac.compare_digest(

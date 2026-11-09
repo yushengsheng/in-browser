@@ -108,8 +108,10 @@ class ManagerRouteTests(unittest.TestCase):
 
     def test_continuity_verified_arguments_reach_real_launch_without_changing_native(self):
         service,record=self.service();record['_native']={'synthetic':True};native=copy.deepcopy(record['_native'])
+        record['_continuity']={'synthetic':'original-baseline'};baseline=copy.deepcopy(record['_continuity'])
         arguments=['--force-prefers-no-reduced-motion','--use-angle=d3d11','--ignore-gpu-blocklist']
-        observed=[]
+        observed=[];persisted=[]
+        service.store.put.side_effect=lambda value:persisted.append(copy.deepcopy(value))
         def launch(*values,**options):
             observed.extend(record['_runtime'].get('environment_args',[]));options['before_launch']()
         service.controller.open.side_effect=launch
@@ -117,9 +119,39 @@ class ManagerRouteTests(unittest.TestCase):
             service.root=Path(directory);(service.root/'continuity-mode.bin').write_bytes(b'synthetic')
             with patch('fingerprint_continuity.verify_continuity',return_value={'environment_args':arguments}) as verify:
                 self.run_open(service)
-        verify.assert_called_once();self.assertEqual(observed,arguments)
+        verify.assert_called_once_with(record,service.root,allow_device_variance=True);self.assertEqual(observed,arguments)
         self.assertNotIn('environment_args',record['_runtime'])
         service.controller.open.assert_called_once();self.assertEqual(record['_native'],native)
+        self.assertTrue(persisted)
+        self.assertTrue(all('environment_args' not in value['_runtime'] for value in persisted))
+        self.assertTrue(all(value['_continuity']==baseline and value['_native']==native for value in persisted))
+
+    def test_stock_device_variance_result_opens_with_original_arguments_and_is_not_persisted(self):
+        service,record=self.service();record['_native']={'synthetic':True}
+        record['_runtime']['launch_args']=['--lang=zh-CN']
+        record['_continuity']={'synthetic':'original-baseline'}
+        before=copy.deepcopy(record);observed=[];persisted=[]
+        service.store.put.side_effect=lambda value:persisted.append(copy.deepcopy(value))
+        def launch(*values,**options):
+            observed.append(copy.deepcopy(record));options['before_launch']()
+        service.controller.open.side_effect=launch
+        with tempfile.TemporaryDirectory() as directory:
+            service.root=Path(directory);(service.root/'continuity-mode.bin').write_bytes(b'synthetic')
+            with patch('fingerprint_continuity.verify_continuity',return_value={
+                    'passed':True,'environment_args':[],'device_variance_fields':['fonts.metrics'],
+                    'verification_policy':'vendor-compatible-148'}) as verify:
+                self.run_open(service)
+        verify.assert_called_once_with(record,service.root,allow_device_variance=True)
+        self.assertEqual(len(observed),1)
+        self.assertEqual(observed[0]['_runtime']['environment_args'],[])
+        self.assertEqual(observed[0]['_runtime']['launch_args'],before['_runtime']['launch_args'])
+        self.assertEqual(record['_native'],before['_native'])
+        self.assertEqual(record['_continuity'],before['_continuity'])
+        self.assertTrue(persisted)
+        for value in persisted:
+            self.assertNotIn('environment_args',value['_runtime'])
+            self.assertNotIn('verification_policy',value)
+            self.assertNotIn('device_variance_fields',value)
 
     def test_incompatible_device_stops_before_cookie_rewrap_preferences_or_launch(self):
         service,_=self.service()
