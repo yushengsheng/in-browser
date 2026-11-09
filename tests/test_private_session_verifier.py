@@ -152,6 +152,26 @@ class MarkerTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_loading_failures_classify_resource_and_origins_without_private_values(self):
+        observer=verifier.AuthResponses('page',marker()['auth_rule'],page_origin=TARGET)
+        secret='synthetic-private-path-or-type'
+        values=[]
+        for identity,url,kind in (('document',TARGET+'/'+secret,'Document'),
+                                  ('api',URL,'XHR'),
+                                  ('script','https://cdn.example.invalid/'+secret,'Script'),
+                                  ('unknown',TARGET+'/'+secret,secret)):
+            values.extend([event('requestWillBeSent',identity=identity,request={'method':'GET','url':url}),
+                event('loadingFailed',identity=identity,type=kind,errorText='net::ERR_CONNECTION_CLOSED')])
+        self.assertEqual(observer.consume(values),[])
+        resources=observer.loading_failed_resources
+        self.assertEqual(resources['page_same_origin']['Document'],1)
+        self.assertEqual(resources['authentication_origin']['XHR'],1)
+        self.assertEqual(resources['other']['Script'],1)
+        self.assertEqual(resources['page_same_origin']['unknown'],1)
+        self.assertNotIn(secret,json.dumps(resources))
+        self.assertNotIn(TARGET,json.dumps(resources))
+        self.assertEqual(observer.request_origins,{})
+
     def test_cached_worker_wrong_method_and_other_page_cannot_authenticate(self):
         observer = verifier.AuthResponses('page', marker()['auth_rule'])
         for values in (response_events(cached=True), response_events(worker=True),

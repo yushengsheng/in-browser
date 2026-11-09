@@ -2,7 +2,16 @@ name: Private Windows session acceptance
 
 on:
   workflow_dispatch:
+    inputs:
+      network_only:
+        description: Compare the original upstream and local relay without opening the browser
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      network_only:
+        type: boolean
+        default: false
     secrets:
       IB_PRIVATE_ACCEPTANCE_KEY:
         required: true
@@ -16,6 +25,7 @@ concurrency:
 
 jobs:
   clean:
+    if: ${{ inputs.network_only != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -104,10 +114,17 @@ jobs:
           & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B tools/unpack_private_acceptance.py --source "$env:RUNNER_TEMP/private-window11.enc" --target "$env:IB_PRIVATE_PACKAGE" --sha256-file .github/private-fixture.sha256
           if ($LASTEXITCODE -ne 0) { throw 'Private transport authentication failed' }
       - name: Keep the real session open for two hours and reopen it normally
+        if: ${{ inputs.network_only != true }}
         shell: pwsh
         run: |
           & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/verify_private_session.py" --execute --duration-seconds 7200 --report "$env:RUNNER_TEMP/private-session-live.json"
           if ($LASTEXITCODE -ne 0) { throw 'Real-session acceptance failed' }
+      - name: Compare the upstream and production relay without account requests
+        if: ${{ inputs.network_only == true }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/diagnose_private_network.py" --execute --package "$env:IB_PRIVATE_PACKAGE" --report "$env:RUNNER_TEMP/private-network-diagnostic.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Private network diagnosis failed' }
       - name: Remove the disposable private copy
         if: always()
         shell: pwsh
@@ -133,6 +150,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: private-session-result
-          path: ${{ runner.temp }}/private-session-live.json
+          path: |
+            ${{ runner.temp }}/private-session-live.json
+            ${{ runner.temp }}/private-network-diagnostic.json
           if-no-files-found: error
           retention-days: 7

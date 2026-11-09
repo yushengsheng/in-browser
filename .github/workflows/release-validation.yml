@@ -9,6 +9,10 @@ on:
         description: Run the explicitly authorized encrypted real-session acceptance
         type: boolean
         default: false
+      network_only:
+        description: Diagnose the authorized private copy network without opening a browser
+        type: boolean
+        default: false
 
 permissions:
   contents: write # Read the unpublished candidate release and its assets.
@@ -17,6 +21,8 @@ jobs:
   private-session:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.private_session == true }}
     uses: ./.github/workflows/private-session-acceptance.yml
+    with:
+      network_only: ${{ inputs.network_only || false }}
     secrets:
       IB_PRIVATE_ACCEPTANCE_KEY: ${{ secrets.IB_PRIVATE_ACCEPTANCE_KEY }}
 

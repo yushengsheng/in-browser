@@ -295,6 +295,7 @@ def main(argv=None):
             entries.append(run_command('private-session-verifier', [python, '-B', str(ROOT/'tests/test_private_session_verifier.py')], 'unittest', env))
             entries.append(run_command('vendor-runtime-restore', [python, '-B', str(ROOT/'tests/test_vendor_runtime_restore.py')], 'unittest', env))
             entries.append(run_command('fixture-runtime-guard', [python, '-B', str(ROOT/'tests/test_fixture_runtime_guard.py')], 'unittest', env))
+            entries.append(run_command('private-network-diagnostic', [python, '-B', str(ROOT/'tests/test_private_network_diagnostic.py')], 'unittest', env))
             for name, style in FIXTURES:
                 path = ROOT / 'analysis' / name
                 if not path.is_file():

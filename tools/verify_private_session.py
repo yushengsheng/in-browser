@@ -43,6 +43,9 @@ NETWORK_ERRORS = frozenset(('net::ERR_ABORTED', 'net::ERR_FAILED', 'net::ERR_TIM
     'net::ERR_NAME_NOT_RESOLVED', 'net::ERR_INTERNET_DISCONNECTED', 'net::ERR_PROXY_CONNECTION_FAILED',
     'net::ERR_TUNNEL_CONNECTION_FAILED', 'net::ERR_CERT_AUTHORITY_INVALID', 'net::ERR_SSL_PROTOCOL_ERROR',
     'net::ERR_NETWORK_CHANGED', 'net::ERR_BLOCKED_BY_CLIENT', 'net::ERR_BLOCKED_BY_RESPONSE'))
+RESOURCE_TYPES = frozenset(('Document', 'Stylesheet', 'Image', 'Media', 'Font', 'Script', 'TextTrack',
+    'XHR', 'Fetch', 'EventSource', 'WebSocket', 'Manifest', 'Other'))
+RESOURCE_ORIGINS = ('page_same_origin', 'authentication_origin', 'other', 'unknown')
 _PAGE_DIAGNOSTIC = r'''(() => {
   const text = document.body ? document.body.textContent || "" : "";
   let localStorageCount = 0, localStorageAccessible = false;
@@ -361,7 +364,7 @@ def _matches_url(url, rule):
 
 
 class AuthResponses:
-    def __init__(self, session, rule):
+    def __init__(self, session, rule, *, page_origin=None):
         self.session = session
         self.rule = rule
         self.requests = {}
@@ -373,6 +376,10 @@ class AuthResponses:
             'served_from_cache_skipped', 'loading_failed', 'loading_cancelled', 'body_unavailable', 'body_mismatch')}
         self.network_errors = {key: 0 for key in sorted(NETWORK_ERRORS)}
         self.network_errors['other'] = 0
+        self.page_origin = page_origin or rule['origin']
+        self.request_origins = {}
+        self.loading_failed_resources = {source: {kind: 0 for kind in sorted(RESOURCE_TYPES | {'unknown'})}
+                                         for source in RESOURCE_ORIGINS}
 
     def consume(self, events):
         ready = []
@@ -390,14 +397,29 @@ class AuthResponses:
                 self.counts['loading_cancelled'] += int(params.get('canceled') is True)
                 error = params.get('errorText')
                 self.network_errors[error if isinstance(error, str) and error in NETWORK_ERRORS else 'other'] += 1
+                identity = params.get('requestId')
+                source = self.request_origins.get(identity, 'unknown') if isinstance(identity, str) else 'unknown'
+                kind = params.get('type')
+                self.loading_failed_resources[source][kind if isinstance(kind, str) and kind in RESOURCE_TYPES else 'unknown'] += 1
             elif method == 'Network.responseReceived':
                 self.counts['responses_total'] += 1
             identity = params.get('requestId')
             if not isinstance(identity, str) or len(identity) > 512:
                 continue
+            if method in ('Network.loadingFinished', 'Network.loadingFailed'):
+                self.request_origins.pop(identity, None)
             if method == 'Network.requestWillBeSent':
                 self.counts['requests_total'] += 1
                 request = params.get('request') or {}
+                try:
+                    request_origin = origin(request.get('url'))
+                    source = ('page_same_origin' if request_origin == self.page_origin else
+                              'authentication_origin' if request_origin == self.rule['origin'] else 'other')
+                except (ValueError, TypeError):
+                    source = 'unknown'
+                if identity not in self.request_origins and len(self.request_origins) >= MAX_EVENTS:
+                    raise AcceptanceError()
+                self.request_origins[identity] = source
                 try:
                     self.counts['request_origin_matches'] += int(origin(request.get('url')) == self.rule['origin'])
                 except (ValueError, TypeError):
@@ -481,10 +503,10 @@ def page_diagnostics(connection, session):
     return result
 
 
-def authenticate(connection, session, rule, *, keepalive=None, report=None):
+def authenticate(connection, session, rule, *, keepalive=None, report=None, page_origin=None):
     connection.stage = 'authentication'
     connection.events()
-    responses = AuthResponses(session, rule)
+    responses = AuthResponses(session, rule, page_origin=page_origin)
     diagnostics = {'authenticated': False, 'timed_out': False}
     try:
         connection.call('Page.reload', {'ignoreCache': True}, session=session)
@@ -515,6 +537,7 @@ def authenticate(connection, session, rule, *, keepalive=None, report=None):
         raise EvidenceTimeout()
     finally:
         diagnostics.update(counts=dict(responses.counts), network_errors=dict(responses.network_errors),
+                           loading_failed_resources={key: dict(values) for key, values in responses.loading_failed_resources.items()},
                            rejected_evidence=responses.rejected)
         if report is not None:
             report.setdefault('authentication_attempts', []).append(diagnostics)
@@ -648,7 +671,8 @@ def run(root, marker, duration, report):
                                       'elapsed_seconds': round(time.monotonic() - run_began, 3)}), flush=True)
 
                 report['stage'] = 'initial_authentication' if round_index == 0 else 'reopened_authentication'
-                authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat, report=report)
+                authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat, report=report,
+                             page_origin=marker['target_origin'])
                 report['counts']['authenticated_rounds'] += 1
                 expected_route = target_route(connection, target, marker)
                 report['checks']['authenticated_page_route_preserved'] = True
@@ -661,7 +685,8 @@ def run(root, marker, duration, report):
                         while time.monotonic() < deadline:
                             heartbeat()
                             if time.monotonic() >= next_reload:
-                                authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat, report=report)
+                                authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat, report=report,
+                                             page_origin=marker['target_origin'])
                                 report['counts']['authenticated_reloads'] += 1
                                 next_reload += 600
                             connection.events()
