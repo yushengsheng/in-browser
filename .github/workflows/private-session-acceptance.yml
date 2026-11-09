@@ -12,6 +12,10 @@ on:
         type: choice
         options: [socks5, http]
         default: socks5
+      approved_pool:
+        description: Diagnose only the explicitly approved seven test proxies
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       network_only:
@@ -20,9 +24,14 @@ on:
       network_protocol:
         type: string
         default: socks5
+      approved_pool:
+        type: boolean
+        default: false
     secrets:
       IB_PRIVATE_ACCEPTANCE_KEY:
         required: true
+      IB_APPROVED_TEST_PROXIES:
+        required: false
 
 permissions:
   contents: write # Download authenticated draft assets; no release is published.
@@ -131,10 +140,14 @@ jobs:
         if: ${{ inputs.network_only == true }}
         shell: pwsh
         run: |
-          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/diagnose_private_network.py" --execute --package "$env:IB_PRIVATE_PACKAGE" --protocol "$env:IB_NETWORK_PROTOCOL" --report "$env:RUNNER_TEMP/private-network-diagnostic.json"
+          $poolArguments = @()
+          if ($env:IB_APPROVED_POOL -eq 'true') { $poolArguments = @('--approved-pool') }
+          & "$env:IB_PRIVATE_PACKAGE/runtime/python/python.exe" -B "$env:IB_PRIVATE_PACKAGE/tools/diagnose_private_network.py" --execute --package "$env:IB_PRIVATE_PACKAGE" --protocol "$env:IB_NETWORK_PROTOCOL" --report "$env:RUNNER_TEMP/private-network-diagnostic.json" @poolArguments
           if ($LASTEXITCODE -ne 0) { throw 'Private network diagnosis failed' }
         env:
           IB_NETWORK_PROTOCOL: ${{ inputs.network_protocol || 'socks5' }}
+          IB_APPROVED_POOL: ${{ inputs.approved_pool && 'true' || 'false' }}
+          IB_APPROVED_TEST_PROXIES: ${{ inputs.approved_pool && secrets.IB_APPROVED_TEST_PROXIES || '' }}
       - name: Remove the disposable private copy
         if: always()
         shell: pwsh

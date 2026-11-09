@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+from datetime import date
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ WORK = Path(__file__).resolve().parent
 ATTEMPT_TIMEOUT = 15
 HANDSHAKE_TIMEOUT = 8
 MAX_HEADERS = 32768
+APPROVED_POOL_ENV = 'IB_APPROVED_TEST_PROXIES'
 
 
 class DiagnosticError(Exception):
@@ -172,8 +174,11 @@ def attempt(payload):
 
 def bounded_attempt(payload):
     began = time.monotonic()
+    os.environ.pop(APPROVED_POOL_ENV, None)
+    environment = os.environ.copy()
     child = subprocess.Popen([sys.executable, '-B', '-E', str(Path(__file__).resolve()), '--worker'],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             env=environment,
                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     output = b''
     timed_out = False
@@ -199,7 +204,28 @@ def bounded_attempt(payload):
     return result
 
 
-def run(root, protocol='socks5'):
+def load_approved_pool(root, protocol):
+    raw = os.environ.pop(APPROVED_POOL_ENV, None)
+    require(isinstance(raw, str) and 0 < len(raw) <= 65536 and protocol in ('socks5', 'http'))
+    rows = json.loads(raw)
+    require(isinstance(rows, list) and len(rows) == 7)
+    sys.path[:0] = [str(root / 'app')]
+    from proxy_config import normalize_proxy
+    selected = {}
+    for row in rows:
+        require(isinstance(row, dict))
+        alias = row.get('alias')
+        require(isinstance(alias, str) and alias in {f'test-{index}' for index in range(1, 8)} and alias not in selected)
+        expires = row.get('expires')
+        require(isinstance(expires, str) and date.fromisoformat(expires).isoformat() == expires
+                and date.fromisoformat(expires) >= date.today())
+        proxy = normalize_proxy({key: row.get(key) for key in ('host', 'port', 'username', 'password')} | {'type': protocol})
+        require(proxy['type'] == protocol and not proxy.get('enable_socks5_udp'))
+        selected[alias] = proxy
+    return [{'alias': f'test-{index}', 'proxy': selected[f'test-{index}']} for index in range(1, 8)]
+
+
+def run(root, protocol='socks5', override_proxy=None):
     # The selected isolated package owns all defaults in the imported modules.
     sys.path[:0] = [str(root / 'app'), str(root / 'tools')]
     from inspect_installation import read_catalog
@@ -219,8 +245,8 @@ def run(root, protocol='socks5'):
     saved = digest(record)
     parsed = urlsplit(marker['target_origin'])
     require(parsed.scheme == 'https' and parsed.hostname and parsed.path in ('', '/') and not parsed.query and not parsed.fragment)
-    proxy = normalize_proxy(record['proxy'])
-    require(proxy['type'] == 'socks5')
+    require(normalize_proxy(record['proxy'])['type'] == 'socks5')
+    proxy = normalize_proxy(override_proxy if override_proxy is not None else record['proxy'])
     require(protocol in ('socks5', 'http'))
     proxy = {**proxy, 'type': protocol}
     runtime_record = copy.deepcopy(record)
@@ -279,6 +305,30 @@ def run(root, protocol='socks5'):
     return report
 
 
+def run_approved_pool(root, protocol):
+    rows = load_approved_pool(root, protocol)
+    report = {'approved_pool': True, 'diagnostic_protocol': protocol, 'browser_started': False,
+              'public_get_only': True, 'authentication_test': False, 'results': []}
+    for row in rows:
+        alias = row['alias']
+        print(json.dumps({'alias': alias, 'started': True}), flush=True)
+        try:
+            result = run(root, protocol, override_proxy=row['proxy'])
+        except Exception as error:
+            result = {'success': False, 'error_type': type(error).__name__, 'browser_started': False,
+                      'public_get_only': True, 'authentication_test': False, 'workers_closed': False,
+                      'record_unchanged': False, 'saved_proxy_unchanged': False}
+        result['alias'] = alias
+        result['transport_passed'] = (result.get('success') is True and len(result.get('rounds', [])) == 6
+            and all(value.get('stage') == 'complete' and value.get('statusclass') == '2xx'
+                    and value.get('error_type') is None for value in result['rounds']))
+        report['results'].append(result)
+        print(json.dumps(result), flush=True)
+    report['success'] = len(report['results']) == 7 and all(value.get('success') for value in report['results'])
+    report['transport_passed_count'] = sum(value['transport_passed'] for value in report['results'])
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--package', type=Path)
@@ -286,6 +336,7 @@ def main():
     parser.add_argument('--report', type=Path, default=WORK / 'private-network-diagnostic.json')
     parser.add_argument('--worker', action='store_true')
     parser.add_argument('--protocol', choices=('socks5', 'http'), default='socks5')
+    parser.add_argument('--approved-pool', action='store_true')
     args = parser.parse_args()
     try:
         if args.worker:
@@ -299,7 +350,7 @@ def main():
             return 0
         root = args.package
         require(root is not None)
-        result = run(root.resolve(), args.protocol)
+        result = run_approved_pool(root.resolve(), args.protocol) if args.approved_pool else run(root.resolve(), args.protocol)
     except Exception as error:
         result = {'success': False, 'error_type': type(error).__name__, 'browser_started': False}
     try:

@@ -2,6 +2,7 @@
 import contextlib
 import base64
 import copy
+from datetime import date, timedelta
 import importlib.util
 import io
 import json
@@ -68,15 +69,18 @@ class PrivateNetworkDiagnosticTests(unittest.TestCase):
             (b'{"mode":"production_relay","stage":"relay_connect"}\n', b'')]
         child.poll.return_value = 1
         payload = {'mode': 'production_relay', 'host': 'synthetic-private-host'}
-        with patch.object(diagnostic.subprocess, 'Popen', return_value=child) as popen:
+        with patch.dict(diagnostic.os.environ,{diagnostic.APPROVED_POOL_ENV:'synthetic-unused-pool-secret'}), \
+                patch.object(diagnostic.subprocess, 'Popen', return_value=child) as popen:
             result = diagnostic.bounded_attempt(payload)
+            self.assertFalse(diagnostic.APPROVED_POOL_ENV in diagnostic.os.environ)
         self.assertEqual(result['error_type'], 'TimeoutError')
         self.assertEqual(result['stage'], 'relay_connect')
         self.assertEqual(child.communicate.call_args_list[0].kwargs['timeout'], diagnostic.ATTEMPT_TIMEOUT)
         self.assertEqual(child.communicate.call_args_list[0].args[0], diagnostic.canonical(payload))
         child.kill.assert_called_once()
         self.assertEqual(child.communicate.call_count, 2)
-        self.assertNotIn('synthetic-private-host', repr(popen.call_args))
+        self.assertTrue(all('synthetic-private-host' not in part for part in popen.call_args.args[0]))
+        self.assertFalse(diagnostic.APPROVED_POOL_ENV in popen.call_args.kwargs['env'])
         self.assertNotIn('synthetic-private-host', json.dumps(result))
 
     def test_http_connect_credentials_exist_only_in_the_proxy_request_before_tls(self):
@@ -114,7 +118,7 @@ class PrivateNetworkDiagnosticTests(unittest.TestCase):
         self.assertNotIn(encoded.decode(),output.getvalue()+json.dumps(result))
         connect.assert_called_once();connection.close.assert_called_once()
 
-    def test_http_protocol_uses_only_an_in_memory_record_and_keeps_saved_proxy(self):
+    def test_http_override_uses_only_an_in_memory_record_and_keeps_saved_proxy(self):
         import browser_processes,inspect_installation,manager_service,proxy_runtime,verify_private_session
         with tempfile.TemporaryDirectory(prefix='http-protocol-unit-') as temporary:
             root=Path(temporary).resolve();profile=root/'app/data/profiles/profile-synthetic';profile.mkdir(parents=True)
@@ -125,6 +129,7 @@ class PrivateNetworkDiagnosticTests(unittest.TestCase):
                     '_continuity':{'stable':stable},'_runtime':{'signature_provider':'local-v1','profile_path':str(profile)},
                     'proxy':{'type':'socks5','host':'proxy.example.invalid','port':1234,'username':'fixture','password':'synthetic'}}
             original=copy.deepcopy(record)
+            override={**record['proxy'],'host':'approved.example.invalid','username':'approved-user','password':'approved-synthetic'}
             catalog={'quick_check':True,'records':[record],'catalog_full_tables_sha256':'synthetic-fixed'}
             service=SimpleNamespace(configuration=SimpleNamespace(independent=True),store=Mock())
             service.store.all.return_value=[record]
@@ -134,7 +139,7 @@ class PrivateNetworkDiagnosticTests(unittest.TestCase):
             def ensure(value):
                 self.assertEqual(record,original)
                 self.assertEqual(value['proxy']['type'],'http')
-                for key in ('host','port','username','password'):self.assertEqual(value['proxy'][key],original['proxy'][key])
+                for key in ('host','port','username','password'):self.assertEqual(value['proxy'][key],override[key])
                 active[0]={'port':1234,'created':diagnostic.time.time()}
                 return active[0]
             runtime.ensure.side_effect=ensure
@@ -149,13 +154,61 @@ class PrivateNetworkDiagnosticTests(unittest.TestCase):
                     patch.object(manager_service,'ManagerService',return_value=service), \
                     patch.object(proxy_runtime,'ProxyRuntime',return_value=runtime), \
                     patch.object(diagnostic,'bounded_attempt',side_effect=bounded),contextlib.redirect_stdout(io.StringIO()):
-                report=diagnostic.run(root,'http')
+                report=diagnostic.run(root,'http',override_proxy=override)
             self.assertTrue(report['success']);self.assertTrue(report['saved_proxy_unchanged'])
             self.assertTrue(report['record_unchanged']);self.assertTrue(report['workers_closed'])
             self.assertFalse(report['browser_started']);self.assertFalse(report['authentication_test'])
             self.assertEqual(record,original);service.store.put.assert_not_called()
             self.assertEqual([value['mode'] for value in payloads],['upstream_http','production_relay']*3)
             self.assertEqual(runtime.stop_if_unused.call_count,3)
+
+    def approved_rows(self):
+        expires=(date.today()+timedelta(days=1)).isoformat()
+        return [{'alias':f'test-{index}','expires':expires,'host':f'approved-{index}.example.invalid',
+                 'port':1234,'username':f'fixture-{index}','password':f'synthetic-approved-secret-{index}'}
+                for index in range(1,8)]
+
+    def test_approved_pool_requires_exact_unique_seven_valid_aliases_and_unexpired_rows(self):
+        rows=self.approved_rows()
+        with patch.dict(diagnostic.os.environ,{diagnostic.APPROVED_POOL_ENV:json.dumps(rows[::-1])}):
+            selected=diagnostic.load_approved_pool(ROOT,'socks5')
+            self.assertFalse(diagnostic.APPROVED_POOL_ENV in diagnostic.os.environ)
+        self.assertEqual([value['alias'] for value in selected],[f'test-{index}' for index in range(1,8)])
+        self.assertTrue(all(value['proxy']['type']=='socks5' and 'alias' not in value['proxy'] and 'expires' not in value['proxy'] for value in selected))
+        for change in (lambda values:values.pop(),lambda values:values[0].update(alias='test-2'),
+                       lambda values:values[0].update(alias='private-identity'),
+                       lambda values:values[0].update(expires=(date.today()-timedelta(days=1)).isoformat())):
+            invalid=copy.deepcopy(rows);change(invalid)
+            with patch.dict(diagnostic.os.environ,{diagnostic.APPROVED_POOL_ENV:json.dumps(invalid)}):
+                with self.subTest(change=change),self.assertRaises(diagnostic.DiagnosticError):
+                    diagnostic.load_approved_pool(ROOT,'socks5')
+                self.assertFalse(diagnostic.APPROVED_POOL_ENV in diagnostic.os.environ)
+
+    def test_pool_dispatch_pops_all_credentials_before_each_override_and_reports_only_aliases(self):
+        rows=self.approved_rows();observed=[]
+        def run(root,protocol,override_proxy=None):
+            self.assertFalse(diagnostic.APPROVED_POOL_ENV in diagnostic.os.environ)
+            self.assertNotIn('alias',override_proxy)
+            observed.append(copy.deepcopy(override_proxy))
+            return {'success':True,'browser_started':False,'public_get_only':True,'authentication_test':False,
+                    'workers_closed':True,'record_unchanged':True,'saved_proxy_unchanged':True,
+                    'rounds':[{'mode':mode,'stage':'complete','seconds':.1,'statusclass':'2xx','error_type':None}
+                              for mode in ('upstream_socks5','production_relay') for _ in range(3)]}
+        with tempfile.TemporaryDirectory(prefix='approved-pool-unit-') as temporary:
+            destination=Path(temporary)/'anonymous.json';output=io.StringIO()
+            arguments=['diagnostic','--execute','--package',temporary,'--approved-pool','--report',str(destination)]
+            with patch.dict(diagnostic.os.environ,{diagnostic.APPROVED_POOL_ENV:json.dumps(rows)}), \
+                    patch.object(sys,'argv',arguments),patch.object(diagnostic,'run',side_effect=run), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(diagnostic.main(),0)
+            result=json.loads(destination.read_text())
+            self.assertEqual(result['transport_passed_count'],7)
+            self.assertEqual(len(observed),7)
+            self.assertFalse(result['authentication_test'])
+            self.assertEqual([value['alias'] for value in result['results']],[f'test-{index}' for index in range(1,8)])
+            for row in rows:
+                for key in ('host','username','password'):
+                    self.assertNotIn(row[key],output.getvalue()+destination.read_text())
 
     def test_stage_deadline_exits_only_the_request_child_and_cleans_its_socket(self):
         import socks

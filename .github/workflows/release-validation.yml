@@ -18,6 +18,10 @@ on:
         type: choice
         options: [socks5, http]
         default: socks5
+      approved_pool:
+        description: Diagnose only the explicitly approved seven test proxies
+        type: boolean
+        default: false
 
 permissions:
   contents: write # Read the unpublished candidate release and its assets.
@@ -29,8 +33,10 @@ jobs:
     with:
       network_only: ${{ inputs.network_only || false }}
       network_protocol: ${{ inputs.network_protocol || 'socks5' }}
+      approved_pool: ${{ inputs.approved_pool || false }}
     secrets:
       IB_PRIVATE_ACCEPTANCE_KEY: ${{ secrets.IB_PRIVATE_ACCEPTANCE_KEY }}
+      IB_APPROVED_TEST_PROXIES: ${{ inputs.approved_pool && secrets.IB_APPROVED_TEST_PROXIES || '' }}
 
   windows:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.private_session != true }}
