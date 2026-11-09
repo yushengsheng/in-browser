@@ -72,6 +72,11 @@ def _stock_engine(record, fixture, root):
     chrome_name = chrome_names[0]
     expected = copy.deepcopy(files)
     expected[chrome_name]['sha256'] = spec['sha256']
+    resource_revision = manifest['local_trust'].get('resource_root_revision', 0)
+    _require(type(resource_revision) is int and resource_revision in (0, 1))
+    if resource_revision:
+        resource = spec['resource_root']
+        expected[resource['file']]['sha256'] = resource['sha256']
     _require(engine._tree_digest(expected, directories)
              == manifest['local_trust']['source_tree_digest'])
     destination = fixture._inside(root / 'analysis/vendor-runtime', root, exists=False)
@@ -99,11 +104,24 @@ def _stock_engine(record, fixture, root):
             os.fsync(stream.fileno())
     finally:
         chrome.chmod(original_mode)
+    if resource_revision:
+        resource_path = engine._resource_key(destination, spec, vendor_der)
+        _require(engine._sha256(resource_path) == resource['sha256'])
     _require(engine._sha256(chrome) == spec['sha256']
              and not (destination / 'manifest.json').exists()
              and engine._inventory(destination) == (expected, directories)
              and engine._inventory(source) == (files, directories))
     return fixture._inside(destination / executable.name, root), expected, directories
+
+
+def _launch_core(argument, core, fixture, root):
+    """Accept an existing spelling only with file and parent identity proof."""
+    import local_engine as engine
+    candidate, core = Path(argument), Path(core)
+    _require(candidate.is_absolute() and candidate.samefile(core)
+             and candidate.parent.samefile(core.parent))
+    engine._plain_ancestors(candidate)
+    return fixture._inside(core, root)
 
 
 def _snapshot(connection, session, record, storage, continuity):
@@ -223,7 +241,7 @@ def main(argv=None):
             runtime = active_controller.profiles[fixture.IDENTITY]
             core = fixture._inside(runtime['core_path'], ROOT)
             signature = fixture._inside(runtime['fingerprint_path'], ROOT)
-            _require(fixture._inside(arguments[0], ROOT) == core
+            _require(_launch_core(arguments[0], core, fixture, ROOT) == core
                      and (core, signature) in allowed)
             for switch, required in (
                 ('--user-data-dir', str(profile)), ('--fingerprint-config', str(signature)),

@@ -103,6 +103,7 @@ class MarkerTests(unittest.TestCase):
             migrated['_native']['path'] = 'relocated-path'
             events = []
             service = Mock()
+            service.configuration.independent = True
             service.store.all.side_effect = lambda: (events.append('read-relocated') or [migrated])
             def factory(selected):
                 self.assertEqual(selected, data)
@@ -125,6 +126,21 @@ class MarkerTests(unittest.TestCase):
             with self.assertRaises(verifier.AcceptanceError):
                 verifier.prepare_service(data, bad, old, processes, forbidden)
             forbidden.assert_not_called()
+
+    def test_private_acceptance_refuses_a_nonindependent_runtime_before_opening(self):
+        with tempfile.TemporaryDirectory(prefix='private-independent-unit-') as directory:
+            data = Path(directory).resolve()
+            (data / 'profiles/profile-synthetic').mkdir(parents=True)
+            record = {'id': 'profile-synthetic', '_portable_crypt': {'synthetic': True},
+                      '_runtime': {'signature_provider': 'local-v1', 'profile_path': 'Z:/old-copy/profile-synthetic'},
+                      '_continuity': {'stable': {'field': 'synthetic'}}, '_native': {}}
+            for independent in (False, None, 1, 'true'):
+                service = Mock()
+                service.configuration.independent = independent
+                with self.subTest(independent=independent), self.assertRaises(verifier.AcceptanceError):
+                    verifier.prepare_service(data, marker(), record, Mock(return_value=[]), Mock(return_value=service))
+                service.store.all.assert_not_called()
+                service.open.assert_not_called()
 
 
 class EvidenceTests(unittest.TestCase):

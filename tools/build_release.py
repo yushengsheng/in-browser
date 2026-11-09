@@ -89,7 +89,8 @@ def main():
         if args.zip:
             with zipfile.ZipFile(target.with_suffix('.zip'),'x',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
                 for path in sorted(target.rglob('*')):
-                    if path.is_file():archive.write(path,path.relative_to(target).as_posix())
+                    ordinary(path)
+                    archive.write(path,path.relative_to(target).as_posix())
         print(json.dumps({'success':True,'files':count,'contains_user_data':False,'runtime_included':bool(args.runtime_from)}));return 0
     except Exception as exc:
         print(json.dumps({'success':False,'error_type':type(exc).__name__}));return 1

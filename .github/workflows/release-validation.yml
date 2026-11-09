@@ -46,6 +46,27 @@ jobs:
           if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Candidate digest mismatch' }
           & (Join-Path $env:ProgramFiles '7-Zip/7z.exe') x $archive "-o$package" -y -bso0 -bsp0
           if ($LASTEXITCODE -ne 0) { throw 'Candidate extraction failed' }
+          gh release download validation-v0.2.0-private --repo $env:GITHUB_REPOSITORY --pattern acceptance-runtime-v0.2.0.zip --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Audited runtime download failed' }
+          $runtimeArchive = Join-Path $env:RUNNER_TEMP 'acceptance-runtime-v0.2.0.zip'
+          $runtimeDigest = (Get-Content -LiteralPath '.github/acceptance-runtime.sha256' -Raw).Trim()
+          if ($runtimeDigest -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $runtimeArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $runtimeDigest) { throw 'Audited runtime digest mismatch' }
+          $runtimeZip = [IO.Compression.ZipFile]::OpenRead($runtimeArchive)
+          try {
+            if ($runtimeZip.Entries.Count -gt 20000 -or (($runtimeZip.Entries | Measure-Object -Property Length -Sum).Sum -gt 2GB)) { throw 'Runtime budget exceeded' }
+            foreach ($entry in $runtimeZip.Entries) {
+              if ($entry.FullName -notmatch '^runtime/' -or $entry.FullName -match '(^|/)\.\.(/|$)|:|\\') { throw 'Unexpected runtime member' }
+            }
+          } finally { $runtimeZip.Dispose() }
+          $runtime = [IO.Path]::GetFullPath((Join-Path $package 'runtime'))
+          $expectedRuntime = [IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'ib/runtime'))
+          if ($runtime -ne $expectedRuntime) { throw 'Unexpected runtime replacement target' }
+          if (Test-Path -LiteralPath $runtime) {
+            $linked = @((Get-Item -LiteralPath $runtime); (Get-ChildItem -LiteralPath $runtime -Recurse -Force)) | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+            if (@($linked).Count -ne 0) { throw 'Linked runtime replacement target' }
+            Remove-Item -LiteralPath $runtime -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $runtimeArchive -DestinationPath $package
           $publicFiles = git ls-files app tools
           if ($LASTEXITCODE -ne 0) { throw 'Candidate source enumeration failed' }
           foreach ($relative in $publicFiles) {

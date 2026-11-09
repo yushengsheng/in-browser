@@ -181,6 +181,8 @@ def prepare_service(data, marker, record, profile_processes, service_factory):
     if profile_processes(profile, require_inspectable=True):
         raise OwnershipError()
     service = service_factory(data)
+    if service.configuration.independent is not True:
+        raise AcceptanceError()
     records = service.store.all()
     if len(records) != 1:
         raise AcceptanceError()
@@ -407,6 +409,7 @@ def close_owned(service, identity, owned, profile, profile_processes):
 
 
 def run(root, marker, duration, report):
+    report['stage'] = 'prepare'
     run_began = time.monotonic()
     sys.path[:0] = [str(root / 'app'), str(root / 'tools')]
     from browser_processes import profile_processes
@@ -422,9 +425,12 @@ def run(root, marker, duration, report):
     service = None
     owned = None
     try:
+        report['checks']['independent_runtime'] = False
         service, profile, original = prepare_service(data, marker, record, profile_processes, ManagerService)
+        report['checks']['independent_runtime'] = True
         report['checks']['single_authorized_profile_closed'] = True
         for round_index in range(2):
+            report['stage'] = 'initial_open' if round_index == 0 else 'reopen'
             if profile_processes(profile, require_inspectable=True):
                 raise OwnershipError()
             started = time.time()
@@ -457,11 +463,13 @@ def run(root, marker, duration, report):
                                       'authenticated_reloads': report['counts']['authenticated_reloads'],
                                       'elapsed_seconds': round(time.monotonic() - run_began, 3)}), flush=True)
 
+                report['stage'] = 'initial_authentication' if round_index == 0 else 'reopened_authentication'
                 report['counts']['rejected_evidence'] += authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat)
                 report['counts']['authenticated_rounds'] += 1
                 expected_route = target_route(connection, target, marker)
                 report['checks']['authenticated_page_route_preserved'] = True
                 if round_index == 0:
+                    report['stage'] = 'continuous_hold'
                     held_start = time.monotonic()
                     deadline = held_start + duration
                     next_reload = held_start + 600
@@ -478,6 +486,7 @@ def run(root, marker, duration, report):
                     finally:
                         report['held_duration_seconds'] = round(time.monotonic() - held_start, 3)
                 connection.call('Target.detachFromTarget', {'sessionId': session})
+            report['stage'] = 'normal_close'
             close_owned(service, identity, owned, profile, profile_processes)
             owned = None
             report['counts']['normal_closes'] += 1
@@ -487,6 +496,8 @@ def run(root, marker, duration, report):
         report['checks']['initial_and_reopened_server_authenticated'] = report['counts']['authenticated_rounds'] == 2
         report['checks']['requested_hold_completed'] = report['held_duration_seconds'] >= duration
         report['success'] = all(report['checks'].values())
+        if report['success']:
+            report['stage'] = 'complete'
     finally:
         if service is not None and owned is not None:
             try:

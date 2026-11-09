@@ -293,6 +293,7 @@ def main(argv=None):
             entries.append(run_command('session-recovery', [python, '-B', str(ROOT/'tests/test_session_recovery.py')], 'unittest', env))
             entries.append(run_command('private-acceptance-transport', [python, '-B', str(ROOT/'tests/test_private_acceptance_transport.py')], 'unittest', env))
             entries.append(run_command('private-session-verifier', [python, '-B', str(ROOT/'tests/test_private_session_verifier.py')], 'unittest', env))
+            entries.append(run_command('vendor-runtime-restore', [python, '-B', str(ROOT/'tests/test_vendor_runtime_restore.py')], 'unittest', env))
             for name, style in FIXTURES:
                 path = ROOT / 'analysis' / name
                 if not path.is_file():
