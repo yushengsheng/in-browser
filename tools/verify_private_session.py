@@ -4,7 +4,8 @@ private-acceptance.json belongs only in the encrypted private package. Digests u
 UTF-8 JSON with ensure_ascii=False, sort_keys=True, separators=(',', ':'), and
 allow_nan=False. The response URL digest excludes its query and fragment. Only
 natural responses to reloading an existing, explicitly approved page are read.
-No authentication request, login action, JavaScript, or business action is sent.
+No authentication request, login action, or business action is sent. On an
+evidence timeout, fixed read-only JavaScript returns only page booleans/counts.
 """
 import argparse
 import base64
@@ -30,7 +31,24 @@ MAX_EVENT_BYTES = 4 * MAX_BODY
 AUTH_TIMEOUT = 60
 EVENTS = frozenset(('Network.requestWillBeSent', 'Network.responseReceived',
                     'Network.loadingFinished', 'Network.loadingFailed',
-                    'Network.requestServedFromCache'))
+                    'Network.requestServedFromCache', 'Page.frameNavigated',
+                    'Page.frameStoppedLoading', 'Page.loadEventFired', 'Page.domContentEventFired'))
+NETWORK_ERRORS = frozenset(('net::ERR_ABORTED', 'net::ERR_FAILED', 'net::ERR_TIMED_OUT',
+    'net::ERR_CONNECTION_CLOSED', 'net::ERR_CONNECTION_RESET', 'net::ERR_CONNECTION_REFUSED',
+    'net::ERR_NAME_NOT_RESOLVED', 'net::ERR_INTERNET_DISCONNECTED', 'net::ERR_PROXY_CONNECTION_FAILED',
+    'net::ERR_TUNNEL_CONNECTION_FAILED', 'net::ERR_CERT_AUTHORITY_INVALID', 'net::ERR_SSL_PROTOCOL_ERROR',
+    'net::ERR_NETWORK_CHANGED', 'net::ERR_BLOCKED_BY_CLIENT', 'net::ERR_BLOCKED_BY_RESPONSE'))
+_PAGE_DIAGNOSTIC = r'''(() => {
+  const text = document.body ? document.body.textContent || "" : "";
+  let localStorageCount = 0, localStorageAccessible = false;
+  try { localStorageCount = localStorage.length; localStorageAccessible = true; } catch (_) {}
+  return {readyComplete: document.readyState === "complete",
+    hasPasswordInput: !!document.querySelector('input[type="password"]'),
+    loginPrompt: /请(?:先)?登录|会话(?:已)?过期|登录(?:已)?过期|session expired|sign in|log in/i.test(text),
+    trafficError: /网络(?:连接)?(?:异常|错误)|无法连接|连接失败|network error|connection failed|proxy error|traffic error/i.test(text),
+    bodyEmpty: !text.trim(), iframeCount: document.querySelectorAll("iframe").length,
+    localStorageAccessible, localStorageCount};
+})()'''
 DIAGNOSTIC_FIELDS = frozenset(('audio.offline audio.supported canvas.geometry canvas.text context.secure '
     'devices.kinds devices.supported fonts.metrics locale.options navigator.cookieEnabled '
     'navigator.deviceMemory navigator.hardwareConcurrency navigator.language navigator.languages '
@@ -311,19 +329,45 @@ class AuthResponses:
         self.rule = rule
         self.requests = {}
         self.rejected = 0
+        self.counts = {key: 0 for key in ('network_events', 'page_events', 'requests_total',
+            'request_origin_matches', 'request_url_matches', 'request_method_matches', 'responses_total',
+            'matched_responses', 'status_1xx', 'status_2xx', 'status_3xx', 'status_4xx', 'status_5xx',
+            'status_other', 'disk_cache_skipped', 'service_worker_skipped', 'prefetch_cache_skipped',
+            'served_from_cache_skipped', 'loading_failed', 'loading_cancelled', 'body_unavailable', 'body_mismatch')}
+        self.network_errors = {key: 0 for key in sorted(NETWORK_ERRORS)}
+        self.network_errors['other'] = 0
 
     def consume(self, events):
         ready = []
         for event in events:
             if event.get('sessionId') != self.session:
                 continue
+            method = event.get('method', '')
+            if method.startswith('Page.'):
+                self.counts['page_events'] += 1
+                continue
+            self.counts['network_events'] += 1
             params = event.get('params') or {}
+            if method == 'Network.loadingFailed':
+                self.counts['loading_failed'] += 1
+                self.counts['loading_cancelled'] += int(params.get('canceled') is True)
+                error = params.get('errorText')
+                self.network_errors[error if isinstance(error, str) and error in NETWORK_ERRORS else 'other'] += 1
+            elif method == 'Network.responseReceived':
+                self.counts['responses_total'] += 1
             identity = params.get('requestId')
             if not isinstance(identity, str) or len(identity) > 512:
                 continue
-            method = event.get('method')
             if method == 'Network.requestWillBeSent':
+                self.counts['requests_total'] += 1
                 request = params.get('request') or {}
+                try:
+                    self.counts['request_origin_matches'] += int(origin(request.get('url')) == self.rule['origin'])
+                except (ValueError, TypeError):
+                    pass
+                matches = _matches_url(request.get('url'), self.rule)
+                self.counts['request_url_matches'] += int(matches)
+                self.counts['request_method_matches'] += int(matches and request.get('method') == self.rule['method'])
                 self.requests.pop(identity, None)
                 if request.get('method') == self.rule['method'] and _matches_url(request.get('url'), self.rule):
                     if len(self.requests) >= 128:
@@ -333,8 +377,17 @@ class AuthResponses:
                 current = self.requests[identity]
                 if method == 'Network.requestServedFromCache':
                     current['cached'] = True
+                    self.counts['served_from_cache_skipped'] += 1
                 elif method == 'Network.responseReceived':
                     response = params.get('response') or {}
+                    self.counts['matched_responses'] += 1
+                    status = response.get('status')
+                    status_class = int(status) // 100 if type(status) in (int, float) and math.isfinite(status) else 0
+                    self.counts['status_' + str(status_class) + 'xx' if 1 <= status_class <= 5 else 'status_other'] += 1
+                    for field, counter in (('fromDiskCache', 'disk_cache_skipped'),
+                                           ('fromServiceWorker', 'service_worker_skipped'),
+                                           ('fromPrefetchCache', 'prefetch_cache_skipped')):
+                        self.counts[counter] += int(bool(response.get(field)))
                     current['eligible'] = (_matches_url(response.get('url'), self.rule)
                         and response.get('status') == self.rule['status']
                         and 'json' in str(response.get('mimeType', '')).lower()
@@ -375,28 +428,60 @@ def body_matches(response, rule):
         return False
 
 
-def authenticate(connection, session, rule, *, keepalive=None):
+def page_diagnostics(connection, session):
+    reply = connection.call('Runtime.evaluate', {'expression': _PAGE_DIAGNOSTIC, 'returnByValue': True}, session=session)
+    value = reply.get('result', {}).get('value')
+    if reply.get('exceptionDetails') or not isinstance(value, dict):
+        return {'available': False}
+    result = {'available': True}
+    for key in ('readyComplete', 'hasPasswordInput', 'loginPrompt', 'trafficError', 'bodyEmpty', 'localStorageAccessible'):
+        if type(value.get(key)) is bool:
+            result[key] = value[key]
+    for key in ('iframeCount', 'localStorageCount'):
+        if type(value.get(key)) is int and 0 <= value[key] <= 100000:
+            result[key] = value[key]
+    return result
+
+
+def authenticate(connection, session, rule, *, keepalive=None, report=None):
     connection.events()
     responses = AuthResponses(session, rule)
-    connection.call('Page.reload', {'ignoreCache': True}, session=session)
-    deadline = time.monotonic() + AUTH_TIMEOUT
-    while time.monotonic() < deadline:
-        if keepalive:
-            keepalive()
-        for identity in responses.consume(connection.events()):
-            try:
-                body = connection.call('Network.getResponseBody', {'requestId': identity}, session=session)
-            except CommandRejected:
+    diagnostics = {'authenticated': False, 'timed_out': False}
+    try:
+        connection.call('Page.reload', {'ignoreCache': True}, session=session)
+        deadline = time.monotonic() + AUTH_TIMEOUT
+        while time.monotonic() < deadline:
+            if keepalive:
+                keepalive()
+            for identity in responses.consume(connection.events()):
+                try:
+                    body = connection.call('Network.getResponseBody', {'requestId': identity}, session=session)
+                except CommandRejected:
+                    responses.counts['body_unavailable'] += 1
+                    responses.rejected += 1
+                    continue
+                if body_matches(body, rule):
+                    diagnostics['authenticated'] = True
+                    return responses.rejected
+                responses.counts['body_mismatch'] += 1
                 responses.rejected += 1
-                continue
-            if body_matches(body, rule):
-                return responses.rejected
-            responses.rejected += 1
-        connection.poll(min(1, max(.001, deadline - time.monotonic())))
-    raise EvidenceTimeout()
+            connection.poll(min(1, max(.001, deadline - time.monotonic())))
+        responses.consume(connection.events())
+        diagnostics['timed_out'] = True
+        try:
+            diagnostics['page'] = page_diagnostics(connection, session)
+        except Exception as error:
+            diagnostics['page'] = {'available': False, 'error_type': type(error).__name__}
+        raise EvidenceTimeout()
+    finally:
+        diagnostics.update(counts=dict(responses.counts), network_errors=dict(responses.network_errors),
+                           rejected_evidence=responses.rejected)
+        if report is not None:
+            report.setdefault('authentication_attempts', []).append(diagnostics)
+            report['counts']['rejected_evidence'] += responses.rejected
 
 
-def attach_existing(connection, marker):
+def attach_existing(connection, marker, report=None):
     targets = connection.call('Target.getTargets').get('targetInfos', [])
     matches = []
     for target in targets:
@@ -407,6 +492,12 @@ def attach_existing(connection, marker):
             continue
     if not matches:
         raise AcceptanceError()
+    if report is not None:
+        selected = urlsplit(matches[0]['url'])
+        routes = {(urlsplit(value['url']).path, urlsplit(value['url']).fragment) for value in matches}
+        report.setdefault('page_selections', []).append({'same_origin_page_count': len(matches),
+            'same_origin_routes_equal': len(routes) == 1, 'selected_query_present': bool(selected.query),
+            'selected_fragment_present': bool(selected.fragment)})
     target = matches[0]['targetId']
     session = connection.call('Target.attachToTarget', {'targetId': target, 'flatten': True})['sessionId']
     connection.call('Page.enable', session=session)
@@ -475,7 +566,7 @@ def run(root, marker, duration, report):
                 raise OwnershipError()
             report['counts']['formal_opens'] += 1
             with EventCDP(service.controller.endpoint(identity)) as connection:
-                target, session = attach_existing(connection, marker)
+                target, session = attach_existing(connection, marker, report=report)
                 next_heartbeat = time.monotonic() + 60
                 expected_route = None
 
@@ -497,7 +588,7 @@ def run(root, marker, duration, report):
                                       'elapsed_seconds': round(time.monotonic() - run_began, 3)}), flush=True)
 
                 report['stage'] = 'initial_authentication' if round_index == 0 else 'reopened_authentication'
-                report['counts']['rejected_evidence'] += authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat)
+                authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat, report=report)
                 report['counts']['authenticated_rounds'] += 1
                 expected_route = target_route(connection, target, marker)
                 report['checks']['authenticated_page_route_preserved'] = True
@@ -510,7 +601,7 @@ def run(root, marker, duration, report):
                         while time.monotonic() < deadline:
                             heartbeat()
                             if time.monotonic() >= next_reload:
-                                report['counts']['rejected_evidence'] += authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat)
+                                authenticate(connection, session, marker['auth_rule'], keepalive=heartbeat, report=report)
                                 report['counts']['authenticated_reloads'] += 1
                                 next_reload += 600
                             connection.events()
