@@ -107,6 +107,25 @@ jobs:
         run: |
           & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_login_storage.py" --execute --storage-only-diagnostic
           if ($LASTEXITCODE -ne 0) { throw 'Login storage preservation failed' }
+      - name: Load the genuine signature of the synthetic native configuration
+        if: ${{ !cancelled() && env.IB_LOGIN_READY == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download validation-v0.1.0 --repo $env:GITHUB_REPOSITORY --pattern portable-vendor-signature-v0.1.0.bin --dir $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic native signature download failed' }
+          $signature = Join-Path $env:RUNNER_TEMP 'portable-vendor-signature-v0.1.0.bin'
+          $expected = (Get-Content -LiteralPath '.github/portable-vendor-signature.sha256' -Raw).Trim()
+          if ($expected -notmatch '^[0-9a-f]{64}$' -or (Get-FileHash -LiteralPath $signature -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Synthetic native signature digest mismatch' }
+          Copy-Item -LiteralPath $signature -Destination (Join-Path $env:IB_PACKAGE 'vendor-signature.bin')
+          "IB_VENDOR_READY=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Compare stock and independent native runtimes on the same device
+        if: ${{ !cancelled() && env.IB_VENDOR_READY == 'true' }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/compare_vendor_runtime.py" --execute
+          if ($LASTEXITCODE -ne 0) { throw 'Native runtime comparison failed' }
       - name: Keep only anonymous acceptance reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -118,5 +137,6 @@ jobs:
             ${{ env.IB_PACKAGE }}/analysis/reports/portable-device.json
             ${{ env.IB_PACKAGE }}/analysis/reports/portable-candidates.json
             ${{ env.IB_PACKAGE }}/analysis/reports/login-storage.json
+            ${{ env.IB_PACKAGE }}/analysis/reports/vendor-runtime-comparison.json
           if-no-files-found: warn
           retention-days: 14
