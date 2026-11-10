@@ -3,6 +3,8 @@
 Only an unauthenticated GET / of the authorized page origin is requested. No
 cookies, account requests, authorization headers, query, redirect or browser is
 used. Private input travels only through local memory/anonymous child pipes.
+The optional approved pool consumes exactly seven numbered, unexpired test
+proxies from one environment secret without saving them to the profile.
 """
 from __future__ import annotations
 import argparse
