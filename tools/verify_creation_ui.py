@@ -34,6 +34,18 @@ EXPRESSION=r'''(async()=>{
   set('fingerprint.os','MacIntel');
   checks.os_preset_applied=/Macintosh/.test(state.draft.fingerprint.userAgent);
   set('fingerprint.os','Win32');set('fingerprint.coreVersion','148');
+  checks.random_button_beside_heading=!!q('.fingerprint-heading #creation-randomize');
+  const oldNoise=state.draft.fingerprint.canvasValue;
+  q('#creation-randomize').click();
+  await wait(()=>!state.saving&&state.draft.fingerprint.canvasValue!==oldNoise);
+  checks.random_values_visible=Number(q('[data-field="fingerprint.canvasValue"]').value)===state.draft.fingerprint.canvasValue;
+  checks.other_inputs_kept=q('[data-field="name"]').value==='Synthetic UI creation'&&state.draft.creation.count===2;
+  checks.compatibility_fields_readonly=['version','osVersion','timeZoneOffset'].every(key=>q(`[data-field="fingerprint.${key}"]`).disabled);
+  set('fingerprint.devicePixelRatio','2');set('fingerprint.resolutionType','0');
+  checks.system_dpr_readonly=q('[data-field="fingerprint.devicePixelRatio"]').disabled;
+  set('fingerprint.resolutionType','1');
+  checks.manual_dpr_restored=!q('[data-field="fingerprint.devicePixelRatio"]').disabled&&Number(q('[data-field="fingerprint.devicePixelRatio"]').value)===2;
+  set('fingerprint.devicePixelRatio','1');
   checks.drawer_visible=q('#profile-drawer').getBoundingClientRect().right<=innerWidth+1;
   const requestId=state.creation.requestId;
   q('#save-profile').click();

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import time
 
 from local_state import LocalBrowserError
 from browser_processes import profile_processes,ProfileProcessSnapshot
@@ -19,6 +20,8 @@ from local_source import source_protection,PUBLIC_SEED_IMPORT_NOTE
 _ID = re.compile(r'[a-fA-F0-9]{32}')
 _VERSION = re.compile(r'([0-9]{2,3})\.[0-9]+\.[0-9]+\.[0-9]+')
 _CHANGED_ERROR = '来源资料或配置已变化，请重新点击同步窗口；尚未复制此来源。'
+_METADATA_NOTE = '名称和备注暂不可读取，请检查比特登录及网络后重新检测；尚未复制资料。'
+_METADATA_PENDING_NOTE = '本轮尚未读到名称和备注，请重新检测以继续读取；尚未复制资料。'
 
 
 def _reparse(path):
@@ -182,6 +185,64 @@ class BitSource:
         except OSError:
             raise LocalBrowserError('无法枚举原客户端本机资料；原窗口和资料未改动。') from None
 
+    def preview_metadata(self, candidates):
+        """Display-only details; never prepare sources or change import candidates."""
+        def fields(info, identity):
+            if (not isinstance(info, dict) or not isinstance(info.get('id'), str)
+                    or info['id'].lower() != identity.lower()):
+                return None
+            name, remark, seq = info.get('name'), info.get('remark'), info.get('seq')
+            return {'name': name[:1024] if isinstance(name, str) else '',
+                    'remark': remark[:20000] if isinstance(remark, str) else '',
+                    'seq': seq if type(seq) is int or (isinstance(seq, str) and len(seq) <= 64) else None}
+
+        results = {}; reader = None; unavailable = False
+        now = time.monotonic(); deadline = now + 10
+        keys = {candidate['source_key'] for candidate in candidates}
+        recent = {key: value for key, value in getattr(self, '_preview_labels', {}).items()
+                  if key in keys and 0 <= now - value[0] < 600}
+        self._preview_labels = recent
+        for candidate in candidates:
+            identity = candidate['source_id']; key = candidate['source_key']
+            cached = fields(candidate.get('info'), identity)
+            if cached is not None:
+                results[key] = cached
+            if (not getattr(self.configuration, 'independent', False)
+                    or candidate['status'] not in ('ready', 'source_open')
+                    or (cached is not None and not candidate.get('_needs_preparation'))):
+                continue
+            if not _ID.fullmatch(identity):
+                continue
+            if key in recent:
+                results[key] = dict(recent[key][1])
+                continue
+            if reader is None and not unavailable and time.monotonic() < deadline:
+                try:
+                    from local_source import _reader
+                    reader = _reader(self.configuration)
+                except Exception:
+                    # An unavailable session applies to all remaining sources.
+                    unavailable = True
+            try:
+                if unavailable:
+                    raise LocalBrowserError(_METADATA_NOTE)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    results[key] = dict(cached or {}, metadata_note=_METADATA_PENDING_NOTE)
+                    continue
+                detail = reader.source_detail(identity, timeout=min(3, remaining))
+                display = fields(detail, identity)
+                if display is None:
+                    raise LocalBrowserError(_METADATA_NOTE)
+                display['name'] = display['name'] or '未命名窗口'
+                results[key] = display
+                if len(recent) < 10000:
+                    recent[key] = (now, dict(display))
+            except Exception:
+                # A missing or invalid source must not hide the next window's labels.
+                results[key] = dict(cached or {}, metadata_note=_METADATA_NOTE)
+        return results
+
     def revalidate(self, candidate):
         source_id = candidate.get('source_id')
         if not isinstance(source_id, str) or not _ID.fullmatch(source_id):
@@ -244,6 +305,8 @@ class BitSource:
             source_protection(fp)
         except (ValueError, KeyError, TypeError):
             raise LocalBrowserError('来源完整启动配置或匹配的数据保护参数缺失，尚未导入。') from None
+        from import_progress import emit
+        emit('engine')
         core = self._core_path(major)
         if getattr(self.configuration,'independent',False):
             self.revalidate(fresh)

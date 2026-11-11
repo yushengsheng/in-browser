@@ -15,6 +15,11 @@ import build_release
 
 
 class ReleaseBoundary(unittest.TestCase):
+    def test_loopback_verifier_dependency_is_exported(self):
+        files={path.relative_to(ROOT).as_posix() for path in build_release.source_files(ROOT)}
+        self.assertIn('tools/verify_proxy_loopback.py',files)
+        self.assertIn('analysis/browser-proxy-boundary-regression.py',files)
+
     @staticmethod
     def source_tree(root):
         names=list(build_release.TOP)+['app/main.py','app/ui/app.js','app/ui/index.html',

@@ -56,6 +56,248 @@ test("port scan protection labels preserve the native mode values", () => {
   }
 });
 
+test("creation randomize sits next to its fingerprint heading and imported fields stay read-only", () => {
+  const h = fixture(), imported = { disabled: false };
+  h.state.creatingDraft = true;
+  h.state.draft = h.context.mergedProfile({ creation: { count: 1, proxy_lines: [] } });
+  h.context.buildProfileForm();
+  const html = h.element("#profile-form").innerHTML;
+  const basic = html.match(/data-form-section="basic">(.*?)<\/section>/s)[1];
+  const fingerprint = html.match(/data-form-section="fingerprint">(.*?)<\/section>/s)[1];
+  assert.doesNotMatch(basic, /creation-randomize/);
+  assert.match(fingerprint, /class="fingerprint-heading"><h3>指纹信息<\/h3><button id="creation-randomize"/);
+  assert.match(fingerprint, /设置新窗口的浏览器环境信息/);
+  h.state.creatingDraft = false;
+  h.element("#profile-form").all.set("[data-form-section='fingerprint'] input,[data-form-section='fingerprint'] select,[data-form-section='fingerprint'] textarea", [imported]);
+  h.context.buildProfileForm();
+  assert.doesNotMatch(h.element("#profile-form").innerHTML, /creation-randomize|data-field="created_options\./);
+  assert.equal(imported.disabled, true);
+});
+
+test("batch proxy lines preserve separate rows through a form rebuild and collection", () => {
+  const h = fixture();
+  const lines = ["http://first.example:8080", "socks5://second.example:1080"];
+  h.state.creatingDraft = true;
+  h.state.draft = h.context.mergedProfile({ creation: { count: 2, proxy_lines: lines } });
+  for (let i = 0; i < 2; i++) {
+    h.context.buildProfileForm();
+    const text = h.element("#profile-form").innerHTML.match(/<textarea id="field-creation-proxy_lines"[^>]*>(.*?)<\/textarea>/s)[1];
+    assert.equal(text, lines.join("\n"));
+    h.element("#profile-form").all.set("[data-field]", [{ dataset: { field: "creation.proxy_lines", type: "lines" }, value: text }]);
+    assert.deepEqual(Array.from(h.context.collectDraft().creation.proxy_lines), lines);
+  }
+});
+
+function creationControls(h, definitions) {
+  const controls = definitions.map(([field, type, initial]) => {
+    let value = String(initial ?? "");
+    return {
+      dataset: { field, type }, disabled: false, checked: initial === true,
+      get value() { return value; }, set value(next) { value = String(next ?? ""); },
+      checkValidity: () => true,
+    };
+  });
+  const form = h.element("#profile-form");
+  form.all.set("[data-field]", controls);
+  form.all.set('[data-field^="fingerprint."]', controls.filter(c => c.dataset.field.startsWith("fingerprint.")));
+  form.all.set("[data-form-section='fingerprint'] input,[data-form-section='fingerprint'] select,[data-form-section='fingerprint'] textarea", controls.filter(c => c.dataset.field.startsWith("fingerprint.")));
+  form.all.set('input[type="number"]', controls.filter(c => ["number", "nullableNumber"].includes(c.dataset.type)));
+  form.all.set('[data-type^="json"]', controls.filter(c => c.dataset.type.startsWith("json")));
+  for (const type of ["jsonobject", "jsontext"])
+    form.all.set(`[data-type="${type}"]:not(:disabled)`, controls.filter(c => c.dataset.type === type));
+  return Object.fromEntries(controls.map(c => [c.dataset.field, c]));
+}
+
+test("creation compatibility-only fields stay readable and cannot silently replace persisted values", () => {
+  const h = fixture();
+  h.state.creatingDraft = true;
+  h.state.draft = h.context.mergedProfile({ name: "synthetic", fingerprint: {
+    version: "fixture-version", osVersion: "fixture-system", timeZoneOffset: 60,
+    platformVersion: "10.0.0", resolutionType: "1", devicePixelRatio: 2,
+  } });
+  const controls = creationControls(h, [
+    ["fingerprint.version", "string", "fixture-version"], ["fingerprint.osVersion", "string", "fixture-system"],
+    ["fingerprint.timeZoneOffset", "number", "60"], ["fingerprint.platformVersion", "string", "10.0.0"],
+    ["fingerprint.devicePixelRatio", "number", "2"],
+  ]);
+  h.context.buildProfileForm();
+  for (const key of ["version", "osVersion", "timeZoneOffset"]) {
+    const control = controls[`fingerprint.${key}`];
+    assert.equal(control.disabled, true);
+    control.value = "999";
+    h.context.readField(control);
+  }
+  assert.equal(controls["fingerprint.platformVersion"].disabled, false);
+  assert.equal(controls["fingerprint.devicePixelRatio"].disabled, false);
+  const collected = h.context.collectDraft();
+  assert.equal(collected.fingerprint.version, "fixture-version");
+  assert.equal(collected.fingerprint.osVersion, "fixture-system");
+  assert.equal(collected.fingerprint.timeZoneOffset, 60);
+  const html = h.element("#profile-form").innerHTML;
+  assert.match(html, /仅保留原厂在线随机筛选值，本地不使用/);
+  assert.match(html, /实际时区偏移由上方 IANA 时区和日期决定/);
+  assert.match(html, /UA 可以相同，不代表全部指纹相同；UA 版本需匹配所选内核/);
+  assert.match(html, /value="fixture-version"/);
+  assert.match(html, /value="fixture-system"/);
+});
+
+test("system resolution makes DPR read-only without losing the manual draft across toggles and randomization", async () => {
+  const h = fixture();
+  h.state.creatingDraft = true;
+  h.state.draft = h.context.mergedProfile({ fingerprint: { resolutionType: "1", devicePixelRatio: 2.5 } });
+  const controls = creationControls(h, [["fingerprint.resolutionType", "string", "1"], ["fingerprint.devicePixelRatio", "number", "2.5"]]);
+  const mode = controls["fingerprint.resolutionType"], dpr = controls["fingerprint.devicePixelRatio"];
+  h.context.buildProfileForm();
+  dpr.value = "3.5";
+  h.context.readField(dpr);
+  const switchMode = value => { mode.value = value; h.context.readField(mode); };
+  for (const next of ["0", "2", "0", "1", "0"]) {
+    switchMode(next);
+    assert.equal(dpr.disabled, next === "0");
+    assert.equal(dpr.value, "3.5");
+    assert.equal(h.context.collectDraft().fingerprint.devicePixelRatio, 3.5);
+  }
+  h.context.api = async (_action, payload) => ({ fingerprint: { ...payload.fingerprint, canvasValue: 12345 } });
+  await h.context.randomizeCreation();
+  assert.equal(dpr.disabled, true);
+  assert.equal(dpr.value, "3.5");
+  switchMode("1");
+  assert.equal(dpr.disabled, false);
+  assert.equal(dpr.value, "3.5");
+  assert.equal(h.state.draft.fingerprint.devicePixelRatio, 3.5);
+  assert.match(h.element("#profile-form").innerHTML, /系统分辨率模式使用系统像素比；此处保留手动值/);
+  h.state.creatingDraft = false;
+  h.context.updateFingerprintReadOnly();
+  assert.equal(dpr.disabled, true);
+  assert.equal(mode.disabled, true);
+});
+
+test("randomized controls and all field types reach creation payload without rebuilding unrelated fields", async () => {
+  const h = fixture(), requests = [];
+  h.state.creatingDraft = true;
+  h.state.creation.requestId = "a".repeat(32);
+  h.state.draft = h.context.mergedProfile({ name: "synthetic", creation: { count: 2, random_each: false, proxy_lines: [] }, created_options: { workbench: "disable" } });
+  const controls = creationControls(h, [
+    ["name", "string", "synthetic typed name"], ["tags", "list", "first,second"],
+    ["creation.count", "number", "2"], ["creation.random_each", "boolean", false],
+    ["creation.proxy_lines", "lines", "http://first.example:8080\nsocks5://second.example:1080"],
+    ["fingerprint.hardwareConcurrency", "number", "12"], ["fingerprint.deviceMemory", "number", "0.5"],
+    ["fingerprint.lat", "number", "0"], ["fingerprint.lng", "number", ""],
+    ["fingerprint.canvasValue", "nullableNumber", ""], ["fingerprint.clientRectNoiseEnabled", "boolean", false],
+    ["fingerprint.webgpu", "jsonobject", '{"fixture":true}'],
+    ["fingerprint.mediaDeviceValue", "jsontext", ""], ["fingerprint.speechVoicesValue", "jsontext", '[{"voice":"synthetic"}]'],
+    ["fingerprint.plugins", "jsonarray", '[{"name":"synthetic"}]'],
+    ["created_options.image_limit_kb", "number", "64"], ["created_options.clear_cache", "boolean", true],
+    ["preferences.disable_gpu", "boolean", true], ["cookie_text", "string", "synthetic cookie draft"],
+  ]);
+  h.element("#profile-form").innerHTML = "unchanged form";
+  h.element("#drawer-proxy-result").textContent = "synthetic proxy status";
+  h.context.api = async (action, payload) => {
+    requests.push(JSON.parse(JSON.stringify({ action, payload })));
+    if (action === "creation_randomize") return { fingerprint: { ...payload.fingerprint, hardwareConcurrency: 16, deviceMemory: 8,
+      canvasValue: 45678, clientRectNoiseEnabled: true, webgpu: { fixture: false } } };
+    return { job_id: "synthetic", state: "completed", total: 2, completed: 2, failed: 0, items: [] };
+  };
+  h.context.pollCreation = async () => {};
+  await h.context.randomizeCreation();
+  assert.equal(requests[0].payload.fingerprint.hardwareConcurrency, 12);
+  assert.equal(requests[0].payload.fingerprint.deviceMemory, 0.5);
+  assert.equal(controls["fingerprint.hardwareConcurrency"].value, "16");
+  assert.equal(controls["fingerprint.canvasValue"].value, "45678");
+  assert.equal(controls["fingerprint.clientRectNoiseEnabled"].checked, true);
+  assert.deepEqual(JSON.parse(controls["fingerprint.webgpu"].value), { fixture: false });
+  assert.equal(h.element("#profile-form").innerHTML, "unchanged form");
+  assert.equal(h.element("#drawer-proxy-result").textContent, "synthetic proxy status");
+  assert.equal(h.state.saving, false);
+  assert.equal(h.element("#profile-form").inert, false);
+  await h.context.saveProfile();
+  const submitted = requests.find(r => r.action === "create_windows").payload;
+  assert.equal(submitted.count, 2);
+  assert.equal(submitted.random_each, false);
+  assert.deepEqual(submitted.proxy_lines, ["http://first.example:8080", "socks5://second.example:1080"]);
+  assert.equal(submitted.profile.creation, undefined);
+  assert.equal(submitted.profile.name, "synthetic typed name");
+  assert.deepEqual(submitted.profile.tags, ["first", "second"]);
+  assert.equal(submitted.profile.fingerprint.hardwareConcurrency, 16);
+  assert.equal(submitted.profile.fingerprint.deviceMemory, 8);
+  assert.equal(submitted.profile.fingerprint.lat, 0);
+  assert.equal(submitted.profile.fingerprint.lng, "");
+  assert.equal(submitted.profile.fingerprint.mediaDeviceValue, null);
+  assert.equal(submitted.profile.fingerprint.speechVoicesValue, '[{"voice":"synthetic"}]');
+  assert.equal(submitted.profile.fingerprint.plugins, '[{"name":"synthetic"}]');
+  assert.deepEqual(submitted.profile.fingerprint.webgpu, { fixture: false });
+  assert.equal(submitted.profile.created_options.image_limit_kb, 64);
+  assert.equal(submitted.profile.created_options.clear_cache, true);
+  assert.equal(submitted.profile.preferences.disable_gpu, true);
+  assert.equal(submitted.profile.cookie_text, "synthetic cookie draft");
+});
+
+test("late randomization cannot overwrite edits or apply an earlier result after a change and undo", async () => {
+  for (const undo of [false, true]) {
+    const h = fixture(), pending = deferred();
+    h.state.creatingDraft = true;
+    h.state.draft = h.context.mergedProfile({ fingerprint: { hardwareConcurrency: 8 } });
+    const controls = creationControls(h, [["fingerprint.hardwareConcurrency", "number", "8"]]);
+    let requests = 0;
+    h.context.api = async () => { requests++; return pending.promise; };
+    const randomizing = h.context.randomizeCreation();
+    assert.equal(h.element("#profile-form").inert, true);
+    await h.context.randomizeCreation();
+    assert.equal(requests, 1);
+    controls["fingerprint.hardwareConcurrency"].value = "12";
+    h.context.readField(controls["fingerprint.hardwareConcurrency"]);
+    if (undo) {
+      controls["fingerprint.hardwareConcurrency"].value = "8";
+      h.context.readField(controls["fingerprint.hardwareConcurrency"]);
+    }
+    pending.resolve({ fingerprint: { hardwareConcurrency: 16 } });
+    await randomizing;
+    assert.equal(h.state.draft.fingerprint.hardwareConcurrency, undo ? 8 : 12);
+    assert.match(h.element("#drawer-error").textContent, /随机结果未应用/);
+    assert.equal(h.state.saving, false);
+  }
+});
+
+test("randomization failure keeps the draft and an old response cannot reset a newer drawer", async () => {
+  for (const late of [false, true]) {
+    const h = fixture(), pending = deferred();
+    h.state.creatingDraft = true;
+    h.state.draft = h.context.mergedProfile({ name: "first" });
+    h.context.api = async () => pending.promise;
+    const randomizing = h.context.randomizeCreation();
+    if (late) {
+      h.state.draft = h.context.mergedProfile({ name: "second" });
+      h.state.drawerSession++;
+      h.context.showDrawerError("new drawer error");
+    }
+    pending.reject(new Error("synthetic random failure"));
+    await randomizing;
+    assert.equal(h.state.draft.name, late ? "second" : "first");
+    assert.equal(h.state.saving, late);
+    assert.equal(h.element("#profile-form").inert, late);
+    assert.equal(h.element("#drawer-error").textContent, late ? "new drawer error" : "synthetic random failure");
+  }
+});
+
+test("numeric input rejects incomplete browser numbers and location accuracy matches backend limits", () => {
+  const h = fixture();
+  h.state.creatingDraft = true;
+  h.state.draft = h.context.mergedProfile({ name: "synthetic" });
+  h.context.buildProfileForm();
+  assert.match(h.element("#profile-form").innerHTML, /id="field-fingerprint-defaultAccuracy"[^>]*min="1" max="100000"/);
+  for (const field of ["hardwareConcurrency", "deviceMemory"]) {
+    const control = {
+      value: "", disabled: false, validity: { badInput: true }, checkValidity: () => false,
+      dataset: { field: `fingerprint.${field}` },
+      closest: selector => selector === "[data-form-section]" ? { dataset: { formSection: "fingerprint" } } : { querySelector: () => ({ textContent: field }) },
+    };
+    h.element("#profile-form").all.set('input[type="number"]', [control]);
+    assert.equal(h.context.validateDraft(h.state.draft).field, `fingerprint.${field}`);
+    control.validity.badInput = false;
+    assert.equal(h.context.validateDraft(h.state.draft), null);
+  }
+});
+
 test("explicit creation device changes apply the stock mobile screen defaults and preserve later manual edits", () => {
   const h = fixture();
   const catalog = JSON.parse(fs.readFileSync(path.join(root, "app/resources/creation-catalog.json"), "utf8"));
@@ -213,6 +455,7 @@ function fixture() {
         innerHTML: "", style: {}, dataset: {}, listeners: new Map(), all: new Map(),
         classList: { toggle() {}, add() {}, contains() { return false; } },
         setAttribute(key, value) { this[key] = value; },
+        removeAttribute(key) { delete this[key]; },
         addEventListener(type, callback) { this.listeners.set(type, callback); },
         querySelectorAll(query) { return this.all.get(query) || []; },
         querySelector() { return null; },
@@ -257,6 +500,178 @@ function fixture() {
   });
   return { context, state, element, nodes, timers, toasts, confirmations, serviceErrors, setting, renderProfiles, refreshProfiles, nativeConfirmAction };
 }
+
+function windowLayoutData(settings = {}) {
+  return {
+    settings: { mode: "auto", monitor: "primary", start_x: 0, start_y: 0, width: 640, height: 600,
+      columns: 3, gap_x: 0, gap_y: 0, step_x: 30, step_y: 30, order: "asc", ...settings },
+    monitors: [{ id: "display-one", label: "显示器 1", primary: true, x: 0, y: 0, width: 1920, height: 1040 }],
+  };
+}
+
+test("arrange uses all package windows regardless of filters or selection and prevents duplicate requests", async () => {
+  const h = fixture(), pending = deferred(), requests = [];
+  h.state.search = "no results";
+  h.state.selected.add("one-selected-window");
+  h.state.filter = "running";
+  h.context.api = async (...args) => { requests.push(args); return pending.promise; };
+  const arranging = h.element("#arrange-windows").onclick();
+  await h.context.arrangeWindows();
+  assert.deepEqual(requests, [["arrange_windows"]]);
+  assert.equal(h.element("#arrange-windows").disabled, true);
+  assert.equal(h.element("#window-layout-settings").disabled, true);
+  pending.resolve({ arranged: 2, failed: 1, skipped: 1, total: 4, adjusted: 0 });
+  await arranging;
+  assert.match(h.toasts[0].message, /已排列 2 个窗口，失败 1 个，跳过 1 个/);
+  assert.equal(h.toasts[0].type, "error");
+  assert.equal(h.state.windowLayout.arranging, false);
+  assert.equal(h.element("#arrange-windows").disabled, false);
+  assert.equal(h.state.search, "no results");
+  assert.equal(h.state.selected.size, 1);
+});
+
+test("layout result keeps backend diagnostics without duplicating counts or inventing empty state", () => {
+  const h = fixture();
+  for (const result of [
+    { arranged: 2, failed: 1, skipped: 1, total: 4, message: "已排列 2 个窗口，失败 1 个，跳过 1 个" },
+    { arranged: 0, failed: 0, skipped: 0, total: 0, message: "无法读取部分进程，未确认窗口归属" },
+  ]) {
+    h.context.reportWindowArrangement(result);
+    assert.equal(h.toasts.at(-1).message, result.message);
+  }
+});
+
+test("layout modes show only applicable fields and cancelling never saves", async () => {
+  const h = fixture(), requests = [];
+  h.context.api = async (action) => { requests.push(action); return windowLayoutData(); };
+  await h.context.openWindowLayout();
+  assert.equal(h.element("#window-layout-manual").hidden, true);
+  assert.equal(h.element("#window-layout-auto-note").hidden, false);
+  for (const mode of ["grid", "cascade"]) {
+    h.element("#window-layout-mode").value = mode;
+    h.element("#window-layout-mode").onchange();
+    assert.equal(h.element("#window-layout-manual").hidden, false);
+    assert.equal(h.element("#window-layout-grid").hidden, mode !== "grid");
+    assert.equal(h.element("#window-layout-cascade").hidden, mode !== "cascade");
+  }
+  h.element("#window-layout-width").value = "850";
+  h.element("#window-layout-cancel").onclick();
+  assert.equal(h.element("#window-layout-dialog").open, false);
+  assert.deepEqual(requests, ["window_layout_get"]);
+  await h.context.openWindowLayout();
+  assert.equal(h.element("#window-layout-width").value, "640");
+});
+
+test("closing a layout read ignores its late reply after a newer dialog opens", async () => {
+  const h = fixture(), pending = deferred();
+  h.context.api = async () => pending.promise;
+  const oldRead = h.context.openWindowLayout();
+  h.context.closeWindowLayout();
+  h.context.api = async () => windowLayoutData({ mode: "grid", width: 880 });
+  await h.context.openWindowLayout();
+  pending.resolve(windowLayoutData({ mode: "cascade", width: 500 }));
+  await oldRead;
+  assert.equal(h.element("#window-layout-dialog").open, true);
+  assert.equal(h.element("#window-layout-mode").value, "grid");
+  assert.equal(h.element("#window-layout-width").value, "880");
+  assert.equal(h.state.windowLayout.loading, false);
+});
+
+test("layout save and arrange preserves API ordering, integer fields and busy locking", async () => {
+  const h = fixture(), pendingSave = deferred(), pendingArrange = deferred(), requests = [];
+  h.context.api = async () => windowLayoutData({ mode: "grid" });
+  await h.context.openWindowLayout();
+  h.element("#window-layout-width").value = "480";
+  h.element("#window-layout-columns").value = "4";
+  h.element("#window-layout-order").value = "desc";
+  h.context.api = async (action, payload) => {
+    requests.push({ action, payload });
+    return action === "window_layout_save" ? pendingSave.promise : pendingArrange.promise;
+  };
+  const saving = h.context.saveWindowLayout(true);
+  await h.context.saveWindowLayout(true);
+  h.context.closeWindowLayout();
+  assert.equal(h.element("#window-layout-dialog").open, true);
+  assert.equal(h.element("#window-layout-form").inert, true);
+  assert.equal(h.element("#window-layout-cancel").disabled, true);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].payload.settings.width, 480);
+  assert.equal(requests[0].payload.settings.columns, 4);
+  assert.equal(requests[0].payload.settings.order, "desc");
+  pendingSave.resolve({ settings: requests[0].payload.settings });
+  await new Promise(setImmediate);
+  assert.deepEqual(requests.map((request) => request.action), ["window_layout_save", "arrange_windows"]);
+  assert.equal(requests[1].payload, undefined);
+  assert.equal(h.state.windowLayout.arranging, true);
+  pendingArrange.resolve({ arranged: 4, failed: 0, skipped: 0, total: 4, adjusted: 0 });
+  await saving;
+  assert.equal(h.element("#window-layout-dialog").open, false);
+  assert.equal(h.state.windowLayout.saving, false);
+  assert.equal(h.state.windowLayout.arranging, false);
+});
+
+test("invalid layout dimensions block saving but unused fields do not block auto", async () => {
+  const h = fixture(), requests = [];
+  h.context.api = async () => windowLayoutData({ mode: "grid" });
+  await h.context.openWindowLayout();
+  h.context.api = async (action, payload) => { requests.push(action); return { settings: payload.settings }; };
+  for (const [key, value] of [["width", "119"], ["height", "39"], ["columns", "2.5"], ["start_x", "-1"], ["gap_x", ""]]) {
+    const control = h.element("#window-layout-" + key), previous = control.value;
+    control.value = value;
+    await h.context.saveWindowLayout();
+    assert.equal(h.element("#window-layout-error").hidden, false);
+    assert.equal(requests.length, 0);
+    control.value = previous;
+  }
+  h.element("#window-layout-mode").value = "auto";
+  h.element("#window-layout-width").value = "";
+  await h.context.saveWindowLayout();
+  assert.deepEqual(requests, ["window_layout_save"]);
+  assert.equal(h.element("#window-layout-dialog").open, false);
+});
+
+test("layout failures retain the draft and distinguish a saved layout from failed arrangement", async () => {
+  const h = fixture();
+  h.context.api = async () => windowLayoutData({ mode: "cascade" });
+  await h.context.openWindowLayout();
+  h.element("#window-layout-step_x").value = "45";
+  h.context.api = async () => { throw new Error("合成保存失败"); };
+  await h.context.saveWindowLayout(true);
+  assert.match(h.element("#window-layout-error").textContent, /合成保存失败/);
+  assert.equal(h.element("#window-layout-step_x").value, "45");
+  assert.equal(h.element("#window-layout-save").disabled, false);
+  h.context.api = async (action, payload) => {
+    if (action === "window_layout_save") return { settings: payload.settings };
+    throw new Error("合成排列失败");
+  };
+  await h.context.saveWindowLayout(true);
+  assert.match(h.element("#window-layout-error").textContent, /设置已保存，排列未完成/);
+  assert.equal(h.element("#window-layout-dialog").open, true);
+  assert.equal(h.element("#window-layout-form").inert, false);
+  assert.equal(h.state.windowLayout.arranging, false);
+});
+
+test("missing layout monitor uses primary and escapes display names", async () => {
+  const h = fixture(), data = windowLayoutData({ monitor: "unplugged" });
+  data.monitors[0].label = '<display & "one">';
+  h.context.api = async () => data;
+  await h.context.openWindowLayout();
+  assert.equal(h.element("#window-layout-monitor").value, "primary");
+  assert.equal(h.element("#window-layout-monitor-note").hidden, false);
+  assert.match(h.element("#window-layout-monitor").innerHTML, /&lt;display &amp; &quot;one&quot;&gt;/);
+  assert.doesNotMatch(h.element("#window-layout-monitor").innerHTML, /<display/);
+});
+
+test("layout monitor labels use service text once and generate details only when missing", async () => {
+  const h = fixture(), data = windowLayoutData();
+  data.monitors[0].label = "显示器 1 · 主屏 · 1920 × 1040";
+  data.monitors.push({ id: "display-two", primary: false, width: 1280, height: 720 });
+  h.context.api = async () => data;
+  await h.context.openWindowLayout();
+  const html = h.element("#window-layout-monitor").innerHTML;
+  assert.match(html, /<option value="display-one">显示器 1 · 主屏 · 1920 × 1040<\/option>/);
+  assert.match(html, /<option value="display-two">显示器 · 1280 × 720<\/option>/);
+});
 
 test("batch search matches any remark and ignores case, blank lines and duplicates", () => {
   const h = fixture();
@@ -315,6 +730,24 @@ test("batch search keeps field coverage, phrase matching, filters and sorting", 
   assert.equal(h.context.filteredProfiles().length, 4);
 });
 
+test("reused collator preserves Chinese, numeric, missing and equal value sort order", () => {
+  const h = fixture();
+  const values = ["窗口10", "窗口2", "中文", "Alpha", "alpha", "窗口02", "", null, "阿", "2026-11-2", "2026-11-10"];
+  for (const field of ["name", "group", "remark", "created_at", "last_opened_at"]) {
+    h.state.profiles = values.map((value, index) => ({ id: `sort-${index}`, seq: values.length - index, [field]: value }));
+    h.state.sort = field;
+    for (const direction of [1, -1]) {
+      h.state.direction = direction;
+      const expected = [...h.state.profiles].sort((a, b) =>
+        String(a[field] ?? "").localeCompare(String(b[field] ?? ""), "zh-CN", { numeric: true }) * direction);
+      assert.deepEqual(Array.from(h.context.filteredProfiles(), p => p.id), expected.map(p => p.id));
+    }
+  }
+  h.state.sort = "seq";
+  h.state.direction = 1;
+  assert.deepEqual(Array.from(h.context.filteredProfiles(), p => p.seq), values.map((_, index) => index + 1));
+});
+
 test("multiline search resets pagination and clearing filters restores the input", () => {
   const h = fixture();
   h.context.renderProfiles = h.renderProfiles;
@@ -322,6 +755,11 @@ test("multiline search resets pagination and clearing filters restores the input
   h.state.page = 4;
   input.value = "one\ntwo\nthree\nfour\nfive";
   input.oninput({ target: input });
+  assert.equal(h.state.search, "");
+  assert.equal(h.state.page, 4);
+  assert.equal(input.rows, 4);
+  assert.equal(h.timers.size, 1);
+  [...h.timers.values()][0].callback();
   assert.equal(h.state.search, input.value);
   assert.equal(h.state.page, 1);
   assert.equal(input.rows, 4);
@@ -332,6 +770,138 @@ test("multiline search resets pagination and clearing filters restores the input
   assert.equal(input.rows, 1);
   assert.equal(input["aria-invalid"], "false");
   assert.equal(h.element("#search-feedback").hidden, true);
+});
+
+test("debounced search selects the displayed page until the latest input is applied", () => {
+  const h = fixture();
+  h.context.renderProfiles = h.renderProfiles;
+  h.state.profiles = Array.from({ length: 5 }, (_, index) => ({ id: `row-${index + 1}`, seq: index + 1, name: `窗口 ${index + 1}` }));
+  h.state.pageSize = 2;
+  h.state.page = 2;
+  h.renderProfiles();
+  let renders = 0;
+  h.context.renderProfiles = () => { renders++; h.renderProfiles(); };
+  const input = h.element("#search-input");
+  input.value = "窗口";
+  input.oninput({ target: input });
+  const old = [...h.timers.values()][0];
+  input.value = "窗口 5";
+  input.oninput({ target: input });
+  old.callback();
+  assert.equal(renders, 0);
+  assert.equal(h.state.search, "");
+  assert.equal(h.state.page, 2);
+  assert.equal(h.timers.size, 1);
+  const pending = [...h.timers.values()][0];
+  assert.equal(pending.delay, 150);
+  h.element("#select-all").onchange({ target: { checked: true } });
+  assert.deepEqual([...h.state.selected], ["row-3", "row-4"]);
+  assert.match(h.element("#profile-rows").innerHTML, /<tr data-id="row-3"/);
+  assert.doesNotMatch(h.element("#profile-rows").innerHTML, /<tr data-id="row-5"/);
+  pending.callback();
+  assert.equal(renders, 2);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.state.search, "窗口 5");
+  assert.equal(h.state.page, 1);
+  assert.equal(h.element("#select-all").checked, false);
+  assert.deepEqual([...h.state.selected], ["row-3", "row-4"]);
+  h.element("#select-all").onchange({ target: { checked: true } });
+  assert.deepEqual([...h.state.selected], ["row-3", "row-4", "row-5"]);
+});
+
+test("clearing input or resetting filters cancels late search without changing later pagination", () => {
+  for (const reset of [false, true]) {
+    const h = fixture();
+    h.context.renderProfiles = h.renderProfiles;
+    h.state.search = "applied";
+    const input = h.element("#search-input");
+    input.value = "pending";
+    input.oninput({ target: input });
+    const pending = [...h.timers.values()][0];
+    if (reset) h.element("#clear-filters").onclick();
+    else {
+      input.value = "";
+      input.oninput({ target: input });
+    }
+    assert.equal(h.state.search, "");
+    assert.equal(h.timers.size, 0);
+    assert.equal(input.rows, 1);
+    h.state.page = 2;
+    pending.callback();
+    assert.equal(h.state.search, "");
+    assert.equal(h.state.page, 2);
+  }
+});
+
+test("Chinese composition cancels pending input and commits once after the final input event", () => {
+  const h = fixture(), input = h.element("#search-input");
+  let renders = 0;
+  h.context.renderProfiles = () => { renders++; };
+  input.value = "previous";
+  input.oninput({ target: input });
+  const pending = [...h.timers.values()][0];
+  input.oncompositionstart();
+  for (const value of ["chuang", "窗口"]) {
+    input.value = value;
+    input.oninput({ target: input, isComposing: true });
+    assert.equal(h.timers.size, 0);
+  }
+  pending.callback();
+  assert.equal(h.state.search, "");
+  assert.equal(renders, 0);
+  input.oncompositionend({ target: input });
+  const ended = [...h.timers.values()][0];
+  input.oninput({ target: input, isComposing: false });
+  assert.equal(h.timers.size, 1);
+  ended.callback();
+  assert.equal(renders, 0);
+  [...h.timers.values()][0].callback();
+  assert.equal(h.state.search, "窗口");
+  assert.equal(renders, 1);
+  assert.equal(h.timers.size, 0);
+});
+
+test("pending batch search retains filters and pagination selection before enforcing the ten term limit", () => {
+  const h = fixture(), input = h.element("#search-input");
+  h.context.renderProfiles = h.renderProfiles;
+  h.state.profiles = Array.from({ length: 11 }, (_, index) => ({
+    id: `row-${index + 1}`, seq: index + 1, name: `term-${index + 1}`, group: index % 2 ? "B" : "A", tags: ["work"],
+  }));
+  input.value = h.state.profiles.slice(0, 10).map(p => p.name).join("\n");
+  input.oninput({ target: input });
+  h.element("#group-filter").onchange({ target: { value: "A" } });
+  h.element("#tag-filter").onchange({ target: { value: "work" } });
+  h.element("#page-size").onchange({ target: { value: "1" } });
+  h.element("#next-page").onclick();
+  assert.equal(h.state.page, 2);
+  h.element("#select-all").onchange({ target: { checked: true } });
+  assert.deepEqual([...h.state.selected], ["row-3"]);
+  [...h.timers.values()][0].callback();
+  assert.equal(h.state.page, 1);
+  assert.equal(h.state.group, "A");
+  assert.equal(h.state.tag, "work");
+  assert.equal(h.state.pageSize, 1);
+  assert.equal(h.element("#search-input")["aria-invalid"], "false");
+  input.value += "\nterm-11";
+  input.oninput({ target: input });
+  [...h.timers.values()][0].callback();
+  assert.equal(h.element("#search-input")["aria-invalid"], "true");
+  assert.equal(h.element("#profile-rows").innerHTML, "");
+  assert.deepEqual([...h.state.selected], ["row-3"]);
+});
+
+test("arrangement keeps a pending search independent of the all-window request", async () => {
+  const h = fixture(), input = h.element("#search-input"), requests = [];
+  h.state.search = "applied";
+  input.value = "pending";
+  input.oninput({ target: input });
+  h.context.api = async (...args) => { requests.push(args); return { arranged: 1, total: 1 }; };
+  await h.element("#arrange-windows").onclick();
+  assert.deepEqual(requests, [["arrange_windows"]]);
+  assert.equal(h.state.search, "applied");
+  assert.equal(h.timers.size, 1);
+  [...h.timers.values()][0].callback();
+  assert.equal(h.state.search, "pending");
 });
 
 test("discarded settings never change single or batch close confirmation", async () => {
@@ -687,6 +1257,9 @@ test("independent guidance includes complete new local sources and keeps per-sou
   h.context.renderSync();
   assert.match(h.element("#sync-source-note").textContent, /先自动检测本机来源.*开始同步.*才复制资料/);
   assert.match(h.element("#sync-explanation").textContent, /在比特中打开过的新窗口均会参与检查/);
+  assert.match(h.element("#sync-explanation").textContent, /读取名称、备注，不复制窗口资料/);
+  assert.match(h.element("#sync-explanation").textContent, /读取名称、备注可能需要比特的有效登录会话及联网/);
+  assert.doesNotMatch(h.element("#sync-explanation").textContent, /检测只读取本机资料/);
   assert.match(h.element("#sync-preview-summary").textContent, /正在检查本机来源配置及完整资料/);
   h.state.sync.loading = false;
   h.context.renderSyncPreview();
@@ -732,6 +1305,259 @@ function syncStatus(overrides = {}) {
     cancel_requested: false, ...overrides,
   };
 }
+
+function syncProgress(overrides = {}) {
+  return {
+    index: 1, source_key: "progress-fixture", name: "合成导入窗口", phase: "copying",
+    done: 512 * 1024 * 1024, total: 1024 * 1024 * 1024, unit: "bytes",
+    elapsed_seconds: 74, phase_elapsed_seconds: 12, timings: { checking: 2, source_hash: 60 },
+    ...overrides,
+  };
+}
+
+test("sync progress separates processed batch counts from measured byte progress and success", () => {
+  const h = fixture();
+  h.context.restoreSyncJob(syncStatus({ total: 4, completed: 1, skipped: 1, failed: 1, progress: syncProgress({ index: 4 }) }));
+  assert.equal(h.element("#sync-progress-count").textContent, "批次已处理 3 / 4 · 75%");
+  assert.equal(h.element("#sync-progress").value, 3);
+  assert.equal(h.element("#sync-progress-summary").textContent, "成功 1 个，跳过 1 个，失败 1 个。");
+  assert.equal(h.element("#sync-current").hidden, false);
+  assert.equal(h.element("#sync-current-label").textContent, "当前窗口 4 / 4");
+  assert.equal(h.element("#sync-stage-count").textContent, "512 MB / 1 GB · 50%");
+  assert.equal(h.element("#sync-stage-progress").value, 512 * 1024 * 1024);
+  assert.equal(h.element("#sync-stage-progress").max, 1024 * 1024 * 1024);
+  assert.equal(h.element("#sync-stage-elapsed").textContent, "当前窗口已用 1 分 14 秒 · 本阶段已用 12 秒");
+  assert.match(h.element("#sync-stage-timings").textContent, /检查资料 2 秒.*读取来源校验摘要 1 分 0 秒/);
+  assert.equal(h.timers.size, 1);
+});
+
+test("copying at 100 percent cannot complete a batch and the next phase resets its measurement", () => {
+  const h = fixture();
+  h.context.restoreSyncJob(syncStatus({ total: 1, progress: syncProgress({ done: 1024, total: 1024 }) }));
+  assert.match(h.element("#sync-stage-count").textContent, /100%/);
+  assert.match(h.element("#sync-progress-count").textContent, /0 \/ 1 · 0%/);
+  assert.doesNotMatch(h.element("#sync-phase").textContent, /同步完成/);
+  h.context.restoreSyncJob(syncStatus({ total: 1, phase: "importing", progress: syncProgress({ phase: "cookies", done: null, total: null, unit: null, phase_elapsed_seconds: 0 }) }));
+  assert.equal(h.element("#sync-stage-name").textContent, "准备登录资料");
+  assert.equal(h.element("#sync-stage-progress").value, undefined);
+  assert.equal(h.element("#sync-stage-progress").max, 1);
+  assert.equal(h.element("#sync-stage-count").textContent, "总量待确认");
+  assert.match(h.element("#sync-stage-elapsed").textContent, /本阶段已用 0 秒/);
+});
+
+test("large import batches retain exact processed totals and distinct final failures", () => {
+  for (const total of [9999, 10000]) {
+    const h = fixture();
+    h.context.restoreSyncJob(syncStatus({ total, progress: syncProgress({ done: 1024, total: 1024 }) }));
+    assert.equal(h.element("#sync-progress-count").textContent, `批次已处理 0 / ${total} · 0%`);
+    assert.match(h.element("#sync-stage-count").textContent, /100%/);
+    h.context.restoreSyncJob(syncStatus({ total, completed: total - 2, skipped: 1, progress: syncProgress({ index: total }) }));
+    assert.equal(h.element("#sync-progress-count").textContent, `批次已处理 ${total - 1} / ${total} · 99.9%`);
+    h.state.sync.status = h.context.boundedSyncStatus(syncStatus({ state: "completed", total, completed: total - 2, skipped: 1, failed: 1, progress: syncProgress() }));
+    h.context.renderSyncProgress();
+    assert.equal(h.element("#sync-progress-count").textContent, `批次已处理 ${total} / ${total} · 100%`);
+    assert.equal(h.element("#sync-progress-summary").textContent, `成功 ${total - 2} 个，跳过 1 个，失败 1 个。`);
+    assert.equal(h.element("#sync-phase").textContent, "同步完成，部分窗口失败");
+    assert.equal(h.element("#sync-current").hidden, true);
+  }
+});
+
+test("import headings display detailed stages while retaining legacy phase aliases", () => {
+  const h = fixture();
+  for (const [phase, label] of [["validating", "验证窗口配置"], ["committing", "提交本地窗口"]]) {
+    h.context.restoreSyncJob(syncStatus({ phase, progress: null }));
+    assert.equal(h.element("#sync-phase").textContent, `${label}…`);
+    h.context.restoreSyncJob(syncStatus({ phase: "importing", progress: syncProgress({ phase }) }));
+    assert.equal(h.element("#sync-phase").textContent, `${label}…`);
+  }
+  for (const [phase, label] of [["preview", "正在检查资料"], ["saving", "正在保存本地副本"], ["finalizing", "正在完成同步"]]) {
+    h.context.restoreSyncJob(syncStatus({ phase, progress: null }));
+    assert.equal(h.element("#sync-phase").textContent, label);
+  }
+});
+
+test("zero, unknown and invalid phase totals remain indeterminate without invented percentages", () => {
+  for (const values of [
+    { done: 0, total: 0, unit: "bytes" },
+    { done: 12, total: null, unit: "files" },
+    { done: null, total: 100, unit: "bytes" },
+    { done: -1, total: 100, unit: "bytes" },
+    { done: 2, total: Infinity, unit: "files" },
+    { done: 1, total: 3, unit: null },
+  ]) {
+    const h = fixture();
+    h.context.restoreSyncJob(syncStatus({ progress: syncProgress(values) }));
+    assert.equal(h.element("#sync-stage-progress").value, undefined);
+    assert.doesNotMatch(h.element("#sync-stage-count").textContent, /%/);
+    assert.match(h.element("#sync-stage-count").textContent, /总量待确认|无可计量数据/);
+    if (values.total === 0) assert.match(h.element("#sync-stage-count").textContent, /^0 B/);
+  }
+});
+
+test("file and baseline round progress uses reported counts without elapsed-time extrapolation", () => {
+  const h = fixture();
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress({ phase: "source_verify", done: 9999, total: 10000, unit: "files" }) }));
+  assert.equal(h.element("#sync-stage-count").textContent, "9999 个文件 / 10000 个文件 · 99.9%");
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress({ phase: "baseline_second", done: 1, total: 3, unit: "steps", elapsed_seconds: 3661, phase_elapsed_seconds: 3600, timings: {} }) }));
+  assert.equal(h.element("#sync-stage-name").textContent, "第二次环境基线采集");
+  assert.equal(h.element("#sync-stage-count").textContent, "1 轮 / 3 轮 · 33.3%");
+  assert.equal(h.element("#sync-stage-elapsed").textContent, "当前窗口已用 1 小时 1 分 1 秒 · 本阶段已用 1 小时 0 分 0 秒");
+  assert.equal(h.element("#sync-stage-timings").hidden, true);
+  assert.equal(h.element("#sync-stage-timings").textContent, "");
+  h.state.sync.status.progress.elapsed_seconds = 99999;
+  h.context.renderSyncProgress();
+  assert.match(h.element("#sync-stage-count").textContent, /33.3%/);
+});
+
+test("current source names prefer preview labels and remain literal text with safe empty fallbacks", () => {
+  const h = fixture();
+  const name = '<img src=x onerror="fixture"> & 合成窗口';
+  h.state.sync.names.set("progress-fixture", name);
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress({ name: "待准备的本机窗口" }) }));
+  assert.equal(h.element("#sync-current-name").textContent, name);
+  assert.equal(h.element("#sync-current-name").title, name);
+  assert.equal(h.element("#sync-current-name").innerHTML, "");
+  h.state.sync.names.clear();
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress({ name }) }));
+  assert.equal(h.element("#sync-current-name").textContent, name);
+  assert.equal(h.element("#sync-current-name").innerHTML, "");
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress({ name: "" }) }));
+  assert.equal(h.element("#sync-current-name").textContent, "未命名窗口");
+});
+
+test("terminal and interrupted responses clear current-item details even when stale progress is attached", async () => {
+  for (const state of ["completed", "failed", "cancelled", "interrupted"]) {
+    const h = fixture();
+    h.context.restoreSyncJob(syncStatus({ progress: syncProgress() }));
+    h.context.api = async () => syncStatus({ state, progress: syncProgress() });
+    await h.context.pollSyncStatus();
+    assert.equal(h.state.sync.status.progress, null);
+    assert.equal(h.element("#sync-current").hidden, true);
+    assert.equal(h.element("#sync-current-name").textContent, "");
+    assert.equal(h.element("#sync-current-name").title, "");
+    assert.equal(h.element("#sync-stage-count").textContent, "");
+    assert.equal(h.element("#sync-stage-timings").textContent, "");
+    assert.equal(h.element("#sync-stage-progress").value, undefined);
+    assert.equal(h.timers.size, 0);
+  }
+});
+
+test("legacy and restarted jobs without progress cannot retain the previous current item", () => {
+  const h = fixture();
+  for (const status of [syncStatus(), syncStatus({ progress: null }), syncStatus({ state: "interrupted" })]) {
+    h.context.restoreSyncJob(syncStatus({ progress: syncProgress() }));
+    h.context.restoreSyncJob(status);
+    assert.equal(h.state.sync.status.progress, null);
+    assert.equal(h.element("#sync-current").hidden, true);
+    assert.equal(h.element("#sync-current-name").textContent, "");
+  }
+});
+
+test("a late status response cannot replace a newer current window or phase", async () => {
+  const h = fixture();
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress() }));
+  const old = deferred();
+  h.context.api = async () => old.promise;
+  const polling = h.context.pollSyncStatus();
+  h.context.restoreSyncJob(syncStatus({ completed: 1, progress: syncProgress({ index: 2, source_key: "next-fixture", name: "后续合成窗口", phase: "checking", done: null, total: null, unit: null }) }));
+  old.resolve(syncStatus({ progress: syncProgress() }));
+  await polling;
+  assert.equal(h.element("#sync-current-name").textContent, "后续合成窗口");
+  assert.equal(h.element("#sync-stage-name").textContent, "检查资料");
+  assert.equal(h.element("#sync-stage-progress").value, undefined);
+  assert.equal(h.state.sync.status.completed, 1);
+  assert.equal(h.timers.size, 1);
+});
+
+test("cancelling remaining work preserves the current phase until it completes", async () => {
+  const h = fixture();
+  h.context.restoreSyncJob(syncStatus({ progress: syncProgress() }));
+  h.context.api = async (action) => action === "cancel_sync" ? { requested: true } : syncStatus({ cancel_requested: true, progress: syncProgress({ done: 768 * 1024 * 1024 }) });
+  await h.context.cancelSyncJob();
+  await new Promise(setImmediate);
+  assert.equal(h.element("#sync-current").hidden, false);
+  assert.match(h.element("#sync-stage-count").textContent, /75%/);
+  assert.match(h.element("#sync-background-note").textContent, /当前窗口会继续处理，只取消尚未开始的窗口/);
+  assert.equal(h.element("#sync-cancel-job").disabled, true);
+  assert.equal(h.timers.size, 1);
+  assert.equal([...h.timers.values()][0].delay, 1000);
+});
+
+test("sync preview safely displays full source labels and long remarks with empty fallbacks", () => {
+  const h = fixture();
+  const name = '合成窗口 <img src=x onerror="fixture"> & \'中文\'';
+  const remark = `${"长中文备注".repeat(80)}\n<script>fixture("文本")</script> & '完整尾部'`;
+  const escapedName = '合成窗口 &lt;img src=x onerror=&quot;fixture&quot;&gt; &amp; &#39;中文&#39;';
+  const escapedRemark = `${"长中文备注".repeat(80)}\n&lt;script&gt;fixture(&quot;文本&quot;)&lt;/script&gt; &amp; &#39;完整尾部&#39;`;
+  h.state.sync.preview = [
+    { source_key: "labels-fixture", name, remark, seq: 0, status: "ready" },
+    { source_key: "empty-fixture", remark: " \n ", status: "ready", metadata_note: '合成提示 <读取失败> & "重试"' },
+  ];
+  h.context.renderSyncPreview();
+  const rows = h.element("#sync-preview-rows").innerHTML;
+  assert.ok(rows.includes(`<strong class="sync-source-name" title="${escapedName}">${escapedName}</strong>`));
+  assert.ok(rows.includes(`<small class="sync-source-remark" title="${escapedRemark}">备注：${escapedRemark}</small>`));
+  assert.match(rows, /来源序号 0/);
+  assert.match(rows, /未命名窗口/);
+  assert.match(rows, /来源序号 —/);
+  assert.match(rows, /title="无备注">备注：—<\/small>/);
+  assert.match(rows, /合成提示 &lt;读取失败&gt; &amp; &quot;重试&quot;/);
+  assert.doesNotMatch(rows, /<img|<script|disabled/);
+});
+
+test("sync remark search preserves original indices and cross-page choices until explicit start", async () => {
+  const h = fixture(), calls = [];
+  const candidates = Array.from({ length: 105 }, (_, index) => ({
+    source_key: `labels-${index}`, name: "同名合成窗口", seq: 1000 + index,
+    remark: index % 2 === 0 ? "中文 Alpha 备注" : "另一组合成备注", status: "ready",
+  }));
+  h.context.api = async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "sync_preview") return { preview_id: "labels-preview", items: candidates };
+    if (action === "sync_windows") return { job_id: "fixture-job" };
+    return syncStatus({ state: "completed", total: 104, completed: 104 });
+  };
+  await h.context.loadSyncPreview();
+  assert.equal(h.state.sync.selected.size, 105);
+  h.element("#sync-search").oninput({ target: { value: "  ALPHA  " } });
+  assert.equal(h.element("#sync-range").textContent, "1–50 / 53");
+  assert.equal((h.element("#sync-preview-rows").innerHTML.match(/<tr>/g) || []).length, 50);
+  assert.match(h.element("#sync-preview-rows").innerHTML, /data-sync-index="98"/);
+  h.element("#sync-next").onclick();
+  assert.equal(h.element("#sync-range").textContent, "51–53 / 53");
+  assert.equal((h.element("#sync-preview-rows").innerHTML.match(/<tr>/g) || []).length, 3);
+  for (const index of [102, 104]) {
+    assert.match(h.element("#sync-preview-rows").innerHTML, new RegExp(`data-sync-index="${index}"`));
+    h.element("#sync-preview-rows").onchange({
+      target: { closest: () => ({ dataset: { syncIndex: String(index) }, checked: false }) },
+    });
+  }
+  assert.equal(h.state.sync.selected.size, 103);
+  assert.equal(h.state.sync.selected.has("labels-101"), true);
+  h.element("#sync-search").oninput({ target: { value: "同名合成窗口" } });
+  assert.equal(h.state.sync.page, 1);
+  assert.equal(h.element("#sync-range").textContent, "1–50 / 105");
+  h.element("#sync-search").oninput({ target: { value: "1104" } });
+  const rows = h.element("#sync-preview-rows").innerHTML;
+  assert.equal(h.element("#sync-range").textContent, "1–1 / 1");
+  assert.match(rows, /data-sync-index="104"/);
+  assert.doesNotMatch(rows, /checked/);
+  h.element("#sync-preview-rows").onchange({
+    target: { closest: () => ({ dataset: { syncIndex: "104" }, checked: true }) },
+  });
+  assert.equal(h.state.sync.selected.size, 104);
+  assert.equal(h.state.sync.selected.has("labels-102"), false);
+  assert.deepEqual(calls.map((call) => call.action), ["sync_preview"]);
+  await h.context.startSync();
+  await new Promise(setImmediate);
+  const started = calls.filter((call) => call.action === "sync_windows");
+  assert.equal(started.length, 1);
+  assert.equal(started[0].payload.preview_id, "labels-preview");
+  assert.equal(started[0].payload.source_keys.length, 104);
+  assert.equal(started[0].payload.source_keys.includes("labels-102"), false);
+  assert.equal(started[0].payload.source_keys.includes("labels-104"), true);
+  assert.equal(started[0].payload.source_keys.includes("labels-0"), true);
+});
 
 test("sync entry only detects and explicit start submits its preview receipt once", async () => {
   const h = fixture(), calls = [];

@@ -13,7 +13,8 @@ import uuid
 from app_paths import APP_ROOT
 from browser_core import sha256
 from browser_processes import profile_processes
-from creation_fingerprint import creation_defaults,random_fingerprint,freeze_random_font,validate_profile,build_native,resolve_geo,needs_geo,catalog
+from creation_fingerprint import creation_defaults,random_fingerprint,freeze_random_font,freeze_creation_battery,validate_profile,build_native,resolve_geo,needs_geo,catalog
+from engine_validation import verification_scope
 from local_state import LocalBrowserError,_dpapi_protect
 from portable_browser import capture_profile
 from sync_state import WorkerLease
@@ -99,13 +100,17 @@ class WindowCreator:
                         if common.get(field) in ('',None):common[field]=generated[field]
                     if not random_each and str(common.get('resolutionType'))=='2':
                         common.update(resolutionType='1',resolution=_random_resolution(common))
-                    if not random_each:freeze_random_font(self.service.configuration,common)
+                    if not random_each:
+                        freeze_random_font(self.service.configuration,common)
+                        freeze_creation_battery(profile)
                     for index in range(1,count+1):
                         value=copy.deepcopy(profile)
                         value['fingerprint']=random_fingerprint(profile['fingerprint']) if random_each else copy.deepcopy(common)
                         if str(value['fingerprint'].get('resolutionType'))=='2':
                             value['fingerprint'].update(resolutionType='1',resolution=_random_resolution(value['fingerprint']))
-                        if random_each:freeze_random_font(self.service.configuration,value['fingerprint'])
+                        if random_each:
+                            freeze_random_font(self.service.configuration,value['fingerprint'])
+                            freeze_creation_battery(value)
                         if count>1:value['name']=(value['name'][:85] or '新窗口')+' '+str(index)
                         if proxies:value['proxy']=copy.deepcopy(proxies[0 if len(proxies)==1 else index-1])
                         key=hashlib.sha256(('local-created-v1:'+job_id+':'+str(index)).encode()).hexdigest()
@@ -160,7 +165,9 @@ class WindowCreator:
                         identity=self.store.source_binding(key)
                         if not identity:
                             profile=self.store.unpack(data)
-                            if freeze_random_font(self.service.configuration,profile['fingerprint']):
+                            frozen=freeze_random_font(self.service.configuration,profile['fingerprint'])
+                            frozen=freeze_creation_battery(profile) or frozen
+                            if frozen:
                                 with self.store.lock,self.store.connect() as con:
                                     con.execute('UPDATE creation_items SET data=? WHERE job_id=? AND ordinal=?',
                                         (self.store.pack(profile),job_id,index))
@@ -188,6 +195,7 @@ class WindowCreator:
         finally:
             with self.lock:self.lease.release()
 
+    @verification_scope()
     def _create(self,helper,profile,key,executable=None):
         from fingerprint_continuity import create_baseline,verify_continuity
         identity='profile-'+uuid.uuid4().hex
@@ -219,7 +227,8 @@ class WindowCreator:
             signer=LocalSigner(self.service.root,load_private=False)
             previous={'alias':identity,'profile_path':str(final),'core_path':str(executable),'core_major':profile['core_version'],
                 'core_sha256':sha256(executable),'fingerprint_path':str(signature),'fingerprint_sha256':sha256(signed),
-                'signature_provider':'local-v1','signature_key_id':signer.key_id,'new_profile':True,'has_launched':False}
+                'signature_provider':'local-v1','signature_key_id':signer.key_id,'new_profile':True,'has_launched':False,
+                'creation_options_version':1}
             width=profile['fingerprint'].get('openWidth');height=profile['fingerprint'].get('openHeight')
             if type(width) in (int,float) and type(height) in (int,float) and 320<=width<=16384 and 240<=height<=16384:
                 previous['window_size_once']=[width,height]

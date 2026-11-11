@@ -16,7 +16,8 @@ import zipfile
 ROOT=Path(__file__).resolve().parents[1]
 FIXTURES=('portable-vault-tests.py','portable-browser-tests.py','portable-state-tests.py',
     'signature-guard-tests.py','local-engine-tests.py','local-signer-tests.py','sync-source-tests.py',
-    'fingerprint-continuity-tests.py','conservative-policy-tests.py','proxy-runtime-protocol-tests.py')
+    'fingerprint-continuity-tests.py','conservative-policy-tests.py','proxy-runtime-protocol-tests.py',
+    'browser-proxy-boundary-regression.py')
 TOP=('README.md','AGENTS.md','本地浏览器说明.md','开发说明.md','启动本地浏览器.cmd','完整迁移到新目录.cmd','VERSION',
      'requirements.txt','THIRD_PARTY_NOTICES.md','.gitignore')
 RUNTIME_EXECUTABLES=('python/python.exe','python/pythonw.exe','node/node.exe','webview2/msedgewebview2.exe')

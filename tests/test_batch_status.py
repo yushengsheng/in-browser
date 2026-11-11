@@ -33,6 +33,9 @@ class Process:
     def oneshot(self):
         return nullcontext()
 
+    def as_dict(self, attrs):
+        return {name: self.info.get(name) for name in attrs}
+
     def _read(self):
         if self.gone:
             raise core.psutil.NoSuchProcess(self.pid)
@@ -107,6 +110,80 @@ class BatchStatusTests(unittest.TestCase):
         cached, scans, lookups = self.run_statuses(controller, [])
         self.assertEqual(cached, result)
         self.assertEqual((scans, lookups), (0, 0))
+
+    def test_snapshot_defers_unused_metadata_without_name_filtering(self):
+        controller = self.controller(3)
+        main = self.process(controller, 0, 101, name='renamed-browser.exe')
+        helper = self.process(controller, 1, 102, args=['helper.exe', '--type=renderer',
+                              '--user-data-dir=' + controller.profiles['p1']['profile_path']])
+        unrelated = self.process(controller, 2, 103, args=['unrelated.exe', '--no-profile'])
+        main.as_dict = Mock(wraps=main.as_dict)
+        helper.as_dict = Mock(side_effect=AssertionError('Unexpected helper metadata read'))
+        unrelated.as_dict = Mock(side_effect=AssertionError('Unexpected unrelated metadata read'))
+        with patch.object(processes.psutil, 'process_iter', return_value=iter([main, helper, unrelated])) as scan, \
+                patch.object(processes.psutil, 'Process', return_value=main) as lookup:
+            snapshot = processes.ProfileProcessSnapshot()
+            self.assertTrue(snapshot.occupied(controller.profiles['p0']['profile_path']))
+            self.assertTrue(snapshot.occupied(controller.profiles['p1']['profile_path']))
+            self.assertFalse(snapshot.occupied(controller.profiles['p2']['profile_path']))
+            self.assertEqual(snapshot.browsers(controller.profiles['p0']['profile_path']), [main])
+            self.assertEqual(snapshot.browsers(controller.profiles['p1']['profile_path']), [])
+            self.assertTrue(all(snapshot.has_pid(item.pid) for item in (main, helper, unrelated)))
+            self.assertFalse(snapshot.incomplete)
+        scan.assert_called_once_with(['pid', 'cmdline'])
+        main.as_dict.assert_called_once_with(attrs=['create_time'])
+        helper.as_dict.assert_not_called()
+        unrelated.as_dict.assert_not_called()
+        lookup.assert_called_once_with(main.pid)
+
+    def test_unreadable_snapshot_retains_name_and_executable_fallbacks(self):
+        controller = self.controller(1)
+        for field in ('name', 'exe'):
+            with self.subTest(field=field):
+                candidate = self.process(controller, 0, 101)
+                candidate.info.update(cmdline=None, name=None, exe=None)
+                candidate.info[field] = 'custom-browser.exe'
+                candidate.as_dict = Mock(wraps=candidate.as_dict)
+                with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])):
+                    snapshot = processes.ProfileProcessSnapshot(browser_names=['custom-browser.exe'])
+                self.assertTrue(snapshot.uncertain(controller.profiles['p0']['profile_path']))
+                self.assertTrue(snapshot.has_pid(candidate.pid))
+                candidate.as_dict.assert_called_once_with(attrs=['name', 'exe'])
+
+    def test_unreadable_creation_time_keeps_occupancy_and_local_uncertainty(self):
+        controller = self.controller(2)
+        candidate = self.process(controller, 0, 101)
+        candidate.info['create_time'] = None
+        with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])), \
+                patch.object(processes.psutil, 'Process', return_value=candidate):
+            snapshot = processes.ProfileProcessSnapshot()
+            self.assertTrue(snapshot.occupied(controller.profiles['p0']['profile_path']))
+            self.assertEqual(snapshot.browsers(controller.profiles['p0']['profile_path']), [])
+        self.assertTrue(snapshot.uncertain(controller.profiles['p0']['profile_path']))
+        self.assertFalse(snapshot.uncertain(controller.profiles['p1']['profile_path']))
+
+    def test_delayed_metadata_exit_matches_enumerator_disappearance(self):
+        controller = self.controller(1)
+        for readable in (False, True):
+            with self.subTest(readable=readable):
+                candidate = self.process(controller, 0, 101)
+                if not readable:
+                    candidate.info['cmdline'] = None
+                candidate.as_dict = Mock(side_effect=processes.psutil.NoSuchProcess(candidate.pid))
+                with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])):
+                    snapshot = processes.ProfileProcessSnapshot()
+                self.assertFalse(snapshot.has_pid(candidate.pid))
+                self.assertFalse(snapshot.occupied(controller.profiles['p0']['profile_path']))
+                self.assertFalse(snapshot.uncertain(controller.profiles['p0']['profile_path'], pid=candidate.pid))
+
+    def test_delayed_metadata_failure_keeps_snapshot_conservative(self):
+        controller = self.controller(1)
+        candidate = self.process(controller, 0, 101)
+        candidate.as_dict = Mock(side_effect=OSError('synthetic-metadata-failure'))
+        with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])):
+            snapshot = processes.ProfileProcessSnapshot()
+        self.assertTrue(snapshot.has_pid(candidate.pid))
+        self.assertTrue(snapshot.uncertain(controller.profiles['p0']['profile_path']))
 
     def test_ten_thousand_with_few_real_candidates_keep_lifecycle_states(self):
         controller = self.controller(10000)

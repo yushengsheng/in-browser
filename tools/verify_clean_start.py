@@ -19,7 +19,6 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TITLE = '本地指纹浏览器'
 PREFIX = 'clean-start-validation-'
 
 
@@ -53,6 +52,8 @@ def _copy_tree(source, destination):
 
 
 def _prepare(work):
+    _ordinary(ROOT / 'VERSION')
+    shutil.copy2(ROOT / 'VERSION', work / 'VERSION')
     app = work / 'app'
     app.mkdir()
     # Enumerate only top-level public source files, never descend into app/data.
@@ -176,7 +177,7 @@ def _readiness_expression(url):
     })()'''.replace('EXPECTED_URL', json.dumps(url))
 
 
-def _ui_launcher(app, work):
+def _ui_launcher(app, work, title):
     """Observe the original window through pywebview's public read-only API."""
     launcher = app / '_verify_clean_start.pyw'
     report = work / 'page-readiness.json'
@@ -188,6 +189,7 @@ from urllib.request import url2pathname
 APP=Path(APP_VALUE)
 REPORT=Path(REPORT_VALUE)
 NONCE=NONCE_VALUE
+EXPECTED_TITLE=TITLE_VALUE
 EXPRESSION=EXPRESSION_VALUE
 sys.path.insert(0,str(APP))
 import webview
@@ -227,7 +229,7 @@ def observe(window):
             state['evaluation_error_type']=type(error).__name__;publish()
         time.sleep(.1)
 def create(title,url=None,*args,**kwargs):
-    if title!='本地指纹浏览器' or not isinstance(url,str) or Path(url).resolve()!=(APP/'ui/index.html').resolve():
+    if title!=EXPECTED_TITLE or not isinstance(url,str) or Path(url).resolve()!=(APP/'ui/index.html').resolve():
         raise ValueError()
     window=original_create(title,url,*args,**kwargs)
     state['window_source_verified']=True;publish()
@@ -242,6 +244,7 @@ webview.create_window=create
 runpy.run_path(str(APP/'local_browser.pyw'),run_name='__main__')
 '''
     for key, value in (('APP_VALUE', str(app)), ('REPORT_VALUE', str(report)), ('NONCE_VALUE', nonce),
+                       ('TITLE_VALUE', title),
                        ('EXPRESSION_VALUE', _readiness_expression('__verify_current_url__'))):
         source = source.replace(key, repr(value))
     compile(source, str(launcher), 'exec')
@@ -284,7 +287,8 @@ def _wait_page(manager, created, pythonw, entry, report, nonce, identities):
 
 
 class Windows:
-    def __init__(self):
+    def __init__(self, title):
+        self.title = title
         self.user = ctypes.WinDLL('user32', use_last_error=True)
         self.callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         self.user.EnumWindows.argtypes = [self.callback, wintypes.LPARAM]
@@ -309,7 +313,7 @@ class Windows:
             title = ctypes.create_unicode_buffer(256)
             rectangle = wintypes.RECT()
             self.user.GetWindowTextW(window, title, len(title))
-            if (title.value == TITLE and self.user.GetWindowRect(window, ctypes.byref(rectangle))
+            if (title.value == self.title and self.user.GetWindowRect(window, ctypes.byref(rectangle))
                     and rectangle.right > rectangle.left and rectangle.bottom > rectangle.top):
                 found.append(window)
             return True
@@ -364,6 +368,8 @@ def main():
         report['existing_project_instances'] = len(_manager_instances(ROOT / 'app/local_browser.pyw', (python, pythonw)))
         work = Path(tempfile.mkdtemp(prefix=PREFIX)).resolve()
         app = _prepare(work)
+        check('copy_version_matches_source', (work / 'VERSION').read_bytes() == (ROOT / 'VERSION').read_bytes())
+        title = '本地指纹浏览器 v' + (work / 'VERSION').read_text('utf-8-sig').strip()
         entry = app / 'local_browser.pyw'
         env = _environment(work, python)
         check('copy_had_no_prior_instance', not _manager_instances(entry, (python, pythonw)))
@@ -380,8 +386,8 @@ def main():
                     "{'confirm_close':False,'close_behavior':'close_browsers'})")
         _run_child([str(python), '-B', '-c', settings], app, env, work, 'settings', owned, identities)
         check('isolated_exit_settings_saved', True)
-        windows = Windows()
-        ui_entry, page_report, nonce = _ui_launcher(app, work)
+        windows = Windows(title)
+        ui_entry, page_report, nonce = _ui_launcher(app, work, title)
         with (work / 'manager.stdout').open('wb') as output, (work / 'manager.stderr').open('wb') as errors:
             manager = subprocess.Popen([str(pythonw), '-B', str(ui_entry)], cwd=app, env=env,
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
@@ -401,6 +407,7 @@ def main():
                 time.sleep(.1)
             check('manager_identity_verified', _owned_manager(manager, created, pythonw, ui_entry))
             check('manager_window_visible', shown is not None)
+            check('manager_native_title_verified', shown is not None)
             report.update(_wait_page(manager, created, pythonw, ui_entry, page_report, nonce, identities))
             check('page_loaded', report['page_loaded'])
             check('bootstrap_empty_list_ready', report['bootstrap_empty_list_ready'])

@@ -137,6 +137,35 @@ def freeze_random_font(configuration,fp):
     return True
 
 
+def freeze_creation_battery(profile):
+    if profile['fingerprint'].get('ostype') not in ('Android','IOS'):return False
+    if '_creation_battery' in profile:
+        value=profile['_creation_battery']
+        if type(value) is not int or not 20<=value<=100:raise LocalBrowserError('已登记的移动电池配置无效，未重新随机或创建窗口。')
+        return False
+    profile['_creation_battery']=20+secrets.randbelow(81)
+    return True
+
+
+def _validate_creation_json(fp):
+    def parsed(field):
+        try:
+            value=fp.get(field)
+            value=json.loads(value) if isinstance(value,str) else value
+            json.dumps(value,allow_nan=False)
+            return value
+        except (ValueError,TypeError,RecursionError):
+            raise LocalBrowserError(field+'须为有效JSON，不能包含非有限数字。') from None
+    for mode,field in (('mediaDevice','mediaDeviceValue'),('speechVoices','speechVoicesValue')):
+        if str(fp.get(mode))=='0' and not isinstance(parsed(field),(dict,list)):
+            raise LocalBrowserError(field+'须为JSON对象或数组，不能使用null、数字或开关值。')
+    if fp.get('enablePlugins') and fp.get('plugins') not in (None,''):
+        value=parsed('plugins')
+        fields=('name','filename','description','mimeType','mimeDescription','suffixes')
+        if not isinstance(value,list) or any(not isinstance(item,dict) or any(not isinstance(item.get(key),str) for key in fields) for item in value):
+            raise LocalBrowserError('插件列表须为JSON对象数组，每项须包含字符串name、filename、description、mimeType、mimeDescription和suffixes。')
+
+
 def validate_profile(incoming):
     if not isinstance(incoming,dict) or incoming.get('id'):
         raise LocalBrowserError('新建配置格式不正确。')
@@ -165,10 +194,7 @@ def validate_profile(incoming):
     if profile['proxy'].get('enable_socks5_udp'):raise LocalBrowserError('当前独立代理不支持UDP，不能创建为可用配置。')
     if str(fp.get('webGLMeta'))=='0' and not (fp.get('webGLManufacturer') and fp.get('webGLRender')):
         raise LocalBrowserError('自定义WebGL需要完整的厂商与渲染器信息。')
-    if str(fp.get('mediaDevice'))=='0' and not fp.get('mediaDeviceValue'):
-        raise LocalBrowserError('自定义媒体设备需填写有效JSON。')
-    if str(fp.get('speechVoices'))=='0' and not fp.get('speechVoicesValue'):
-        raise LocalBrowserError('自定义语音需填写有效JSON。')
+    _validate_creation_json(fp)
     if fp.get('webglparameterscode') and str(fp['webglparameterscode']) not in catalog()['WebGLParameters']:
         raise LocalBrowserError('WebGL参数代码不在已适配目录中。')
     return profile
@@ -232,15 +258,22 @@ def _previous_font_config(fp,previous_native):
 
 def build_native(configuration,profile,previous_native=None):
     """New keys belong only to this new window; imported payloads never enter here."""
+    if previous_native is None:
+        _validate_creation_json(profile['fingerprint'])
+        freeze_creation_battery(profile)
     font=_previous_font_config(profile['fingerprint'],previous_native)
     if font is None:freeze_random_font(configuration,profile['fingerprint'])
     fp=copy.deepcopy(profile['fingerprint']);prefs=profile['preferences']
+    if str(fp.get('webGLMeta'))=='1':
+        fp.update(webGLManufacturer=None,webGLRender=None,webgpu=None)
     for field in ('lat','lng','precisionData'):
         if fp.get(field)=='':fp[field]=None
     protection=copy.deepcopy(previous_native.get('DataProtect')) if previous_native is not None else None if int(fp['coreVersion'])<130 else {'CipherKey':secrets.token_hex(32),'Areas':{
         key:True for key in ('ExtensionIndexedDB','ExtensionManagedStorage','ExtensionCookies','LocalStorage',
                             'ExtensionSyncStorage','Cookies','IndexedDB','ExtensionLocalStorage')}}
     fp['extendOptions']={'DataProtect':protection,'MemorySaverModeEnabled':bool(prefs.get('memory_saver'))}
+    if previous_native is None and fp.get('ostype') in ('Android','IOS'):
+        fp['extendOptions']['battery']=profile['_creation_battery']
     for component in ('canvasContext','WebGL'):
         source=catalog()['NoiseBypassDefaults'][component] if previous_native is None else previous_native.get(component,{})
         if isinstance(source,dict) and 'bypassDomains' in source:

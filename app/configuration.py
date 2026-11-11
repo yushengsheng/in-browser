@@ -124,11 +124,11 @@ class Configuration:
     def source_settings(self,identity):
         return self._source_request(identity,full=True)
 
-    def source_detail(self,identity):
+    def source_detail(self,identity,*,timeout=20):
         """Read one locally discovered source, without the desktop LocalAPI."""
-        return self._source_request(identity,full=False)
+        return self._source_request(identity,full=False,timeout=timeout)
 
-    def _source_request(self,identity,*,full):
+    def _source_request(self,identity,*,full,timeout=20):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',str(identity)):raise LocalBrowserError('来源窗口标识格式无效。')
         if getattr(self,'independent',False):
             source=self.source_entry(identity)
@@ -143,7 +143,7 @@ class Configuration:
         route='/v1/browserInfos/'+('getApi/' if full else '')+str(identity)
         request=Request(match.group(1)+route,headers={'Authorization':'Bearer '+values['app_token'],'x-api-auth':'1','Language':values.get('locale') or 'zh','Content-Type':'application/json;charset=UTF-8'})
         try:
-            with build_opener(ProxyHandler({}),_NoRedirect()).open(request,timeout=20) as response:
+            with build_opener(ProxyHandler({}),_NoRedirect()).open(request,timeout=timeout) as response:
                 raw=response.read(16_000_001)
                 if len(raw)>16_000_000:raise ValueError()
                 data=json.loads(raw)

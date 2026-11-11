@@ -420,6 +420,7 @@ a {
 }
 .filter-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   padding: 20px 23px;
@@ -1012,6 +1013,12 @@ a {
   font-size: 15px;
   font-weight: 500;
   margin: 0;
+}
+.fingerprint-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 .form-intro p {
   font-size: 11px;
@@ -1735,6 +1742,15 @@ a {
 }
 .sync-dialog[open] { display: flex; flex-direction: column; }
 .sync-dialog::backdrop { background: #1c2b465b; }
+.window-layout-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.window-layout-actions .button, .window-layout-actions .text-button { white-space: nowrap; }
+.window-layout-dialog { width: min(620px, calc(100vw - 40px)); }
+.window-layout-note { margin: 0 0 18px; font-size: 12px; line-height: 1.8; color: #70829b; }
+.window-layout-dialog .form-grid { gap: 16px 20px; }
+.window-layout-fields { margin-top: 18px; }
+.window-layout-dialog .field-hint { margin: 10px 0 0; line-height: 1.7; }
+.window-layout-dialog .sync-footer { flex-wrap: wrap; gap: 12px; }
+.window-layout-dialog .footer-buttons { margin-left: auto; }
 .sync-header { padding: 22px 25px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; flex: none; }
 .sync-header h2 { margin: 0 0 6px; font-size: 18px; font-weight: 500; }
 .sync-header p { margin: 0; color: #8b98ab; font-size: 12px; }
@@ -1752,6 +1768,8 @@ a {
 .sync-table td { padding: 13px 12px; vertical-align: top; border-top: 1px solid var(--border); overflow-wrap: anywhere; color: #65758d; }
 .sync-table strong { font-weight: 500; color: #445a79; }
 .sync-table small, .sync-result-item small { display: block; font-size: 11px; line-height: 1.7; color: #96a1b3; margin-top: 5px; }
+.sync-source-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-table .sync-source-remark { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; white-space: pre-line; color: #70829b; }
 .sync-status { display: inline-block; font-size: 11px; line-height: 1.7; }
 .sync-status.ready { color: #329574; }
 .sync-status.blocked { color: #bf795a; }
@@ -1762,9 +1780,15 @@ a {
 .sync-progress-heading { display: flex; gap: 15px; justify-content: space-between; align-items: center; margin-top: 24px; }
 .sync-progress-heading h3 { font-size: 15px; font-weight: 500; margin: 0 0 14px; }
 .sync-progress-heading > span { color: #8091a9; font-size: 12px; }
-#sync-progress { width: 100%; height: 10px; accent-color: var(--blue); border: 0; border-radius: 5px; overflow: hidden; }
-#sync-progress::-webkit-progress-bar { background: #edf3fc; border-radius: 5px; }
-#sync-progress::-webkit-progress-value { background: var(--blue); border-radius: 5px; transition: width .2s; }
+#sync-progress, #sync-stage-progress { width: 100%; height: 10px; accent-color: var(--blue); border: 0; border-radius: 5px; overflow: hidden; }
+#sync-progress::-webkit-progress-bar, #sync-stage-progress::-webkit-progress-bar { background: #edf3fc; border-radius: 5px; }
+#sync-progress::-webkit-progress-value, #sync-stage-progress::-webkit-progress-value { background: var(--blue); border-radius: 5px; }
+#sync-progress::-webkit-progress-value { transition: width .2s; }
+.sync-current { padding: 16px; border: 1px solid var(--border); border-radius: 6px; background: #f9fbfe; }
+.sync-current-label { display: block; font-size: 11px; color: #8091a9; }
+.sync-current-name { display: block; margin: 5px 0 16px; font-size: 13px; font-weight: 500; color: #445a79; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-stage-heading { display: flex; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 10px; font-size: 12px; color: #65758d; }
+.sync-current .field-hint { margin: 9px 0 0; line-height: 1.7; }
 .sync-result-list { max-height: 320px; overflow: auto; margin-top: 20px; border-top: 1px solid var(--border); }
 .sync-result-item { display: grid; grid-template-columns: 1fr auto; column-gap: 16px; padding: 13px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
 .sync-result-item strong { font-weight: 400; color: #566b87; overflow-wrap: anywhere; }

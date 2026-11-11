@@ -122,6 +122,10 @@
               ><select id="tag-filter" aria-label="按标签筛选">
                 <option value="">全部标签</option></select
               ><button id="clear-filters" class="text-button">重置筛选</button>
+              <div class="window-layout-actions">
+                <button id="arrange-windows" class="button small" title="排列本包全部已打开的浏览器窗口"><span data-icon="windows"></span>排列</button>
+                <button id="window-layout-settings" class="text-button">排列设置</button>
+              </div>
             </div>
             <div class="table-scroll">
               <table class="profile-table">
@@ -357,6 +361,46 @@
         </div>
       </footer>
     </section>
+    <dialog id="window-layout-dialog" class="sync-dialog window-layout-dialog" aria-labelledby="window-layout-title">
+      <header class="sync-header">
+        <div><h2 id="window-layout-title">排列设置</h2><p>应用于本包全部已打开的浏览器窗口</p></div>
+        <button id="window-layout-close" class="icon-button close-button" aria-label="关闭排列设置">×</button>
+      </header>
+      <div class="sync-body">
+        <p class="window-layout-note">只移动窗口位置和大小，不修改指纹配置；不受列表筛选或勾选限制。</p>
+        <div id="window-layout-error" class="inline-error" role="alert" hidden></div>
+        <p id="window-layout-loading" class="field-hint" role="status" hidden>正在读取排列设置…</p>
+        <form id="window-layout-form" autocomplete="off" novalidate>
+          <div class="form-grid">
+            <div class="field full"><label class="field-label" for="window-layout-monitor">显示器</label><select id="window-layout-monitor"><option value="primary">主显示器（自动跟随）</option></select><p id="window-layout-monitor-note" class="field-hint" hidden></p></div>
+            <div class="field"><label class="field-label" for="window-layout-mode">排列方式</label><select id="window-layout-mode"><option value="auto">自适应</option><option value="grid">宫格</option><option value="cascade">对角线</option></select></div>
+            <div class="field"><label class="field-label" for="window-layout-order">窗口顺序</label><select id="window-layout-order"><option value="asc">序号正序</option><option value="desc">序号倒序</option></select></div>
+          </div>
+          <p id="window-layout-auto-note" class="field-hint">根据窗口数量自动分行，并调整尺寸以适应显示器工作区。</p>
+          <div id="window-layout-manual" hidden>
+            <div class="form-grid window-layout-fields">
+              <div class="field"><label class="field-label" for="window-layout-start_x">起点 X（px）</label><input id="window-layout-start_x" type="number" min="0" step="1"></div>
+              <div class="field"><label class="field-label" for="window-layout-start_y">起点 Y（px）</label><input id="window-layout-start_y" type="number" min="0" step="1"></div>
+              <div class="field"><label class="field-label" for="window-layout-width">窗口宽度（px）</label><input id="window-layout-width" type="number" min="120" step="1"></div>
+              <div class="field"><label class="field-label" for="window-layout-height">窗口高度（px）</label><input id="window-layout-height" type="number" min="40" step="1"></div>
+            </div>
+            <p class="field-hint">起点相对所选显示器的工作区左上角；所有数值均为整数像素。</p>
+          </div>
+          <div id="window-layout-grid" class="form-grid window-layout-fields" hidden>
+            <div class="field full"><label class="field-label" for="window-layout-columns">每行窗口数</label><input id="window-layout-columns" type="number" min="1" step="1"></div>
+            <div class="field"><label class="field-label" for="window-layout-gap_x">水平间距（px）</label><input id="window-layout-gap_x" type="number" min="0" step="1"></div>
+            <div class="field"><label class="field-label" for="window-layout-gap_y">垂直间距（px）</label><input id="window-layout-gap_y" type="number" min="0" step="1"></div>
+            <p class="field-hint field full">工作区放不下时不会移动窗口，请调小尺寸或改用自适应。</p>
+          </div>
+          <div id="window-layout-cascade" class="form-grid window-layout-fields" hidden>
+            <div class="field"><label class="field-label" for="window-layout-step_x">水平偏移（px）</label><input id="window-layout-step_x" type="number" min="0" step="1"></div>
+            <div class="field"><label class="field-label" for="window-layout-step_y">垂直偏移（px）</label><input id="window-layout-step_y" type="number" min="0" step="1"></div>
+            <p class="field-hint field full">按序号依次错开，超出可用空间时从起点循环排列。</p>
+          </div>
+        </form>
+      </div>
+      <footer class="sync-footer"><span class="muted">保存后，下次点击“排列”即可应用</span><div class="footer-buttons"><button id="window-layout-cancel" class="button">取消</button><button id="window-layout-save" class="button">保存</button><button id="window-layout-save-arrange" class="button primary">保存并排列</button></div></footer>
+    </dialog>
     <dialog id="sync-dialog" class="sync-dialog" aria-labelledby="sync-title">
       <header class="sync-header">
         <div><h2 id="sync-title">同步本地窗口</h2><p id="sync-source-note">正在读取本地运行模式及可用来源…</p></div>
@@ -367,12 +411,12 @@
         <div id="sync-error" class="inline-error" role="alert" hidden></div>
         <section id="sync-preview" aria-label="选择同步窗口">
           <div class="sync-toolbar">
-            <label class="search-input"><span data-icon="search"></span><input id="sync-search" type="search" placeholder="搜索窗口名称或序号" aria-label="搜索待同步窗口"></label>
+            <label class="search-input"><span data-icon="search"></span><input id="sync-search" type="search" placeholder="搜索名称、备注或来源序号" aria-label="搜索待同步窗口的名称、备注或来源序号"></label>
             <button id="sync-reload" class="button small"><span data-icon="refresh"></span>重新检测</button>
           </div>
           <p id="sync-preview-summary" class="sync-summary" role="status">正在读取本机窗口…</p>
           <div class="sync-table-scroll">
-            <table class="sync-table"><thead><tr><th class="select-cell"><input id="sync-select-all" type="checkbox" aria-label="选择本次预览全部可导入窗口"></th><th>窗口</th><th>环境</th><th>同步状态</th></tr></thead><tbody id="sync-preview-rows"></tbody></table>
+            <table class="sync-table"><thead><tr><th class="select-cell"><input id="sync-select-all" type="checkbox" aria-label="选择本次预览全部可导入窗口"></th><th>来源窗口</th><th>环境</th><th>同步状态</th></tr></thead><tbody id="sync-preview-rows"></tbody></table>
             <p id="sync-empty" class="plain-empty" hidden>未发现可同步的本机窗口。</p>
           </div>
           <div class="sync-pagination"><span id="sync-selection-count">已选 0 个</span><div class="pagination"><span id="sync-range"></span><button id="sync-prev" class="icon-button" aria-label="上一页同步窗口">‹</button><span id="sync-page">1 / 1</span><button id="sync-next" class="icon-button" aria-label="下一页同步窗口">›</button></div></div>
@@ -381,6 +425,15 @@
           <div class="sync-progress-heading"><h3 id="sync-phase">准备同步…</h3><span id="sync-progress-count"></span></div>
           <progress id="sync-progress" max="1" value="0" aria-label="窗口同步进度"></progress>
           <p id="sync-progress-summary" class="sync-summary" role="status"></p>
+          <div id="sync-current" class="sync-current" hidden>
+            <span id="sync-current-label" class="sync-current-label"></span>
+            <strong id="sync-current-name" class="sync-current-name"></strong>
+            <div class="sync-stage-heading"><span id="sync-stage-name"></span><span id="sync-stage-count"></span></div>
+            <progress id="sync-stage-progress" max="1" aria-label="当前窗口阶段进度"></progress>
+            <p id="sync-stage-elapsed" class="field-hint"></p>
+            <p class="field-hint">此进度仅代表当前阶段；校验并保存后才计为导入成功。</p>
+            <p id="sync-stage-timings" class="field-hint" hidden></p>
+          </div>
           <p id="sync-background-note" class="field-hint">可关闭此面板继续管理本地窗口；同步将在后台继续。</p>
           <div id="sync-result-list" class="sync-result-list" role="log" aria-live="polite"></div>
         </section>

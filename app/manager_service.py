@@ -4,9 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import threading
-import time
 import uuid
 
 from app_paths import DATA_ROOT
@@ -19,7 +17,8 @@ from window_store import WindowStore,now,fingerprint_unreferenced
 from engine_store import EngineStore,executable_major
 from engine_validation import verification_scope
 from proxy_runtime import ProxyRuntime
-from signature_lifetime import signature_lifetime,require_current_signature,runtime_signature_options
+from signature_lifetime import require_current_signature,runtime_signature_options
+from signature_status import SignatureStatusCache
 
 
 class ManagerService:
@@ -37,6 +36,7 @@ class ManagerService:
                 raise LocalBrowserError('环境连续性基线尚未准备完成，未启动账号窗口。')
         self.configuration=configuration or Configuration(self.root)
         self.store=WindowStore(self.configuration,self.root)
+        self._signature_status=SignatureStatusCache()
         from portable_paths import relocate
         relocate(self)
         self.engines=EngineStore()
@@ -126,11 +126,12 @@ class ManagerService:
     def statuses(self):
         from profile_delete import get_pending_ids
         pending=get_pending_ids(self.root)
-        rows=[];profiles=self.store.all()
+        rows=[];profiles=self.store.status_rows()
         values=self.controller.statuses(p['id'] for p in profiles)
+        self._signature_status.retain(p['_runtime']['fingerprint_path'] for p in profiles)
         for p in profiles:
             status=self._status(p,values)
-            lifetime=signature_lifetime(p['_runtime']['fingerprint_path'])
+            lifetime=self._signature_status.get(p['_runtime']['fingerprint_path'])
             rows.append({'id':p['id'],'status':status,'is_running':status=='open','last_opened_at':p.get('last_opened_at'),
                 'signature_status':lifetime['status'],'signature_expires_at':lifetime.get('expires_at'),'signature_provider':p['_runtime'].get('signature_provider','vendor'),
                 'config_status':'expired' if lifetime['status']=='expired' else p.get('config_status','ready')})
@@ -222,7 +223,12 @@ class ManagerService:
             launch_args=launch_args,no_system_proxy=True,account_platform=p.get('platform') or '',
             account_username=p.get('username') or '',account_password=p.get('password') or '')
         for key in ['mute_audio','disable_gpu','disable_notifications']: runtime[key]=p['preferences'].get(key,False)
-        if p.get('created_locally'):runtime['enable_background_mode']=bool(p.get('created_options',{}).get('enable_background_mode'))
+        if p.get('created_locally'):
+            runtime['enable_background_mode']=bool(p.get('created_options',{}).get('enable_background_mode'))
+            if fp.get('isIpCreateDisplayLanguage'):
+                runtime['language']=str(p.get('_native',{}).get('uiLang') or '')
+            if runtime.get('creation_options_version')==1 and fp.get('ignoreHttpsErrors') and '--ignore-certificate-errors' not in launch_args:
+                launch_args.append('--ignore-certificate-errors')
         return runtime
 
     def save(self,incoming,*,allow_fingerprint=True):
@@ -298,35 +304,8 @@ class ManagerService:
 
     def _copy_profile(self,source,target):
         if profile_processes(source): raise LocalBrowserError('请先正常关闭要复制的窗口。')
-        files=list(source.rglob('*'))
-        if any(p.is_symlink() or getattr(p.lstat(),'st_file_attributes',0)&0x400 for p in files): raise LocalBrowserError('资料包含特殊链接，已停止复制。')
-        total=sum(p.stat().st_size for p in files if p.is_file())
-        target.parent.mkdir(parents=True,exist_ok=True)
-        if shutil.disk_usage(target.parent).free<total*1.1+20_000_000: raise LocalBrowserError('磁盘空间不足，未复制或修改资料。')
-        before=self._manifest(source); temporary=target.with_name(target.name+'.copying')
-        if temporary.exists() or target.exists(): raise LocalBrowserError('复制目标已存在，未覆盖。')
-        try:
-            for attempt in range(3):
-                try:
-                    shutil.copytree(source,temporary)
-                    break
-                except PermissionError:
-                    # Virus scanners/indexers can briefly hold a newly created
-                    # directory on Windows. Only retry our unpublished copy.
-                    if temporary.exists() and temporary.resolve().parent==target.resolve().parent:shutil.rmtree(temporary)
-                    if attempt==2:raise
-                    time.sleep(.15*(attempt+1))
-            if before!=self._manifest(source) or before!=self._manifest(temporary): raise LocalBrowserError('资料在复制时发生变化，未将副本标记为完成。')
-            for attempt in range(3):
-                try:
-                    os.replace(temporary,target)
-                    break
-                except PermissionError:
-                    if attempt==2:raise
-                    time.sleep(.15*(attempt+1))
-        except Exception:
-            if temporary.exists() and temporary.resolve().parent==target.resolve().parent: shutil.rmtree(temporary)
-            raise
+        from profile_copy import copy_profile
+        return copy_profile(source,target)
 
     def _preferences(self,p):
         from profile_preferences import apply_preferences,prepare_clipboard

@@ -216,8 +216,9 @@ const state = {
   settingsSaving: false,
   settingsLoaded: false,
   settingsRevision: 0,
+  windowLayout: { loading: false, loaded: false, saving: false, arranging: false, session: 0, settings: null, returnFocus: null },
   creatingDraft: false,
-  creation: { job: null, requestId: null, revision: 0, timer: null, reading: false, opening: false },
+  creation: { job: null, requestId: null, revision: 0, fingerprintRevision: 0, timer: null, reading: false, opening: false },
   operationIds: new Set(),
   operationActions: new Map(),
   batchBusy: false,
@@ -388,6 +389,166 @@ function confirmAction(title, message, accept = "确定") {
   });
 }
 
+const defaultWindowLayout = {
+  mode: "auto", monitor: "primary", start_x: 0, start_y: 0,
+  width: 640, height: 600, columns: 3, gap_x: 0, gap_y: 0,
+  step_x: 30, step_y: 30, order: "asc",
+};
+const windowLayoutNumbers = {
+  start_x: ["起点 X", 0], start_y: ["起点 Y", 0],
+  width: ["窗口宽度", 120], height: ["窗口高度", 40],
+  columns: ["每行窗口数", 1], gap_x: ["水平间距", 0], gap_y: ["垂直间距", 0],
+  step_x: ["水平偏移", 0], step_y: ["垂直偏移", 0],
+};
+function showWindowLayoutError(message = "") {
+  $("#window-layout-error").textContent = message;
+  $("#window-layout-error").hidden = !message;
+}
+function renderWindowLayout() {
+  const layout = state.windowLayout;
+  const busy = layout.saving || layout.arranging;
+  $("#arrange-windows").disabled = layout.loading || busy;
+  $("#arrange-windows").classList.toggle("is-loading", layout.arranging);
+  $("#window-layout-settings").disabled = layout.loading || busy;
+  $("#window-layout-loading").hidden = !layout.loading;
+  $("#window-layout-form").hidden = !layout.loaded;
+  $("#window-layout-form").inert = layout.loading || busy;
+  $("#window-layout-close").disabled = busy;
+  $("#window-layout-cancel").disabled = busy;
+  $("#window-layout-save").disabled = !layout.loaded || busy;
+  $("#window-layout-save-arrange").disabled = !layout.loaded || busy;
+  $("#window-layout-save").textContent = layout.saving && !layout.arranging ? "正在保存…" : "保存";
+  $("#window-layout-save-arrange").textContent = layout.arranging ? "正在排列…" : "保存并排列";
+  const mode = $("#window-layout-mode").value;
+  $("#window-layout-auto-note").hidden = mode !== "auto";
+  $("#window-layout-manual").hidden = mode === "auto";
+  $("#window-layout-grid").hidden = mode !== "grid";
+  $("#window-layout-cascade").hidden = mode !== "cascade";
+}
+function closeWindowLayout() {
+  const layout = state.windowLayout;
+  if (layout.saving || layout.arranging) return;
+  layout.session++;
+  layout.loading = false;
+  layout.loaded = false;
+  $("#window-layout-dialog").close();
+  renderWindowLayout();
+  layout.returnFocus?.focus();
+}
+async function openWindowLayout() {
+  const layout = state.windowLayout;
+  const dialog = $("#window-layout-dialog");
+  if (layout.saving || layout.arranging || dialog.open) return;
+  const session = ++layout.session;
+  const current = () => session === layout.session && dialog.open;
+  layout.returnFocus = document.activeElement;
+  layout.loading = true;
+  layout.loaded = false;
+  showWindowLayoutError();
+  renderWindowLayout();
+  dialog.showModal();
+  try {
+    const data = await api("window_layout_get");
+    if (!current()) return;
+    if (!data?.settings || !Array.isArray(data.monitors)) throw new Error("未能读取排列设置，请关闭后重试。");
+    const settings = { ...defaultWindowLayout, ...data.settings };
+    const monitors = data.monitors.filter((monitor) => monitor && typeof monitor.id === "string");
+    const missingMonitor = settings.monitor !== "primary" && !monitors.some((monitor) => monitor.id === settings.monitor);
+    $("#window-layout-monitor").innerHTML = '<option value="primary">主显示器（自动跟随）</option>' + monitors.map((monitor) =>
+      `<option value="${esc(monitor.id)}">${esc(monitor.label || `显示器${monitor.primary ? " · 主屏" : ""} · ${monitor.width} × ${monitor.height}`)}</option>`).join("");
+    if (missingMonitor) settings.monitor = "primary";
+    layout.settings = settings;
+    for (const key of Object.keys(defaultWindowLayout)) $("#window-layout-" + key).value = String(settings[key]);
+    $("#window-layout-monitor-note").textContent = missingMonitor || data.monitor_fallback ? "原显示器当前不可用，本次使用主显示器。" : "";
+    $("#window-layout-monitor-note").hidden = !(missingMonitor || data.monitor_fallback);
+    layout.loaded = true;
+  } catch (error) {
+    if (current()) showWindowLayoutError(error.message);
+  } finally {
+    if (current()) {
+      layout.loading = false;
+      renderWindowLayout();
+    }
+  }
+}
+function readWindowLayout() {
+  const settings = {};
+  for (const key of Object.keys(defaultWindowLayout)) settings[key] = $("#window-layout-" + key).value;
+  const active = new Set(settings.mode === "auto" ? [] : ["start_x", "start_y", "width", "height",
+    ...(settings.mode === "grid" ? ["columns", "gap_x", "gap_y"] : ["step_x", "step_y"])]);
+  for (const [key, [label, minimum]] of Object.entries(windowLayoutNumbers)) {
+    const value = Number(settings[key]);
+    if (!String(settings[key]).trim() || !Number.isSafeInteger(value) || value < minimum) {
+      if (!active.has(key)) {
+        settings[key] = state.windowLayout.settings?.[key] ?? defaultWindowLayout[key];
+        continue;
+      }
+      $("#window-layout-" + key).focus();
+      throw new Error(`“${label}”须填写不小于 ${minimum} 的整数。`);
+    }
+    settings[key] = value;
+  }
+  return settings;
+}
+function reportWindowArrangement(result) {
+  if (!result || !Number.isInteger(result.arranged)) throw new Error("未能确认排列结果，请检查窗口后重试。");
+  const arranged = syncCount(result.arranged), failed = syncCount(result.failed), skipped = syncCount(result.skipped);
+  let message = result.message;
+  if (!message) {
+    message = syncCount(result.total) ? `已排列 ${arranged} 个窗口` : "本包暂无可排列的已打开窗口";
+    if (failed) message += `，失败 ${failed} 个`;
+    if (skipped) message += `，跳过 ${skipped} 个`;
+  }
+  toast(message, failed ? "error" : arranged ? "success" : "info");
+}
+async function arrangeWindows() {
+  const layout = state.windowLayout;
+  if (layout.loading || layout.saving || layout.arranging) return;
+  layout.arranging = true;
+  renderWindowLayout();
+  try {
+    reportWindowArrangement(await api("arrange_windows"));
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    layout.arranging = false;
+    renderWindowLayout();
+  }
+}
+async function saveWindowLayout(andArrange = false) {
+  const layout = state.windowLayout;
+  const dialog = $("#window-layout-dialog");
+  if (!dialog.open || !layout.loaded || layout.loading || layout.saving || layout.arranging) return;
+  let settings;
+  showWindowLayoutError();
+  try { settings = readWindowLayout(); }
+  catch (error) { showWindowLayoutError(error.message); return; }
+  const session = layout.session;
+  let saved = false, completed = false;
+  layout.saving = true;
+  renderWindowLayout();
+  try {
+    const data = await api("window_layout_save", { settings });
+    if (!data?.settings) throw new Error("未能确认设置保存结果，请重新读取后确认。");
+    saved = true;
+    if (andArrange) {
+      layout.arranging = true;
+      renderWindowLayout();
+      reportWindowArrangement(await api("arrange_windows"));
+    } else toast("排列设置已保存", "success");
+    completed = true;
+  } catch (error) {
+    const message = saved ? `排列设置已保存，排列未完成：${error.message}` : error.message;
+    if (session === layout.session && dialog.open) showWindowLayoutError(message);
+    else toast(message, "error");
+  } finally {
+    layout.saving = false;
+    layout.arranging = false;
+    renderWindowLayout();
+    if (completed && session === layout.session) closeWindowLayout();
+  }
+}
+
 function sourceGuidance() {
   if (state.capabilities.independent_runtime) return {
     helpTitle: "导入本机完整窗口",
@@ -395,7 +556,7 @@ function sourceGuidance() {
     helpNotice: "本地副本保留来源指纹，界面仅供查看。只有完整配置、内核和浏览器资料通过检查，来源已正常关闭且复制保存完成才计为成功；缺失配置或资料时会逐项说明原因。",
     listEmpty: "点击“同步窗口”，检查并导入比特本机完整窗口资料",
     syncNote: "先自动检测本机来源并显示数量，点击“开始同步”后才复制资料",
-    syncExplanation: "已准备来源和在比特中打开过的新窗口均会参与检查。检测只读取本机资料，不复制窗口；检测结果保留10分钟。开始同步后仍须完成配置、内核和完整资料检查，新来源缺少配置时可能需要比特的有效登录会话及联网。已导入副本不会重复、覆盖，来源删除不会删除本地副本。",
+    syncExplanation: "已准备来源和在比特中打开过的新窗口均会参与检查。检测本机来源并读取名称、备注，不复制窗口资料；读取名称、备注可能需要比特的有效登录会话及联网，检测结果保留10分钟。开始同步后仍须完成配置、内核和完整资料检查，新来源缺少配置时可能需要比特的有效登录会话及联网。已导入副本不会重复、覆盖，来源删除不会删除本地副本。",
     previewLoading: "正在检查本机来源配置及完整资料…",
     previewEmpty: "未发现可导入的本机来源。没有比特不影响本地已有窗口和新建窗口；比特新窗口请先在比特中打开，待完整资料落地后正常关闭，再重新检测。",
     sourceOpen: "请正常关闭来源窗口后重新预览；完整配置和浏览器资料仍须通过检查。",
@@ -429,6 +590,15 @@ const syncStatusLabels = {
   completed: "导入成功", imported: "导入成功", success: "导入成功",
   skipped: "已跳过", failed: "导入失败", cancelled: "已取消",
 };
+const syncProgressPhases = {
+  checking: "检查资料", preparing: "准备窗口配置", engine: "准备独立内核",
+  inventory: "统计资料文件", source_hash: "读取来源校验摘要", copying: "复制浏览器资料",
+  source_verify: "核对来源未变化", copy_verify: "校验复制完整性", validating: "验证窗口配置",
+  portable_keys: "准备便携密钥", cookies: "准备登录资料",
+  baseline_first: "首次环境基线采集", baseline_second: "第二次环境基线采集",
+  baseline_verify: "验证环境基线", flushing: "保存资料到磁盘", final_hash: "最终完整性校验",
+  committing: "提交本地窗口",
+};
 function syncRunning() {
   const sync = state.sync;
   return sync.starting || Boolean(sync.jobId && sync.status?.state === "running");
@@ -438,7 +608,8 @@ function syncInterrupted() {
 }
 function boundedSyncStatus(status) {
   const items = Array.isArray(status.items) ? status.items : [];
-  return { ...status, items: items.slice(-100), items_total: Math.max(syncCount(status.items_total), items.length) };
+  return { ...status, progress: status.state === "running" ? status.progress || null : null,
+    items: items.slice(-100), items_total: Math.max(syncCount(status.items_total), items.length) };
 }
 function invalidateSyncStatus() {
   // A persisted job keeps its ID across resume, so ID checks alone cannot reject old replies.
@@ -606,7 +777,10 @@ function renderSync() {
   $("#sync-retry-status").hidden = !sync.pollPaused || (!running && !interrupted);
   $("#sync-footer-note").textContent = running || interrupted ? "同步只添加新副本，不覆盖本地已有窗口" : "检测不复制资料；点击开始同步后仍须通过完整性检查";
   if (hasJob) renderSyncProgress();
-  else renderSyncPreview();
+  else {
+    renderSyncCurrentProgress({});
+    renderSyncPreview();
+  }
 }
 function renderSyncPreview() {
   const sync = state.sync;
@@ -615,7 +789,7 @@ function renderSyncPreview() {
   const imported = sync.preview.filter((item) => item.status === "already_imported").length;
   const query = sync.search.toLocaleLowerCase();
   const items = sync.preview.map((item, index) => ({ item, index })).filter(({ item }) =>
-    !query || `${item.name || ""} ${item.seq ?? ""}`.toLocaleLowerCase().includes(query));
+    !query || `${item.name || ""} ${item.remark || ""} ${item.seq ?? ""}`.toLocaleLowerCase().includes(query));
   const pages = Math.max(1, Math.ceil(items.length / 50));
   sync.page = Math.min(Math.max(1, sync.page), pages);
   const offset = (sync.page - 1) * 50;
@@ -627,7 +801,9 @@ function renderSyncPreview() {
     const itemStatus = item.status === "ready" && item.has_local_data === false ? "missing_data" : item.status;
     const status = syncStatusLabels[itemStatus] || "暂不可导入";
     const reason = item.reason || (itemStatus === "source_open" ? guidance.sourceOpen : itemStatus === "already_imported" ? "保留已有本地副本，不重复、覆盖。" : itemStatus === "missing_data" ? guidance.missingData : "");
-    return `<tr><td class="select-cell"><input type="checkbox" data-sync-index="${index}" aria-label="选择 ${esc(item.name || "未命名窗口")}" ${enabled ? "" : "disabled"} ${sync.selected.has(item.source_key) ? "checked" : ""}></td><td><strong>${esc(item.name || "未命名窗口")}</strong><small>序号 ${esc(item.seq ?? "—")}${item.created_at ? ` · ${esc(displayDate(item.created_at))}` : ""}</small></td><td>${esc(item.os || "—")}<small>内核 ${esc(item.core_version || "—")}</small></td><td><span class="sync-status ${syncCanImport(item) ? "ready" : item.status === "already_imported" ? "muted" : "blocked"}">${status}</span>${reason ? `<small>${esc(reason)}</small>` : ""}</td></tr>`;
+    const name = item.name || "未命名窗口";
+    const remark = String(item.remark ?? "").trim();
+    return `<tr><td class="select-cell"><input type="checkbox" data-sync-index="${index}" aria-label="选择 ${esc(name)}" ${enabled ? "" : "disabled"} ${sync.selected.has(item.source_key) ? "checked" : ""}></td><td><strong class="sync-source-name" title="${esc(name)}">${esc(name)}</strong><small>来源序号 ${esc(item.seq ?? "—")}${item.created_at ? ` · ${esc(displayDate(item.created_at))}` : ""}</small><small class="sync-source-remark" title="${esc(remark || "无备注")}">备注：${esc(remark || "—")}</small>${item.metadata_note ? `<small>${esc(item.metadata_note)}</small>` : ""}</td><td>${esc(item.os || "—")}<small>内核 ${esc(item.core_version || "—")}</small></td><td><span class="sync-status ${syncCanImport(item) ? "ready" : item.status === "already_imported" ? "muted" : "blocked"}">${status}</span>${reason ? `<small>${esc(reason)}</small>` : ""}</td></tr>`;
   }).join("");
   $("#sync-empty").hidden = sync.loading || rows.length > 0;
   $("#sync-empty").textContent = sync.search ? "没有符合条件的本机窗口。" : guidance.previewEmpty;
@@ -645,6 +821,65 @@ function renderSyncPreview() {
 function syncResultSummary(status) {
   return `成功 ${syncCount(status.completed)} 个，跳过 ${syncCount(status.skipped)} 个，失败 ${syncCount(status.failed)} 个。`;
 }
+function syncProgressNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function syncProgressPercent(done, total) {
+  return Math.floor(Math.min(1, done / total) * 1000) / 10;
+}
+function syncProgressBytes(value) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value, unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+  return `${Number(size.toFixed(unit ? 1 : 0))} ${units[unit]}`;
+}
+function syncProgressDuration(value) {
+  const seconds = Math.floor(value);
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds / 60) % 60} 分 ${seconds % 60} 秒`;
+}
+function renderSyncCurrentProgress(status) {
+  const progress = status.state === "running" && status.progress && typeof status.progress === "object" && !Array.isArray(status.progress) ? status.progress : null;
+  $("#sync-current").hidden = !progress;
+  const bar = $("#sync-stage-progress");
+  bar.removeAttribute("value");
+  bar.max = 1;
+  bar.setAttribute("aria-valuetext", "进度未知");
+  for (const selector of ["#sync-current-label", "#sync-current-name", "#sync-stage-name", "#sync-stage-count", "#sync-stage-elapsed", "#sync-stage-timings"]) $(selector).textContent = "";
+  $("#sync-current-name").title = "";
+  $("#sync-stage-timings").hidden = true;
+  if (!progress) return;
+  const index = syncCount(progress.index), total = syncCount(status.total);
+  $("#sync-current-label").textContent = `${state.sync.pollPaused ? "上次读取 · " : ""}当前窗口${index ? ` ${index}${total ? ` / ${total}` : ""}` : ""}`;
+  const name = state.sync.names.get(progress.source_key) || (typeof progress.name === "string" && progress.name ? progress.name : "未命名窗口");
+  $("#sync-current-name").textContent = name;
+  $("#sync-current-name").title = name;
+  $("#sync-stage-name").textContent = syncProgressPhases[progress.phase] || "正在处理窗口";
+  const done = syncProgressNumber(progress.done), phaseTotal = syncProgressNumber(progress.total);
+  const unit = ["bytes", "files", "steps"].includes(progress.unit) ? progress.unit : null;
+  const measurable = unit && done !== null && phaseTotal !== null && phaseTotal > 0;
+  const format = (value) => unit === "bytes" ? syncProgressBytes(value) : `${Math.floor(value)} ${unit === "files" ? "个文件" : "轮"}`;
+  let detail = unit && done !== null ? `${format(done)}${phaseTotal !== null && phaseTotal > 0 ? ` / ${format(phaseTotal)}` : ""}` : "";
+  if (measurable) {
+    const percent = syncProgressPercent(done, phaseTotal);
+    bar.max = phaseTotal;
+    bar.value = Math.min(done, phaseTotal);
+    detail += ` · ${percent}%`;
+    bar.setAttribute("aria-valuetext", detail);
+  } else {
+    detail += `${detail ? " · " : ""}${phaseTotal === 0 ? "本阶段无可计量数据，等待确认" : "总量待确认"}`;
+    bar.setAttribute("aria-valuetext", detail);
+  }
+  $("#sync-stage-count").textContent = detail;
+  const elapsed = syncProgressNumber(progress.elapsed_seconds), phaseElapsed = syncProgressNumber(progress.phase_elapsed_seconds);
+  $("#sync-stage-elapsed").textContent = [elapsed === null ? "" : `当前窗口已用 ${syncProgressDuration(elapsed)}`, phaseElapsed === null ? "" : `本阶段已用 ${syncProgressDuration(phaseElapsed)}`].filter(Boolean).join(" · ");
+  const timings = progress.timings && typeof progress.timings === "object" ? progress.timings : {};
+  const summary = Object.entries(syncProgressPhases).filter(([phase]) => phase !== progress.phase && syncProgressNumber(timings[phase]) !== null)
+    .map(([phase, label]) => `${label} ${syncProgressDuration(timings[phase])}`).join(" · ");
+  $("#sync-stage-timings").hidden = !summary;
+  $("#sync-stage-timings").textContent = summary ? `已完成阶段耗时：${summary}` : "";
+}
 function renderSyncProgress() {
   const sync = state.sync;
   const status = sync.status || {};
@@ -653,12 +888,15 @@ function renderSyncProgress() {
   const total = syncCount(status.total);
   const done = Math.min(total, syncCount(status.completed) + syncCount(status.skipped) + syncCount(status.failed));
   const phases = { preparing: "正在准备", preview: "正在检查资料", checking: "正在检查资料", copying: "正在复制浏览器资料", importing: "正在导入窗口", saving: "正在保存本地副本", finalizing: "正在完成同步" };
-  $("#sync-phase").textContent = sync.pollPaused ? "进度读取已暂停" : interrupted ? "同步已中断，等待继续" : running ? (sync.cancelRequested ? "正在取消剩余同步" : phases[status.phase] || "正在同步窗口") : status.state === "failed" ? "同步任务失败" : status.state === "cancelled" ? "同步已取消" : syncCount(status.failed) ? "同步完成，部分窗口失败" : "同步完成";
-  $("#sync-progress-count").textContent = `${done} / ${total}`;
+  const currentPhase = syncProgressPhases[status.progress?.phase] || syncProgressPhases[status.phase];
+  const phaseLabel = currentPhase ? `${currentPhase}…` : phases[status.phase] || "正在同步窗口";
+  $("#sync-phase").textContent = sync.pollPaused ? "进度读取已暂停" : interrupted ? "同步已中断，等待继续" : running ? (sync.cancelRequested ? "正在取消剩余同步" : phaseLabel) : status.state === "failed" ? "同步任务失败" : status.state === "cancelled" ? "同步已取消" : syncCount(status.failed) ? "同步完成，部分窗口失败" : "同步完成";
+  $("#sync-progress-count").textContent = `批次已处理 ${done} / ${total} · ${total ? syncProgressPercent(done, total) : 0}%`;
   $("#sync-progress").max = Math.max(1, total);
   $("#sync-progress").value = done;
   $("#sync-progress-summary").textContent = syncResultSummary(status);
-  const note = interrupted ? "上次运行已中断，当前没有继续复制。可继续检查并同步剩余窗口，或取消剩余同步；已保存的副本会保留。" : running ? sync.cancelRequested ? "当前正在复制的窗口会继续处理，只取消尚未开始的窗口。可关闭此面板，后台将继续更新结果。" : "可关闭此面板继续管理本地窗口；同步将在后台继续。" : "已导入的窗口是独立本地副本，来源后续改动或删除不会覆盖、删除它。";
+  renderSyncCurrentProgress(status);
+  const note = interrupted ? "上次运行已中断，当前没有继续复制。可继续检查并同步剩余窗口，或取消剩余同步；已保存的副本会保留。" : running ? sync.cancelRequested ? "当前窗口会继续处理，只取消尚未开始的窗口。可关闭此面板，后台将继续更新结果。" : "可关闭此面板继续管理本地窗口；同步将在后台继续。" : "已导入的窗口是独立本地副本，来源后续改动或删除不会覆盖、删除它。";
   $("#sync-background-note").textContent = note + (sync.deferred ? ` 本批未选 ${sync.deferred} 个来源，本批结束后可重新预览，留待下批同步。` : "");
   const items = Array.isArray(status.items) ? status.items : [];
   $("#sync-result-list").innerHTML = items.slice(-100).map((item) =>
@@ -716,7 +954,7 @@ async function resumeSyncJob() {
   try {
     const result = await api("resume_sync", { job_id: jobId });
     if (String(result?.job_id || "") !== jobId) throw new Error("本地服务未确认继续任务，请读取进度确认结果。");
-    sync.status = { ...sync.status, state: "running", phase: "preparing", cancel_requested: false };
+    sync.status = { ...sync.status, state: "running", phase: "preparing", progress: null, cancel_requested: false };
     sync.cancelRequested = false;
     sync.pollErrors = 0;
     sync.pollPaused = false;
@@ -802,7 +1040,7 @@ async function cancelSyncJob() {
     if (jobId !== sync.jobId) return;
     sync.cancelRequested = true;
     if (interrupted) {
-      sync.status = { ...sync.status, state: "cancelled", phase: "finished", cancel_requested: true };
+      sync.status = { ...sync.status, state: "cancelled", phase: "finished", progress: null, cancel_requested: true };
       sync.pollPaused = false;
       clearTimeout(sync.timer);
     }
@@ -1018,6 +1256,36 @@ function renderFilters() {
   replace("#tag-filter", tags, "全部标签", state.tag);
 }
 const MAX_SEARCH_TERMS = 10;
+const profileCollator = new Intl.Collator("zh-CN", { numeric: true });
+let profileSearchTimer = null;
+let profileSearchRevision = 0;
+let profileSearchComposing = false;
+function cancelProfileSearch() {
+  clearTimeout(profileSearchTimer);
+  profileSearchTimer = null;
+  profileSearchRevision++;
+}
+function applyProfileSearch() {
+  cancelProfileSearch();
+  // Keep the applied query and visible rows together while input is pending.
+  state.search = $("#search-input").value.trim();
+  state.page = 1;
+  renderProfiles();
+}
+function scheduleProfileSearch(event) {
+  const input = event.target;
+  input.rows = Math.min(4, Math.max(1, input.value.split(/\r\n|\r|\n/).length));
+  cancelProfileSearch();
+  if (profileSearchComposing || event.isComposing) return;
+  if (!input.value.trim()) {
+    applyProfileSearch();
+    return;
+  }
+  const revision = profileSearchRevision;
+  profileSearchTimer = setTimeout(() => {
+    if (revision === profileSearchRevision) applyProfileSearch();
+  }, 150);
+}
 function profileSearchTerms(value) {
   return [...new Set(String(value).split(/[\r\n,，;；]+/)
     .map((term) => term.trim().toLowerCase()).filter(Boolean))];
@@ -1054,7 +1322,7 @@ function filteredProfiles() {
       if (state.sort === "seq")
         return (Number(av) - Number(bv)) * state.direction;
       return (
-        String(av).localeCompare(String(bv), "zh-CN", { numeric: true }) *
+        profileCollator.compare(String(av), String(bv)) *
         state.direction
       );
     });
@@ -1368,6 +1636,12 @@ async function chooseSetting(key, button) {
 function help(text) {
   return `<span class="help-dot" tabindex="0" title="${esc(text)}" aria-label="${esc(text)}">?</span>`;
 }
+function fieldText(value, type, lines = false) {
+  if (type?.startsWith("json") && typeof value === "object" && value !== null)
+    return JSON.stringify(value, null, 2);
+  if (Array.isArray(value)) return value.join(type === "lines" || lines ? "\n" : ",");
+  return value ?? "";
+}
 function field(path, label, type = "text", options = {}) {
   const value = getPath(state.draft, path);
   const id = `field-${path.replaceAll(".", "-")}`;
@@ -1394,14 +1668,7 @@ function field(path, label, type = "text", options = {}) {
       })
       .join("")}</select>`;
   } else if (type === "textarea") {
-    const text =
-      options.valueType?.startsWith("json") &&
-      typeof value === "object" &&
-      value !== null
-        ? JSON.stringify(value, null, 2)
-        : Array.isArray(value)
-          ? value.join(options.lines ? "\n" : ",")
-          : value;
+    const text = fieldText(value, options.valueType, options.lines);
     control = `<textarea id="${id}" data-field="${path}" data-type="${options.valueType || "string"}" ${options.class ? `class="${options.class}"` : ""} rows="${options.rows || 3}" placeholder="${esc(options.placeholder || "")}" ${options.maxLength ? `maxlength="${options.maxLength}"` : ""}>${esc(text)}</textarea>`;
   } else {
     const text = Array.isArray(value) ? value.join(",") : value;
@@ -1416,6 +1683,14 @@ const noiseOptions = [
   ["0", "噪声"],
   ["1", "真实"],
 ];
+function updateFingerprintReadOnly() {
+  const compatibilityFields = ["fingerprint.version", "fingerprint.osVersion", "fingerprint.timeZoneOffset"];
+  const systemResolution = String(state.draft?.fingerprint?.resolutionType) === "0";
+  $$("[data-form-section='fingerprint'] input,[data-form-section='fingerprint'] select,[data-form-section='fingerprint'] textarea", $("#profile-form")).forEach((control) => {
+    control.disabled = !state.creatingDraft || compatibilityFields.includes(control.dataset?.field) ||
+      (systemResolution && control.dataset?.field === "fingerprint.devicePixelRatio");
+  });
+}
 function signatureNoticeText(profile) {
   if (profile?.signature_provider === "local-v1" && profile?.environment_check) {
     const firstEnrollment = Array.isArray(profile.import_notes) && profile.import_notes.includes("原厂未保留历史运行种子，使用对应版本公开签名种子首次登记");
@@ -1430,7 +1705,7 @@ function buildProfileForm() {
   const lifetimeNotice = state.draft?.signature_status
     ? `<div class="info-banner" data-signature-notice>${esc(signatureNoticeText(state.draft))}</div>`
     : "";
-  const creationFields = state.creatingDraft ? `<div class="form-grid">${field("creation.count", "创建数量", "number", { min: 1, max: 1000, help: "单个或批量创建，最多1000个。批量名称按前缀追加序号。" })}${field("creation.random_each", "批量指纹", "checkbox", { text: "每个窗口使用不同随机指纹", help: "关闭时所有窗口使用当前表单指纹；各窗口的资料和加密密钥仍独立。" })}${field("creation.proxy_lines", "批量代理", "textarea", { valueType: "lines", full: true, rows: 3, help: "留空使用代理设置；1行共用或每个窗口1行，支持现有代理格式。" })}</div><button id="creation-randomize" class="button" type="button">一键随机生成指纹配置</button><div class="form-divider"></div>` : "";
+  const creationFields = state.creatingDraft ? `<div class="form-grid">${field("creation.count", "创建数量", "number", { min: 1, max: 1000, help: "单个或批量创建，最多1000个。批量名称按前缀追加序号。" })}${field("creation.random_each", "批量指纹", "checkbox", { text: "每个窗口使用不同随机指纹", help: "关闭时所有窗口使用当前表单指纹；各窗口的资料和加密密钥仍独立。" })}${field("creation.proxy_lines", "批量代理", "textarea", { valueType: "lines", full: true, rows: 3, help: "留空使用代理设置；1行共用或每个窗口1行，支持现有代理格式。" })}</div><div class="form-divider"></div>` : "";
   const basic = `${creationFields}<div class="form-intro"><div><h3>基础设置</h3><p>为窗口设置独立的名称和使用信息</p></div></div><div class="form-grid">${field("name", "窗口名称", "text", { required: true, placeholder: "请输入窗口名称" })}${field("group", "分组", "select", { options: [["", "未分组"], ...state.groups.map((group) => [group, group])], help: "分组可在左侧“分组管理”中添加或修改。" })}${field("tags", "标签", "text", { valueType: "list", placeholder: "输入标签，使用逗号分隔", help: "同一窗口可以设置多个标签。" })}${field("platform", "账号平台", "text", { placeholder: "例如：自定义平台名称" })}${field("username", "账号 / 用户名", "text", { placeholder: "可选，仅保存在本机" })}${field("password", "账号密码", "password", { placeholder: "请输入账号密码" })}${field("duplicate_check", "重复校验", "checkbox", { text: "校验重复窗口信息", help: "保存时由本地服务校验重复配置。" })}${field("fa_secret", "2FA 密钥", "password", { placeholder: "可选，双重验证密钥", help: "仅在本地保存；请妥善管理。" })}${field("allow_multi_open", "多开设置", "checkbox", { text: "保留多开兼容设置", help: "不同窗口使用独立资料可同时运行，同一资料再次打开会前置。此选项仅保留兼容值。" })}${field("remark", "备注", "textarea", { placeholder: "为窗口添加备注", rows: 3, full: true })}${field("urls", "启动网址", "textarea", { placeholder: "每行一个网址，例如 https://example.com", valueType: "lines", lines: true, full: true, hint: "打开窗口时按顺序访问；留空使用默认启动页。", rows: 3 })}</div>`;
   const proxy = `${lifetimeNotice}<div class="form-intro"><div><h3>代理设置</h3><p>本地独立代理，修改无需比特签名；请先关闭窗口再修改，重新打开后生效。</p></div></div><div class="form-grid">${field(
     "proxy.type",
@@ -1446,7 +1721,7 @@ function buildProfileForm() {
       ],
     },
   )}${field("proxy.host", "代理主机", "text", { placeholder: "主机名 / IP，或粘贴完整代理自动分填", help: "支持协议地址、主机:端口:用户名:密码，以及竖线分隔格式。未带协议时沿用当前代理类型。", hint: "可直接粘贴完整代理；尾部到期信息会自动忽略。" })}${field("proxy.port", "代理端口", "number", { min: 1, max: 65535, placeholder: "1–65535" })}${field("proxy.username", "代理用户名", "text", { placeholder: "无认证时留空" })}${field("proxy.password", "代理密码", "password", { placeholder: "无认证时留空" })}</div><div id="proxy-parse-result" class="test-result proxy-parse-result" role="status"></div><div class="proxy-test-area"><button class="button primary" id="drawer-proxy-test" type="button">检测代理</button><span id="drawer-proxy-result" class="test-result" role="status"></span></div><div class="form-divider"></div><div class="info-banner">检测通过仅代表当前代理连接可用。每次打开窗口前都会重新检测已保存的代理，检测不通过则不会启动；认证信息只在本机使用。</div>`;
-  const fingerprint = `${lifetimeNotice}<div class="form-intro"><div><h3>指纹信息</h3><p>查看已导入的浏览器环境信息</p></div></div><div class="info-banner fingerprint-overview">指纹在比特配置后导入。本地副本保留导入时的指纹，此处仅供查看；重复同步不会覆盖已有副本。</div><div class="form-card"><h4 class="form-subtitle">浏览器与操作系统</h4><div class="form-grid">${fp(
+  const fingerprint = `${lifetimeNotice}<div class="form-intro"><div><div class="fingerprint-heading"><h3>指纹信息</h3>${state.creatingDraft ? '<button id="creation-randomize" class="button small" type="button">一键随机生成指纹配置</button>' : ""}</div><p>${state.creatingDraft ? "设置新窗口的浏览器环境信息" : "查看已保存的浏览器环境信息"}</p></div></div><div class="info-banner fingerprint-overview">${state.creatingDraft ? "为新窗口选择内核和指纹；提交后固定保存，日常打开不重新生成（启用“每次打开随机指纹”时除外）。" : state.draft?.created_locally ? "此处查看已创建窗口的固定指纹；每次打开是否随机由偏好设置决定。" : "指纹在比特配置后导入。本地副本保留导入时的指纹，此处仅供查看；重复同步不会覆盖已有副本。"}</div><div class="form-card"><h4 class="form-subtitle">浏览器与操作系统</h4><div class="form-grid">${fp(
     "ostype",
     "设备类型",
     "select",
@@ -1465,7 +1740,7 @@ function buildProfileForm() {
       ["Linux armv81", "Android"],
       ["iPhone", "iOS"],
     ],
-  })}${fp("coreVersion", "浏览器内核", "select", { options: [["", "自动选择"], ...(state.creatingDraft ? state.creation.cores || [] : state.cores).map((core) => (typeof core === "string" ? [core, core] : [core.version || core.name, core.name || core.version]))], help: "必须与本机已安装的兼容浏览器内核匹配。" })}${fp("osVersion", "系统版本", "text", { placeholder: "由内核或随机化生成" })}${fp("userAgent", "User-Agent", "textarea", { full: true, rows: 3, placeholder: "浏览器用户代理字符串", help: "应与设备类型、操作系统和内核版本一致。" })}${fp("platformVersion", "平台版本", "text", { placeholder: "Client Hints 平台版本" })}${fp(
+  })}${fp("coreVersion", "浏览器内核", "select", { options: [["", "自动选择"], ...(state.creatingDraft ? state.creation.cores || [] : state.cores).map((core) => (typeof core === "string" ? [core, core] : [core.version || core.name, core.name || core.version]))], help: "必须与本机已安装的兼容浏览器内核匹配。" })}${fp("osVersion", "系统版本（兼容值）", "text", { hint: "仅保留原厂在线随机筛选值，本地不作为系统版本设置；请使用 User-Agent 与平台版本。" })}${fp("userAgent", "User-Agent", "textarea", { full: true, rows: 3, placeholder: "浏览器用户代理字符串", help: "应与设备类型、操作系统和内核版本一致。", hint: "相同系统与内核的 UA 可以相同，不代表全部指纹相同；UA 版本需匹配所选内核。" })}${fp("platformVersion", "平台版本", "text", { placeholder: "Client Hints 平台版本" })}${fp(
     "architecture",
     "CPU 架构",
     "select",
@@ -1500,7 +1775,7 @@ function buildProfileForm() {
         [48, "48 bit"],
       ],
     },
-  )}${fp("devicePixelRatio", "设备像素比", "number", { min: 0.1, max: 10, step: "0.1" })}${fp("windowSizeLimit", "窗口尺寸限制", "checkbox", { text: "限制窗口尺寸", help: "限制窗口不超出配置的屏幕范围。" })}</div></div><div class="form-card"><h4 class="form-subtitle">字体与图形渲染</h4><div class="form-grid">${fp(
+  )}${fp("devicePixelRatio", "设备像素比", "number", { min: 0.1, max: 10, step: "0.1", hint: "系统分辨率模式使用系统像素比；此处保留手动值，切回自定义或创建时随机模式后生效。" })}${fp("windowSizeLimit", "窗口尺寸限制", "checkbox", { text: "限制窗口尺寸", help: "限制窗口不超出配置的屏幕范围。" })}</div></div><div class="form-card"><h4 class="form-subtitle">字体与图形渲染</h4><div class="form-grid">${fp(
     "fontType",
     "字体模式",
     "select",
@@ -1568,7 +1843,7 @@ function buildProfileForm() {
       ["1", "允许"],
       ["2", "禁止"],
     ],
-  })}${fp("isIpCreatePosition", "位置匹配 IP", "checkbox", { text: "根据代理 IP 自动匹配" })}${fp("lat", "纬度", "number", { min: -90, max: 90, step: "any" })}${fp("lng", "经度", "number", { min: -180, max: 180, step: "any" })}${fp("defaultAccuracy", "位置精度 (米)", "number", { min: 0, max: 1000000 })}</div></div><div class="form-card"><h4 class="form-subtitle">安全与设备信息</h4><div class="form-grid">${fp("disableSslCipherSuitesFlag", "SSL 密码套件", "checkbox", { text: "禁用指定密码套件", help: "调整 TLS 特征；错误配置可能导致网站连接失败。" })}${fp("disableSslCipherSuites", "禁用套件列表", "text", { placeholder: "多个套件使用逗号分隔" })}${fp(
+  })}${fp("isIpCreatePosition", "位置匹配 IP", "checkbox", { text: "根据代理 IP 自动匹配" })}${fp("lat", "纬度", "number", { min: -90, max: 90, step: "any" })}${fp("lng", "经度", "number", { min: -180, max: 180, step: "any" })}${fp("defaultAccuracy", "位置精度 (米)", "number", { min: 1, max: 100000 })}</div></div><div class="form-card"><h4 class="form-subtitle">安全与设备信息</h4><div class="form-grid">${fp("disableSslCipherSuitesFlag", "SSL 密码套件", "checkbox", { text: "禁用指定密码套件", help: "调整 TLS 特征；错误配置可能导致网站连接失败。" })}${fp("disableSslCipherSuites", "禁用套件列表", "text", { placeholder: "多个套件使用逗号分隔" })}${fp(
     "portScanProtect",
     "端口扫描保护",
     "select",
@@ -1578,7 +1853,7 @@ function buildProfileForm() {
         ["1", "关闭"],
       ],
     },
-  )}${fp("portWhiteList", "端口白名单", "text", { placeholder: "例如 80,443", help: "允许网页访问的本机端口。" })}${fp("deviceInfoEnabled", "设备信息", "checkbox", { text: "使用自定义设备标识" })}${fp("computerName", "计算机名称", "text", { placeholder: "自定义计算机名称" })}${fp("macAddr", "MAC 地址", "text", { placeholder: "00:00:00:00:00:00" })}${fp("launchArgs", "自定义启动参数", "textarea", { full: true, rows: 3, placeholder: "多个参数使用逗号分隔", help: "直接交给本地启动服务检查；受保护参数可能被拒绝。" })}</div></div><div class="form-card"><h4 class="form-subtitle">高级环境参数</h4><div class="form-grid">${fp("coreProduct", "内核类型", "select", { options: [["chrome", "Chromium / Chrome"]], help: "本地启动仅支持兼容的 Chromium 内核。" })}${fp("version", "浏览器完整版本", "text", { placeholder: "由有效模板或随机化生成", help: "用于生成与内核一致的 User-Agent。" })}${fp(
+  )}${fp("portWhiteList", "端口白名单", "text", { placeholder: "例如 80,443", help: "允许网页访问的本机端口。" })}${fp("deviceInfoEnabled", "设备信息", "checkbox", { text: "使用自定义设备标识" })}${fp("computerName", "计算机名称", "text", { placeholder: "自定义计算机名称" })}${fp("macAddr", "MAC 地址", "text", { placeholder: "00:00:00:00:00:00" })}${fp("launchArgs", "自定义启动参数", "textarea", { full: true, rows: 3, placeholder: "多个参数使用逗号分隔", help: "直接交给本地启动服务检查；受保护参数可能被拒绝。" })}</div></div><div class="form-card"><h4 class="form-subtitle">高级环境参数</h4><div class="form-grid">${fp("coreProduct", "内核类型", "select", { options: [["chrome", "Chromium / Chrome"]], help: "本地启动仅支持兼容的 Chromium 内核。" })}${fp("version", "浏览器版本（兼容值）", "text", { hint: "仅保留原厂在线随机筛选值，本地不使用；实际版本以所选内核和 User-Agent 为准。" })}${fp(
     "bitness",
     "架构位数",
     "select",
@@ -1589,7 +1864,7 @@ function buildProfileForm() {
         [64, "64 bit"],
       ],
     },
-  )}${fp("iswow64", "WOW64", "checkbox", { text: "32 位应用运行在 64 位系统" })}${fp("uamodel", "设备型号", "text", { placeholder: "桌面设备通常留空" })}${fp("navigatorVendor", "浏览器厂商", "text", { placeholder: "Google Inc." })}${fp("timeZoneOffset", "时区偏移兼容值", "number", { help: "兼容字段；Chromium 的时区以 IANA 时区名称为准。" })}${fp("precisionData", "手动位置精度 (米)", "number", { min: 0, step: "any", help: "手动指定经纬度时使用。" })}${fp("hostIP", "WebRTC 替换地址", "text", { placeholder: "WebRTC 选择“替换”时使用" })}${fp("webglparameterscode", "WebGL 参数代码", "text", { placeholder: "有效模板中的参数代码", help: "需与 GPU 厂商、渲染器和完整参数匹配；不自动推断。" })}${fp("modelName", "设备型号名称", "text", { placeholder: "留空沿用模板默认值" })}${fp("manufacturerName", "设备制造商", "text", { placeholder: "留空沿用模板默认值" })}${fp("totalDiskSpace", "磁盘配额 (KiB)", "number", { min: 0, help: "空或 0 使用内核默认值。" })}${fp("ignoreHttpsErrors", "HTTPS 证书", "checkbox", { text: "允许忽略证书错误", help: "启用后可能接受不可信或过期的证书。" })}</div></div>`;
+  )}${fp("iswow64", "WOW64", "checkbox", { text: "32 位应用运行在 64 位系统" })}${fp("uamodel", "设备型号", "text", { placeholder: "桌面设备通常留空" })}${fp("navigatorVendor", "浏览器厂商", "text", { placeholder: "Google Inc." })}${fp("timeZoneOffset", "时区偏移兼容值", "number", { hint: "只读兼容值；实际时区偏移由上方 IANA 时区和日期决定。" })}${fp("precisionData", "手动位置精度 (米)", "number", { min: 0, step: "any", help: "手动指定经纬度时使用。" })}${fp("hostIP", "WebRTC 替换地址", "text", { placeholder: "WebRTC 选择“替换”时使用" })}${fp("webglparameterscode", "WebGL 参数代码", "text", { placeholder: "有效模板中的参数代码", help: "需与 GPU 厂商、渲染器和完整参数匹配；不自动推断。" })}${fp("modelName", "设备型号名称", "text", { placeholder: "留空沿用模板默认值" })}${fp("manufacturerName", "设备制造商", "text", { placeholder: "留空沿用模板默认值" })}${fp("totalDiskSpace", "磁盘配额 (KiB)", "number", { min: 0, help: "空或 0 使用内核默认值。" })}${fp("ignoreHttpsErrors", "HTTPS 证书", "checkbox", { text: "允许忽略证书错误", help: "启用后可能接受不可信或过期的证书。" })}</div></div>`;
   const launchOptions = state.creatingDraft || state.draft?.created_locally ? `<div class="form-divider"></div><h4 class="form-subtitle">启动与清理</h4><div class="form-grid">${field("created_options.workbench", "打开时显示IP信息页", "select", {options:[["localserver","显示"],["disable","不显示"]]})}${field("created_options.dynamic_proxy_url", "动态代理提取链接", "text", {full:true,help:"可选。每次打开先提取1条代理，再经过正常转发和10秒检测。支持单条文本或JSON；失败不回退直连。"})}${field("created_options.dynamic_proxy_type", "提取代理协议", "select", {options:[["socks5","SOCKS5"],["http","HTTP"],["https","HTTPS"],["ssh","SSH"]]})}${[
     ["clear_cache", "启动前清理缓存", "只清理此窗口的受管缓存。"],
     ["clear_cache_without_extensions", "清理时保留扩展缓存", "配合清理缓存使用。"],
@@ -1614,11 +1889,7 @@ function buildProfileForm() {
         `<section class="form-section ${state.section === key ? "active" : ""}" data-form-section="${key}">${content}</section>`,
     )
     .join("");
-  $$("[data-form-section='fingerprint'] input,[data-form-section='fingerprint'] select,[data-form-section='fingerprint'] textarea", $("#profile-form")).forEach((control) => { control.disabled = !state.creatingDraft; });
-  if (state.creatingDraft) {
-    const notice = $(".fingerprint-overview", $("#profile-form"));
-    if (notice) notice.textContent = "为新窗口选择内核和指纹；提交后固定保存，日常打开不重新生成。";
-  }
+  updateFingerprintReadOnly();
 }
 
 function openDrawer(profile, section = "basic", focusField = null, creating = false) {
@@ -1711,6 +1982,8 @@ function readField(control) {
   if (Array.isArray(previous) && control.dataset.type === "string")
     value = splitList(value);
   setPath(state.draft, control.dataset.field, value);
+  if (control.dataset.field.startsWith("fingerprint.") && previous !== value)
+    state.creation.fingerprintRevision++;
   if (state.creatingDraft && previous !== value && ["fingerprint.coreVersion","fingerprint.os","fingerprint.ostype"].includes(control.dataset.field)) {
     const fp = state.draft.fingerprint;
     const deviceChanged = control.dataset.field === "fingerprint.ostype";
@@ -1754,6 +2027,8 @@ function readField(control) {
       }
     }
   }
+  if (state.creatingDraft && previous !== value && ["fingerprint.resolutionType", "fingerprint.ostype"].includes(control.dataset.field))
+    updateFingerprintReadOnly();
   if (control.dataset.field === "cookie_text" && previous !== value) {
     state.cookieReadRequest++;
     const input = $("#cookie-file-input");
@@ -1865,7 +2140,7 @@ function validateDraft(profile) {
   }
   for (const control of $$('input[type="number"]', $("#profile-form"))) {
     if (control.disabled) continue;
-    if (control.value !== "" && !control.checkValidity())
+    if ((control.value !== "" || control.validity?.badInput) && !control.checkValidity())
       return {
         section: control.closest("[data-form-section]").dataset.formSection,
         field: control.dataset.field,
@@ -2391,17 +2666,34 @@ async function openCreation(batch = false) {
 }
 
 async function randomizeCreation() {
-  if (!state.creatingDraft || state.saving) return;
+  if (!state.creatingDraft || !state.draft || state.saving || state.preparingSave) return;
+  collectDraft();
   const draft = state.draft, session = state.drawerSession;
+  const fingerprint = copy(draft.fingerprint), revision = state.creation.fingerprintRevision;
+  const current = () => draft === state.draft && session === state.drawerSession;
+  showDrawerError("");
   state.saving = true; setDrawerBusy(true, "生成指纹…");
   try {
-    const result = await api("creation_randomize", { fingerprint: draft.fingerprint });
-    if (draft !== state.draft || session !== state.drawerSession) return;
+    const result = await api("creation_randomize", { fingerprint });
+    if (!current()) return;
+    if (revision !== state.creation.fingerprintRevision || JSON.stringify(draft.fingerprint) !== JSON.stringify(fingerprint)) {
+      showDrawerError("指纹参数已修改，本次随机结果未应用；请确认当前参数后重新随机。");
+      return;
+    }
+    if (!result?.fingerprint || typeof result.fingerprint !== "object" || Array.isArray(result.fingerprint))
+      throw new Error("未取得有效的随机指纹，请重试。");
     draft.fingerprint = result.fingerprint;
+    state.creation.fingerprintRevision++;
     state.dirty = true;
-    buildProfileForm();
-  } catch (error) { showDrawerError(error.message); }
-  finally { state.saving = false; setDrawerBusy(false); }
+    $$('[data-field^="fingerprint."]', $("#profile-form")).forEach((control) => {
+      const value = getPath(draft, control.dataset.field);
+      if (control.dataset.type === "boolean") control.checked = value === true || value === 1 || value === "1" || value === "true";
+      else control.value = fieldText(value, control.dataset.type);
+    });
+    updateFingerprintReadOnly();
+    toast("随机指纹已更新，可继续调整后创建。", "success");
+  } catch (error) { if (current()) showDrawerError(error.message); }
+  finally { if (current()) { state.saving = false; setDrawerBusy(false); } }
 }
 
 async function submitCreation(profile) {
@@ -2588,11 +2880,14 @@ function bindEvents() {
         renderProfiles();
       }),
   );
-  $("#search-input").oninput = (event) => {
-    state.search = event.target.value.trim();
-    event.target.rows = Math.min(4, Math.max(1, event.target.value.split(/\r\n|\r|\n/).length));
-    state.page = 1;
-    renderProfiles();
+  $("#search-input").oninput = scheduleProfileSearch;
+  $("#search-input").oncompositionstart = () => {
+    profileSearchComposing = true;
+    cancelProfileSearch();
+  };
+  $("#search-input").oncompositionend = (event) => {
+    profileSearchComposing = false;
+    scheduleProfileSearch(event);
   };
   $("#group-filter").onchange = (event) => {
     state.group = event.target.value;
@@ -2605,6 +2900,7 @@ function bindEvents() {
     renderProfiles();
   };
   $("#clear-filters").onclick = () => {
+    cancelProfileSearch();
     state.search = "";
     state.group = "";
     state.tag = "";
@@ -2614,6 +2910,15 @@ function bindEvents() {
     renderFilters();
     renderProfiles();
   };
+  $("#arrange-windows").onclick = arrangeWindows;
+  $("#window-layout-settings").onclick = openWindowLayout;
+  $("#window-layout-close").onclick = closeWindowLayout;
+  $("#window-layout-cancel").onclick = closeWindowLayout;
+  $("#window-layout-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeWindowLayout(); });
+  $("#window-layout-mode").onchange = renderWindowLayout;
+  $("#window-layout-form").onsubmit = (event) => { event.preventDefault(); saveWindowLayout(); };
+  $("#window-layout-save").onclick = () => saveWindowLayout();
+  $("#window-layout-save-arrange").onclick = () => saveWindowLayout(true);
   $$("[data-sort]").forEach(
     (button) =>
       (button.onclick = () => {
@@ -2736,7 +3041,7 @@ function bindEvents() {
   $("#drawer-backdrop").onclick = closeDrawer;
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape" || $("#confirm-dialog").open) return;
-    if ($("#sync-dialog").open) return;
+    if ($("#sync-dialog").open || $("#window-layout-dialog").open) return;
     if (!$("#row-menu").hidden) {
       $("#row-menu").hidden = true;
       event.preventDefault();

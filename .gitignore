@@ -19,3 +19,4 @@ __pycache__/
 !/analysis/fingerprint-continuity-tests.py
 !/analysis/conservative-policy-tests.py
 !/analysis/proxy-runtime-protocol-tests.py
+!/analysis/browser-proxy-boundary-regression.py

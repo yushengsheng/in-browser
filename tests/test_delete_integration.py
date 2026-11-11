@@ -14,6 +14,7 @@ sys.path.insert(0,str(ROOT/'tests'))
 from api import dispatch
 from local_state import LocalBrowserError
 from manager_service import ManagerService
+from signature_status import SignatureStatusCache
 from sync_state import SyncState
 from test_profile_delete import Fixture
 from window_sync import WindowSynchronizer
@@ -69,6 +70,7 @@ class PendingIntegrationTests(unittest.TestCase):
     def manager(self):
         service=ManagerService.__new__(ManagerService)
         service.root=self.fixture.root;service.operations=threading.RLock()
+        service._signature_status=SignatureStatusCache()
         service.store=Mock();service.controller=Mock()
         return service
 
@@ -91,6 +93,7 @@ class PendingIntegrationTests(unittest.TestCase):
         records=[{'id':identity,'fingerprint':{},'tags':[],'_runtime':{'fingerprint_path':'synthetic-missing'}} for identity in ('a','b')]
         service.store=self.fixture.store
         service.store.all=Mock(return_value=records)
+        service.store.status_rows=Mock(return_value=records)
         service.controller.statuses.return_value={'a':'未打开','b':'未打开'}
         with patch('profile_delete.get_pending_ids',return_value={'a'}):
             for rows in (service.listing()['profiles'],service.statuses()['profiles']):

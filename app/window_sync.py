@@ -23,6 +23,8 @@ from profile_model import defaults,PREFERENCES,sanitize,fingerprint_fields
 from proxy_config import normalize_proxy
 from window_store import now,source_time
 from sync_state import SyncState,WorkerLease
+from engine_validation import verification_scope
+from import_progress import ImportProgress,observe,emit
 
 MAX_SYNC_SOURCES=9999
 SYNC_PREVIEW_TTL=600
@@ -55,6 +57,7 @@ class WindowSynchronizer:
         self.lock=threading.RLock();self.candidates={};self.active=None;self.diagnostics={}
         self.preview_id=None;self.preview_created=0;self.confirmed_jobs={}
         self.state=SyncState(service.store);self.lease=WorkerLease(service.root);self._job_item=None
+        self.progress=ImportProgress()
         if self.lease.acquire():
             try:
                 self.state.interrupt_running()
@@ -101,11 +104,14 @@ class WindowSynchronizer:
             unique,conflicts=self._discover();items=[]
             bindings=self.service.store.source_bindings()
             self.candidates=unique
+            metadata=self.provider.preview_metadata(list(unique.values())) if hasattr(self.provider,'preview_metadata') else {}
             for candidate in unique.values():
                 info=candidate.get('info') or {};fp=info.get('browserFingerPrint') or {};key=candidate['source_key']
+                display=metadata.get(key,info)
                 bound=key in bindings and key not in conflicts
                 status='already_imported' if bound and key not in conflicts else candidate['status']
-                items.append({'source_key':key,'name':str(info.get('name') or '本机资料窗口'),'seq':info.get('seq'),
+                items.append({'source_key':key,'name':str(display.get('name') or info.get('name') or '本机资料窗口'),'seq':display.get('seq'),
+                    'remark':str(display.get('remark') or ''),'metadata_note':display.get('metadata_note') or '',
                     'os':fp.get('os') or info.get('os') or '', 'core_version':str(fp.get('coreVersion') or info.get('coreVersion') or ''),
                     'created_at':source_time(info.get('createdTime')),'status':status,
                     'reason':'已保留独立本地副本，本次跳过，不覆盖现有资料。' if bound else candidate.get('reason'),
@@ -174,9 +180,20 @@ class WindowSynchronizer:
         self.worker=threading.Thread(target=self._run,args=(identity,),name='local-window-sync',daemon=True)
         self.worker.start()
 
-    def latest(self):return self.state.latest()
+    def latest(self):
+        result=self.state.latest()
+        return self._with_progress(result)
 
-    def status(self,identity,*,after=None,missing_ok=False):return self.state.status(identity,after=after,missing_ok=missing_ok)
+    def _with_progress(self,result):
+        if result is not None:
+            result['progress']=self.progress.snapshot(result['job_id']) if result['state']=='running' else None
+            if result['progress']:
+                result['progress']['index']=result['current']
+                result['phase']=result['progress']['phase']
+        return result
+
+    def status(self,identity,*,after=None,missing_ok=False):
+        return self._with_progress(self.state.status(identity,after=after,missing_ok=missing_ok))
 
     def resume(self,identity):
         with self.lock:
@@ -196,16 +213,19 @@ class WindowSynchronizer:
 
     def _update(self,identity,**values):
         self.state.update(identity,**values)
+        if values.get('phase'):emit(values['phase'])
 
     def _run(self,identity):
+        self.diagnostics.setdefault(identity,[])
         try:
             for index,candidate in self.state.pending(identity):
                 if self.state.cancelled(identity):
                     self._update(identity,state='cancelled',phase='finished');return
                 self.state.begin_item(identity,index);self._job_item=(identity,index)
+                self.progress.begin(identity,index,candidate)
                 key=candidate['source_key'];result={'source_key':key}
                 try:
-                    with self.service.operations:
+                    with observe(self.progress.update),self.service.operations:
                         if self.service.store.source_binding(key):result.update(status='skipped',message='该来源已经同步，保留原有副本。')
                         elif candidate['status']!='ready':result.update(status='skipped',message=candidate.get('reason') or '来源尚未准备好。')
                         else:
@@ -219,6 +239,11 @@ class WindowSynchronizer:
                         'frames':[{'file':Path(f.filename).name,'line':f.lineno} for f in traceback.extract_tb(exc.__traceback__)]})
                     self.diagnostics[identity]=self.diagnostics[identity][-100:]
                     result.update(status='failed',message='本次同步未完成，来源和已有本地窗口未修改。请检查磁盘、文件占用或授权。')
+                finally:
+                    timing=self.progress.finish()
+                    if timing:
+                        self.diagnostics[identity].append(timing)
+                        self.diagnostics[identity]=self.diagnostics[identity][-100:]
                 self.state.finish_item(identity,index,result['status'],result['message'])
                 self._job_item=None
             self._update(identity,state='completed',phase='finished')
@@ -226,6 +251,7 @@ class WindowSynchronizer:
             try:self._update(identity,state='interrupted',phase='finished',message='同步任务中止，已完成的副本仍保留，可继续剩余项。')
             except Exception:pass
         finally:
+            self.progress.finish()
             with self.lock:self._job_item=None;self.lease.release()
 
     def _startup(self,candidate):
@@ -235,6 +261,7 @@ class WindowSynchronizer:
             'username':full.get('proxyUserName') or '', 'password':full.get('proxyPassword') or '', 'enable_socks5_udp':bool(full.get('enableSocks5Udp'))})
         # A leftover LocalCache may predate a fingerprint edit. Source identity,
         # proxy and protection-key equality alone cannot prove all fields match.
+        emit('preparing')
         native,binary=self.service.configuration.build_source(full)
         if native.get('DataProtect')!=protection:raise LocalBrowserError('启动文件与来源资料的保护参数不一致，未提交副本。')
         if (native.get('FontConfig') or {}).get('Files'):raise LocalBrowserError('来源使用当前内核未验证的额外字体文件，不能将其标记为完整可用；来源未修改。')
@@ -443,6 +470,7 @@ class WindowSynchronizer:
         if key is not None and blocked:
             raise LocalBrowserError('此来源仍有待核实的同步副本；已保留资料，请恢复后再试。')
 
+    @verification_scope()
     def _import(self,candidate,phase):
         service=self.service;self._recover_intents(candidate['source_key'])
         if service.store.source_binding(candidate['source_key']):return False
@@ -450,6 +478,7 @@ class WindowSynchronizer:
         if profile_processes(source):raise LocalBrowserError('来源窗口仍在运行，请正常关闭后再同步。')
         phase('preparing');startup,native,binary,proxy=self._startup(candidate)
         full=startup['info'];core=str(full['browserFingerPrint']['coreVersion'])
+        emit('engine')
         if getattr(service.configuration,'independent',False):
             engine_path=service.configuration.local_core(core)
         else:engine_path=service.engines.install(core,startup['core_path']) if startup.get('core_path') else None
@@ -464,8 +493,9 @@ class WindowSynchronizer:
             marker=service.store.pack({'format':1,'ownership':self.state.validate_intent(intent)})
             with (work/'.sync-owner.bin').open('xb') as output:
                 output.write(marker);output.flush();os.fsync(output.fileno())
-            self._intent_paths(intent);phase('copying');service._copy_profile(source,staged)
-            manifest=service._manifest(staged);phase('validating')
+            self._intent_paths(intent);phase('copying');manifest=service._copy_profile(source,staged)
+            if not isinstance(manifest,dict):manifest=service._manifest(staged)
+            phase('validating')
             self.provider.revalidate(candidate)
             notes=self._extensions(source,staged,final)
             if startup.get('import_note'):notes.append(startup['import_note'])
@@ -474,11 +504,16 @@ class WindowSynchronizer:
             record=self._record(candidate,full,native,proxy,identity,final,config,manifest,notes,engine_path,fingerprint_hash=sha256(signed))
             record=self._prepare_record(record,candidate,staged,work)
             self.provider.revalidate(candidate)
+            emit('flushing')
             self._plain_tree(staged)
-            for path in staged.rglob('*'):
-                if path.is_file():self._flush_file(path)
+            files=[path for path in staged.rglob('*') if path.is_file()]
+            emit('flushing',done=0,total=len(files),unit='files')
+            for index,path in enumerate(files,1):
+                self._flush_file(path)
+                emit('flushing',done=index,total=len(files),unit='files')
             self._flush_file(signed);signature_hash=sha256(signed)
             record['_runtime']['fingerprint_sha256']=signature_hash
+            emit('final_hash')
             published_manifest=service._manifest(staged)
             intent=self.state.prepare(intent_id,record,published_manifest,signature_hash);prepared=True
             phase('committing')

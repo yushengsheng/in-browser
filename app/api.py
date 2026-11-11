@@ -10,6 +10,15 @@ def dispatch(service,action,payload=None):
         if action=='bootstrap': result=service.bootstrap()
         elif action=='list': result=service.listing()
         elif action=='status': result=service.statuses()
+        elif action=='window_layout_get':
+            from window_layout import get_settings
+            result=get_settings(service)
+        elif action=='window_layout_save':
+            from window_layout import save_settings
+            result=save_settings(service,payload.get('settings'))
+        elif action=='arrange_windows':
+            from window_layout import arrange
+            result=arrange(service)
         elif action=='sync_preview':result=service.synchronizer().preview()
         elif action=='sync_windows':result=service.synchronizer().start(payload.get('source_keys'),preview_id=payload.get('preview_id'))
         elif action=='sync_status':result=service.synchronizer().status(payload['job_id'],after=payload.get('after'),missing_ok=payload.get('missing_ok') is True)

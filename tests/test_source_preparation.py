@@ -157,6 +157,111 @@ class SourcePreparationTests(unittest.TestCase):
         for provider in providers:
             self.assertEqual([p.name for p in provider.configuration.root.iterdir()],['portable-mode.bin'])
 
+    def test_preview_reads_only_display_fields_without_preparing_or_changing_candidates(self):
+        provider=self.provider()
+        processes=SimpleNamespace(uncertain=lambda _:False,occupied=lambda _:False)
+        with patch('bit_source.ProfileProcessSnapshot',return_value=processes):
+            candidates=provider.discover()
+        before=copy.deepcopy(candidates)
+        files={p.relative_to(self.base).as_posix():hashlib.sha256(p.read_bytes()).digest()
+               for p in self.base.rglob('*') if p.is_file()}
+        reader=Mock()
+        reader.source_detail.side_effect=lambda identity,**_:dict(full(identity),
+            name='来源 '+identity[0],remark='测试备注 <b>原样显示</b>',password='synthetic-private-only')
+        with patch.object(local_source,'_reader',return_value=reader), \
+                patch.object(provider.configuration,'prepare_source',side_effect=AssertionError('Unexpected preparation')):
+            metadata=provider.preview_metadata(candidates)
+        self.assertEqual(candidates,before)
+        self.assertEqual(reader.source_detail.call_count,2)
+        reader.source_settings.assert_not_called();reader.build_source.assert_not_called()
+        for item in candidates:
+            value=metadata[item['source_key']]
+            self.assertEqual(set(value),{'name','remark','seq'})
+            self.assertEqual(value['name'],'来源 '+item['source_id'][0])
+            self.assertEqual(value['remark'],'测试备注 <b>原样显示</b>')
+            self.assertEqual(value['seq'],7)
+        self.assertEqual(files,{p.relative_to(self.base).as_posix():hashlib.sha256(p.read_bytes()).digest()
+                               for p in self.base.rglob('*') if p.is_file()})
+
+    def test_prepared_preview_reuses_saved_labels_without_network(self):
+        provider=self.provider()
+        candidate={'source_id':A,'source_key':'synthetic','status':'ready',
+                   'info':dict(full(),remark='已准备的备注')}
+        with patch.object(local_source,'_reader',side_effect=AssertionError('Unexpected session')):
+            metadata=provider.preview_metadata([candidate])
+        self.assertEqual(metadata['synthetic'],{'name':'same fixture name','remark':'已准备的备注','seq':7})
+
+    def test_preview_session_failure_is_bounded_and_does_not_block_import_candidates(self):
+        provider=self.provider()
+        processes=SimpleNamespace(uncertain=lambda _:False,occupied=lambda _:False)
+        with patch('bit_source.ProfileProcessSnapshot',return_value=processes):candidates=provider.discover()
+        before=copy.deepcopy(candidates)
+        with patch.object(local_source,'_reader',side_effect=RuntimeError('synthetic-private-only')) as reader:
+            metadata=provider.preview_metadata(candidates)
+        reader.assert_called_once()
+        self.assertEqual(candidates,before)
+        self.assertTrue(all(value['metadata_note'] for value in metadata.values()))
+        self.assertNotIn('synthetic-private-only',json.dumps(metadata))
+
+    def test_preview_wrong_identity_is_not_displayed_and_unsupported_source_is_not_requested(self):
+        provider=self.provider();reader=Mock();reader.source_detail.return_value=dict(full(B),remark='wrong source')
+        candidate={'source_id':A,'source_key':'synthetic','status':'ready','info':None,'_needs_preparation':True}
+        with patch.object(local_source,'_reader',return_value=reader):
+            metadata=provider.preview_metadata([candidate])
+        self.assertTrue(metadata['synthetic']['metadata_note'])
+        self.assertNotIn('wrong source',json.dumps(metadata))
+        reader.reset_mock();candidate['status']='unsupported'
+        with patch.object(local_source,'_reader',return_value=reader):provider.preview_metadata([candidate])
+        reader.source_detail.assert_not_called()
+
+    def test_preview_metadata_stops_new_requests_when_detection_budget_is_spent(self):
+        provider=self.provider();reader=Mock();reader.source_detail.return_value=full()
+        candidates=[{'source_id':identity,'source_key':identity,'status':'ready','info':None,'_needs_preparation':True}
+                    for identity in (A,B)]
+        with patch.object(local_source,'_reader',return_value=reader), \
+                patch('bit_source.time.monotonic',side_effect=[0,0,0,11]):
+            metadata=provider.preview_metadata(candidates)
+        reader.source_detail.assert_called_once_with(A,timeout=3)
+        self.assertEqual(metadata[A]['name'],'same fixture name')
+        self.assertTrue(metadata[B]['metadata_note'])
+
+    def test_one_unreadable_source_does_not_hide_later_window_labels(self):
+        candidates=[{'source_id':identity,'source_key':identity,'status':'ready','info':None,'_needs_preparation':True}
+                    for identity in (A,B)]
+        before=copy.deepcopy(candidates)
+        for invalid in (LocalBrowserError('synthetic-private-only'),full(B)):
+            provider=self.provider()
+            reader=Mock();reader.source_detail.side_effect=[invalid,dict(full(B),remark='第二个窗口')]
+            with patch.object(local_source,'_reader',return_value=reader):
+                metadata=provider.preview_metadata(candidates)
+            self.assertEqual(reader.source_detail.call_count,2)
+            self.assertTrue(metadata[A]['metadata_note'])
+            self.assertEqual(metadata[B]['remark'],'第二个窗口')
+            self.assertNotIn('synthetic-private-only',json.dumps(metadata))
+            self.assertEqual(candidates,before)
+
+    def test_preview_retry_completes_remaining_labels_and_expires_memory_cache(self):
+        provider=self.provider();reader=Mock()
+        reader.source_detail.side_effect=lambda identity,**_:full(identity)
+        candidates=[{'source_id':identity,'source_key':identity,'status':'ready','info':None,'_needs_preparation':True}
+                    for identity in (A,B)]
+        with patch.object(local_source,'_reader',return_value=reader):
+            with patch('bit_source.time.monotonic',side_effect=[0,0,0,11]):
+                first=provider.preview_metadata(candidates)
+            self.assertTrue(first[B]['metadata_note'])
+            with patch('bit_source.time.monotonic',return_value=12):
+                second=provider.preview_metadata(candidates)
+            self.assertTrue(all(not value.get('metadata_note') for value in second.values()))
+            self.assertEqual([call.args[0] for call in reader.source_detail.call_args_list],[A,B])
+            with patch('bit_source.time.monotonic',return_value=13):
+                provider.preview_metadata(candidates)
+            self.assertEqual(reader.source_detail.call_count,2)
+            with patch('bit_source.time.monotonic',return_value=700):
+                provider.preview_metadata(candidates)
+            self.assertEqual(reader.source_detail.call_count,4)
+            provider.preview_metadata([])
+            self.assertEqual(provider._preview_labels,{})
+
     def test_same_provider_discovers_vendor_installed_after_first_preview(self):
         provider=self.provider()
         (self.root/'portable-mode.bin').write_bytes(b'synthetic portable marker')
@@ -306,8 +411,10 @@ class SourcePreparationTests(unittest.TestCase):
 
     def test_import_prepares_key_and_cold_start_baseline_before_publish(self):
         record,staged,work=self.import_record();calls=[]
-        def baseline(probe,root):
+        def baseline(probe,root,*,progress=None):
             calls.append('baseline')
+            if progress:
+                progress('first');progress('second')
             self.assertEqual(probe['_runtime']['profile_path'],str(staged))
             self.assertEqual(probe['_runtime']['fingerprint_path'],str(work/'fingerprint.bin'))
             return {'binding':{'fixture':True}}

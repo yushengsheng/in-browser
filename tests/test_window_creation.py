@@ -1,9 +1,12 @@
 """New windows use temporary encrypted catalogs; no account data or real network."""
 import copy
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock,patch
 
@@ -73,6 +76,69 @@ class CreationTests(unittest.TestCase):
         request['profile']['fingerprint']['canvasValue']=123456
         self.creator.start(request);self.creator._run(request['request_id'])
         self.assertEqual([r['fingerprint']['canvasValue'] for r in self.service.store.all()],[123456,123456])
+
+    @unittest.skipUnless(os.name=='nt','Windows protected engine file handles')
+    def test_creation_reuses_protected_engine_hash_only_within_one_item(self):
+        import engine_validation
+        events=[];item_digests=[];closed=[]
+        runtime=self.service._runtime;helper=self.service.synchronizer()
+        complete=helper._complete_intent;flush=helper._flush_file;create=self.creator._create
+        def check(stage):
+            events.append(stage)
+            value=engine_validation.digest_file(self.executable)
+            with self.assertRaises(PermissionError):self.executable.write_bytes(b'blocked')
+            return value
+        def checked_runtime(profile,previous):
+            item_digests.append(check('runtime'))
+            return runtime(profile,previous)
+        def baseline(*args):
+            check('first_probe');check('second_probe')
+            return {'synthetic':True}
+        def verify(*args):check('third_probe');return {'passed':True}
+        def checked_complete(intent):check('commit');return complete(intent)
+        def checked_flush(path):events.append('flush');return flush(path)
+        def checked_create(*args):
+            result=create(*args)
+            closed.append(engine_validation._active.get() is None)
+            self.executable.write_bytes(b'next item '+str(len(closed)).encode())
+            return result
+        self.service._runtime=checked_runtime
+        self.creator._create=checked_create
+        helper._complete_intent=checked_complete;helper._flush_file=checked_flush
+        digest=Mock(wraps=hashlib.sha256)
+        with patch.object(engine_validation,'hashlib',SimpleNamespace(sha256=digest)),\
+                patch('fingerprint_continuity.create_baseline',side_effect=baseline),\
+                patch('fingerprint_continuity.verify_continuity',side_effect=verify):
+            request=self.request(2);self.creator.start(request);self.creator._run(request['request_id'])
+        self.assertEqual(self.creator.status(request['request_id'])['completed'],2)
+        self.assertEqual(digest.call_count,2)
+        self.assertEqual(closed,[True,True]);self.assertNotEqual(*item_digests)
+        for stage in ('runtime','first_probe','second_probe','third_probe','commit'):
+            self.assertEqual(events.count(stage),2)
+        self.assertGreaterEqual(events.count('flush'),6)
+        self.assertEqual(len(self.service.store.all()),2)
+
+    @unittest.skipUnless(os.name=='nt','Windows protected engine file handles')
+    def test_creation_scope_releases_engine_on_probe_failure(self):
+        import engine_validation
+        seen=[];runtime=self.service._runtime
+        def checked_runtime(profile,previous):
+            seen.append(engine_validation.digest_file(self.executable))
+            with self.assertRaises(PermissionError):self.executable.unlink()
+            return runtime(profile,previous)
+        def fail_probe(*args):
+            self.assertEqual(engine_validation.digest_file(self.executable),seen[0])
+            raise LocalBrowserError('合成环境验证失败')
+        self.service._runtime=checked_runtime
+        digest=Mock(wraps=hashlib.sha256)
+        with patch.object(engine_validation,'hashlib',SimpleNamespace(sha256=digest)),\
+                patch('fingerprint_continuity.verify_continuity',side_effect=fail_probe):
+            request=self.request();self.creator.start(request);self.creator._run(request['request_id'])
+        self.assertEqual(digest.call_count,1)
+        self.assertEqual(self.creator.status(request['request_id'])['failed'],1)
+        self.assertIsNone(engine_validation._active.get())
+        self.assertEqual(self.service.store.all(),[])
+        self.executable.write_bytes(b'released after failed item')
 
     def test_cancel_preserves_completed_and_drops_unneeded_private_specs(self):
         request=self.request(3)

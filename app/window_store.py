@@ -15,6 +15,10 @@ from profile_model import defaults,PREFERENCES
 from signature_lifetime import signature_lifetime
 
 
+_STATUS_CACHE_LIMIT=2048
+_STATUS_CACHE_MAX_CHARS=4096
+
+
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
@@ -43,6 +47,7 @@ class WindowStore:
     def __init__(self,configuration,root=DATA_ROOT):
         self.root=Path(root).resolve(); self.root.mkdir(parents=True,exist_ok=True)
         self.db=self.root/'windows.sqlite'; self.lock=threading.RLock(); self.configuration=configuration
+        self._status_cache={}; self._status_cache_identity=None; self._status_lock=threading.RLock()
         with self.connect() as con:
             con.execute('CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY,seq INTEGER NOT NULL UNIQUE,created_at TEXT NOT NULL,last_opened_at TEXT,archived INTEGER NOT NULL DEFAULT 0,data BLOB NOT NULL)')
             con.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value BLOB NOT NULL)')
@@ -53,7 +58,10 @@ class WindowStore:
     def connect(self):
         con=sqlite3.connect(self.db,timeout=5)
         try:
-            con.execute('PRAGMA journal_mode=WAL'); con.execute('PRAGMA synchronous=FULL')
+            if con.execute('PRAGMA journal_mode').fetchone()[0].lower()!='wal':
+                if con.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower()!='wal':
+                    raise LocalBrowserError('目录数据库无法启用可靠日志模式，未继续操作。')
+            con.execute('PRAGMA synchronous=FULL')
             yield con
             con.commit()
         except Exception:
@@ -67,7 +75,10 @@ class WindowStore:
         return protect(json.dumps(value,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode(),root=self.root)
     def unpack(self,value):
         from portable_paths import decode_record
-        return decode_record(json.loads(protect(value,decrypt=True,root=self.root)),self.root)
+        return decode_record(self._unpack_encoded(value),self.root)
+
+    def _unpack_encoded(self,value):
+        return json.loads(protect(value,decrypt=True,root=self.root))
 
     def _migrate(self):
         if self.setting('migration_done',False): return
@@ -122,6 +133,57 @@ class WindowStore:
         with self.lock,self.connect() as con:
             rows=con.execute('SELECT data FROM profiles'+('' if include_archived else ' WHERE archived=0')+' ORDER BY seq').fetchall()
         return [self.unpack(row[0]) for row in rows]
+
+    def status_rows(self):
+        """Reuse authenticated display fields; authoritative reads stay uncached."""
+        from portable_vault import PortableVault,PortableVaultError,is_portable
+        from portable_paths import _RUNTIME_PATHS,decode_record
+        with self._status_lock:
+            try:
+                with self.lock,self.connect() as con:
+                    rows=con.execute('SELECT data FROM profiles ORDER BY seq').fetchall()
+                    database=self.db.stat()
+                if not rows:
+                    self._status_cache={}; self._status_cache_identity=None
+                    return []
+                vault=PortableVault(self.root,key_required=(self.root/'portable-mode.bin').exists() or
+                                    any(is_portable(row[0]) for row in rows))
+                identity=(str(self.root),str(self.db.resolve()),database.st_dev,database.st_ino,vault.key_id)
+                previous=self._status_cache if identity==self._status_cache_identity else {}
+                current={}; result=[]
+                for (blob,) in rows:
+                    digest=hashlib.sha256(blob).digest() if is_portable(blob) and database.st_ino else None
+                    value=previous.get(digest) if digest is not None else None
+                    if value is None:
+                        record=self._unpack_encoded(blob)
+                        if not isinstance(record,dict) or not isinstance(record.get('_runtime'),dict):
+                            decode_record(record,self.root)
+                        runtime=record['_runtime']
+                        value={'id':record['id'],'last_opened_at':record.get('last_opened_at'),
+                               'config_status':record.get('config_status','ready'),
+                               '_runtime':{field:copy.deepcopy(runtime[field]) for field in _RUNTIME_PATHS if field in runtime}}
+                        value['_runtime']['signature_provider']=runtime.get('signature_provider','vendor')
+                    # Path ownership can change without changing the encrypted catalog row.
+                    decoded=decode_record(copy.deepcopy(value),self.root)
+                    display={'id':decoded['id'],'last_opened_at':decoded['last_opened_at'],
+                             'config_status':decoded['config_status'],
+                             '_runtime':{'fingerprint_path':decoded['_runtime']['fingerprint_path'],
+                                         'signature_provider':decoded['_runtime']['signature_provider']}}
+                    fields=(value['id'],value['last_opened_at'],value['config_status'],
+                            *value['_runtime'].values())
+                    # Retain bounded display fields and encoded paths, never full records or ciphertext.
+                    if (digest is not None and len(current)<_STATUS_CACHE_LIMIT and
+                            all(item is None or isinstance(item,str) for item in fields) and
+                            sum(len(item or '') for item in fields)<=_STATUS_CACHE_MAX_CHARS):
+                        current[digest]=value
+                    result.append(display)
+                self._status_cache=current; self._status_cache_identity=identity
+                return result
+            except Exception as error:
+                self._status_cache={}; self._status_cache_identity=None
+                if isinstance(error,PortableVaultError):
+                    raise LocalBrowserError('文件夹密钥缺失、损坏或与资料不匹配，未读取状态。') from None
+                raise
 
     def put(self,record,include_group=False):
         with self.lock,self.connect() as con:

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
@@ -12,7 +13,19 @@ from browser_core import APP_ROOT,DATA_ROOT
 from manager_service import ManagerService
 from installation import initialize_installation
 
-TITLE='本地指纹浏览器'
+BASE_TITLE='本地指纹浏览器'
+
+def _window_title():
+    try:
+        with (APP_ROOT.parent/'VERSION').open(encoding='utf-8-sig') as handle:
+            version=handle.read(129).strip()
+        if len(version)<=128 and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?',version):
+            return BASE_TITLE+' v'+version
+    except (OSError,UnicodeError):
+        pass
+    return BASE_TITLE
+
+TITLE=_window_title()
 
 class Bridge:
     def __init__(self,service): self._service=service
@@ -23,6 +36,7 @@ def _focus_existing_manager():
     user=ctypes.WinDLL('user32')
     user.FindWindowExW.argtypes=[wintypes.HWND,wintypes.HWND,wintypes.LPCWSTR,wintypes.LPCWSTR]
     user.FindWindowExW.restype=wintypes.HWND
+    user.GetWindowTextW.argtypes=[wintypes.HWND,wintypes.LPWSTR,ctypes.c_int]
     user.GetWindowThreadProcessId.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.DWORD)]
     user.ShowWindow.argtypes=[wintypes.HWND,ctypes.c_int]
     user.SetForegroundWindow.argtypes=[wintypes.HWND]
@@ -30,8 +44,11 @@ def _focus_existing_manager():
     runtime=Path(sys.executable).resolve().parent
     window=None
     for _ in range(1024):
-        window=user.FindWindowExW(None,window,None,TITLE)
+        window=user.FindWindowExW(None,window,None,None)
         if not window:return False
+        title=ctypes.create_unicode_buffer(256)
+        user.GetWindowTextW(window,title,len(title))
+        if title.value!=BASE_TITLE and not title.value.startswith(BASE_TITLE+' v'):continue
         owner=wintypes.DWORD();user.GetWindowThreadProcessId(window,ctypes.byref(owner))
         try:
             process=psutil.Process(owner.value)

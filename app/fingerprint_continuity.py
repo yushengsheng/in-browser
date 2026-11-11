@@ -292,7 +292,8 @@ def _launch_arguments(runtime):
         if not isinstance(arg, str) or '\x00' in arg or '\r' in arg or '\n' in arg:
             raise _blocked(['launch_args'])
         switch = arg.split('=', 1)[0].lower()
-        if switch not in _SAFE_SWITCHES:
+        created_certificate_option=(runtime.get('creation_options_version')==1 and arg=='--ignore-certificate-errors')
+        if switch not in _SAFE_SWITCHES and not created_certificate_option:
             # An unknown argument can load a website, extension or alternative
             # resource. Do not silently drop it and compare a different setup.
             raise _blocked(['launch_args'])

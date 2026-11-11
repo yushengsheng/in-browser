@@ -12,7 +12,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock,patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'app'))
@@ -153,6 +153,22 @@ class SyncReliabilityTests(unittest.TestCase):
         with self.assertRaises(LocalBrowserError):sync.start(keys,preview_id=preview['preview_id'])
         self.assertIsNone(sync.latest())
 
+    def test_preview_metadata_is_display_only_and_confirmation_does_not_refetch_it(self):
+        service,sync,items=fixture(self.root,count=1)
+        key=items[0]['source_key'];before=copy.deepcopy(items)
+        sync.provider.preview_metadata=Mock(return_value={key:{'name':'识别窗口',
+            'remark':'选择前的备注','seq':11}})
+        preview=sync.preview()
+        self.assertEqual(preview['items'][0]['name'],'识别窗口')
+        self.assertEqual(preview['items'][0]['remark'],'选择前的备注')
+        self.assertEqual(preview['items'][0]['seq'],11)
+        self.assertEqual(items,before)
+        self.assertEqual(service.store.all(),[])
+        self.assertIsNone(sync.latest())
+        sync.start([key],preview_id=preview['preview_id'])
+        self.assertEqual(self.wait(sync)['completed'],1)
+        sync.provider.preview_metadata.assert_called_once()
+
     def test_confirmed_start_is_idempotent_after_finish_and_rejects_changed_selection(self):
         service,sync,items=fixture(self.root,count=2)
         preview=sync.preview();keys=[items[0]['source_key']]
@@ -254,6 +270,119 @@ class SyncReliabilityTests(unittest.TestCase):
         self.assertEqual((status['completed'],status['skipped']),(0,3))
         self.assertEqual(service.store.source_bindings(),bindings)
         self.assertEqual(service.store.get(bindings[items[0]['source_key']])['name'],'相同名称')
+
+    def test_progress_does_not_mark_copied_bytes_as_a_committed_window(self):
+        from import_progress import emit
+        service,sync,items=fixture(self.root,count=2)
+        entered=threading.Event();release=threading.Event();original=service._copy_profile
+        def copying(source,target):
+            result=original(source,target)
+            emit('copying',done=10,total=10,unit='bytes')
+            entered.set();release.wait(10)
+            return result
+        service._copy_profile=copying;sync.preview();job=sync.start([i['source_key'] for i in items])
+        try:
+            self.assertTrue(entered.wait(5))
+            status=sync.status(job['job_id'])
+            self.assertEqual(status['completed'],0)
+            self.assertEqual((status['progress']['done'],status['progress']['total']),(10,10))
+            self.assertEqual(status['progress']['index'],1)
+            self.assertEqual(sync.latest()['progress']['phase'],'copying')
+            sync.cancel(job['job_id'])
+        finally:release.set()
+        status=self.wait(sync)
+        self.assertEqual((status['state'],status['completed']),('cancelled',1))
+        self.assertIsNone(status['progress'])
+
+    def test_progress_uses_remaining_item_position_after_history_deletion(self):
+        service,sync,items=fixture(self.root,count=3)
+        sync.state.create('synthetic-job',items)
+        with service.store.connect() as con:
+            con.execute('DELETE FROM sync_items WHERE job_id=? AND ordinal=1',('synthetic-job',))
+            con.execute('UPDATE sync_jobs SET total=2 WHERE job_id=?',('synthetic-job',))
+        sync.state.begin_item('synthetic-job',3)
+        sync.progress.begin('synthetic-job',3,items[2])
+        status=sync.status('synthetic-job')
+        self.assertEqual((status['progress']['index'],status['total']),(2,2))
+        self.assertEqual(sync.progress.finish()['ordinal'],3)
+
+    def test_verified_copy_manifest_is_reused_but_publish_and_recovery_are_rechecked(self):
+        service,sync,items=fixture(self.root,count=1)
+        copied=service._copy_profile;seen=[]
+        def verified(source,target):
+            copied(source,target)
+            return manifest(target)
+        service._copy_profile=verified
+        service._manifest=lambda path:seen.append(path) or manifest(path)
+        sync.preview();sync.start([items[0]['source_key']]);status=self.wait(sync)
+        self.assertEqual(status['completed'],1)
+        # Prepared publication and its authoritative readback still independently hash the tree.
+        self.assertEqual(len(seen),2)
+        saved=service.store.all()[0]
+        self.assertEqual(saved['_source_manifest'],manifest(Path(items[0]['profile_path'])))
+
+    @unittest.skipUnless(os.name=='nt','Windows protected file handles')
+    def test_import_reuses_pinned_engine_digest_and_releases_it_on_failure(self):
+        import engine_validation
+        for fail in (False,True):
+            with self.subTest(fail=fail):
+                service,sync,items=fixture(self.root/str(fail),count=1)
+                engine=self.root/('synthetic-'+str(fail)+'.dll');engine.write_bytes(b'synthetic engine')
+                startup=sync._startup;make_record=sync._record
+                def checked_startup(item):
+                    engine_validation.digest_file(engine)
+                    with self.assertRaises(PermissionError):engine.write_bytes(b'blocked')
+                    return startup(item)
+                def checked_record(*args,**kwargs):
+                    engine_validation.digest_file(engine)
+                    if fail:raise LocalBrowserError('synthetic validation failure')
+                    return make_record(*args,**kwargs)
+                sync._startup=checked_startup;sync._record=checked_record
+                digest=Mock(wraps=hashlib.sha256)
+                with patch.object(engine_validation,'hashlib',SimpleNamespace(sha256=digest)):
+                    sync.preview();sync.start([items[0]['source_key']]);status=self.wait(sync)
+                self.assertEqual(digest.call_count,1)
+                self.assertEqual(status['failed'],int(fail))
+                engine.write_bytes(b'released')
+
+    def test_batch_full_profiles_preserve_all_files_and_resume_without_duplicates(self):
+        from manager_service import ManagerService
+        service,sync,items=fixture(self.root,count=120)
+        service._copy_profile=lambda source,target:ManagerService._copy_profile(service,source,target)
+        service._manifest=ManagerService._manifest
+        before={}
+        for index,item in enumerate(items):
+            source=Path(item['profile_path'])
+            for relative in ('Default/Sessions/Session_1','Default/Session Storage/000001.log',
+                    'Default/Local Storage/leveldb/000001.log','Default/IndexedDB/site/000001.log',
+                    'Default/Extensions/synthetic/1.0/manifest.json','Default/Network/Cookies',
+                    'Default/History','Default/Login Data','.hidden-proof','Local State'):
+                path=source/relative;path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_bytes((str(index)+':'+relative).encode()*9)
+            (source/'Default/empty').mkdir()
+            before[item['source_key']]=manifest(source)
+        copied=service._copy_profile;calls=0
+        def copying(source,target):
+            nonlocal calls
+            result=copied(source,target);calls+=1
+            if calls==37:sync.cancel(sync.active)
+            return result
+        service._copy_profile=copying
+        sync.preview();job=sync.start([i['source_key'] for i in items]);status=self.wait(sync)
+        self.assertEqual((status['state'],status['completed']),('cancelled',37))
+        # Remaining entries can be selected by the next normal preview; cancelled jobs stay cancelled.
+        preview=sync.preview();remaining=[i['source_key'] for i in preview['items'] if i['status']=='ready']
+        self.assertEqual(len(remaining),83)
+        sync.start(remaining,preview_id=preview['preview_id']);status=self.wait(sync)
+        self.assertEqual((status['completed'],status['failed']),(83,0))
+        self.assertEqual(calls,120)
+        bindings=service.store.source_bindings();self.assertEqual(len(set(bindings.values())),120)
+        for item in items:
+            saved=service.store.get(bindings[item['source_key']]);profile=Path(saved['_runtime']['profile_path'])
+            self.assertEqual(manifest(profile),before[item['source_key']])
+            self.assertEqual(manifest(Path(item['profile_path'])),before[item['source_key']])
+            self.assertTrue((profile/'Default/empty').is_dir())
+        self.assertEqual(list(sync.state.intents()),[])
 
     def test_preview_uses_one_binding_read_and_rejects_conflicting_duplicate(self):
         service,sync,items=fixture(self.root,count=1)

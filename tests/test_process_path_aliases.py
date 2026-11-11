@@ -22,9 +22,11 @@ def process(profile, *, helper=False):
     args = ['BitBrowser.exe', '--user-data-dir="' + str(profile) + '"']
     if helper:
         args.append('--type=renderer')
-    return SimpleNamespace(pid=101, info={'cmdline': args, 'create_time': 100},
-                           oneshot=nullcontext, create_time=lambda: 100,
-                           cmdline=lambda: list(args))
+    candidate = SimpleNamespace(pid=101, info={'cmdline': args, 'create_time': 100},
+                                oneshot=nullcontext, create_time=lambda: 100,
+                                cmdline=lambda: list(args))
+    candidate.as_dict = lambda attrs: {name: candidate.info.get(name) for name in attrs}
+    return candidate
 
 
 class ProcessPathAliases(unittest.TestCase):

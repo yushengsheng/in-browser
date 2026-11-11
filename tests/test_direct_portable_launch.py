@@ -101,9 +101,11 @@ class DirectLaunch(unittest.TestCase):
             with self.subTest(component=missing):
                 self.launcher('移动盘 便携目录', missing=missing)
 
-    def manager(self, root, *, present=True):
+    def manager(self, root, *, present=True, version=None):
         app = root / 'app'
         app.mkdir()
+        if version is not None:
+            (root / 'VERSION').write_bytes(version)
         runtime = root / 'runtime/webview2'
         runtime.mkdir(parents=True)
         if present:
@@ -114,6 +116,7 @@ class DirectLaunch(unittest.TestCase):
         captured = {}
         def start(**kwargs):
             captured.update(runtime=webview.settings.get('WEBVIEW2_RUNTIME_PATH'),
+                            title=webview.create_window.call_args.args[0],
                             executable_env=os.environ.get('WEBVIEW2_BROWSER_EXECUTABLE_FOLDER'),
                             user_data_env=os.environ.get('WEBVIEW2_USER_DATA_FOLDER'),
                             browser_args=os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'),
@@ -163,6 +166,27 @@ class DirectLaunch(unittest.TestCase):
             self.assertFalse(captured['browser_args'])
             self.assertFalse(captured['debugger_wait'])
 
+    def test_native_title_reads_version_from_its_bundle(self):
+        with tempfile.TemporaryDirectory(prefix='version-synthetic-') as directory:
+            version = (ROOT / 'VERSION').read_bytes()
+            captured, installations, starts = self.manager(Path(directory), version=version)
+            self.assertEqual((installations, starts), (1, 1))
+            self.assertEqual(captured['title'], '本地指纹浏览器 v' + version.decode('utf-8-sig').strip())
+
+    def test_title_follows_moved_bundle_metadata(self):
+        with tempfile.TemporaryDirectory(prefix='version-synthetic-') as directory:
+            captured, installations, starts = self.manager(Path(directory), version=b'\xef\xbb\xbf9.8.7\r\n')
+            self.assertEqual((installations, starts), (1, 1))
+            self.assertEqual(captured['title'], '本地指纹浏览器 v9.8.7')
+
+    def test_missing_or_invalid_version_does_not_break_startup(self):
+        for version in (None, b'', b'\xff', b'0.2.7\nother', b'9' * 129):
+            with self.subTest(version_present=version is not None), \
+                    tempfile.TemporaryDirectory(prefix='version-synthetic-') as directory:
+                captured, installations, starts = self.manager(Path(directory), version=version)
+                self.assertEqual((installations, starts), (1, 1))
+                self.assertEqual(captured['title'], '本地指纹浏览器')
+
     @staticmethod
     def config_command(app):
         tree = ast.parse((ROOT / 'app/configuration.py').read_text('utf-8-sig'))
@@ -193,14 +217,17 @@ class DirectLaunch(unittest.TestCase):
                 self.assertEqual(command(), [str(bundled), str(root / 'app/config_factory.js')])
                 which.assert_not_called()
 
-    def focus_manager(self, *, match=True, reused_pid=False):
+    def focus_manager(self, *, match=True, reused_pid=False, title='本地指纹浏览器 v9.8.7'):
         with tempfile.TemporaryDirectory(prefix='sibling-manager-fixture-') as directory:
             root=Path(directory)
             apps={11:root/'A/app',22:root/'B/app'}
             python=root/'B/runtime/python/pythonw.exe'
             user=types.SimpleNamespace(FindWindowExW=MagicMock(side_effect=[101,202,0]),
-                GetWindowThreadProcessId=MagicMock(),ShowWindow=MagicMock(),SetForegroundWindow=MagicMock())
+                GetWindowTextW=MagicMock(),GetWindowThreadProcessId=MagicMock(),
+                ShowWindow=MagicMock(),SetForegroundWindow=MagicMock())
             owners={101:11,202:22}
+            def caption(window,buffer,size):buffer.value=title
+            user.GetWindowTextW.side_effect=caption
             def owner(window,pointer):pointer._obj.value=owners[window]
             user.GetWindowThreadProcessId.side_effect=owner
             calls={11:0,22:0}
@@ -214,7 +241,7 @@ class DirectLaunch(unittest.TestCase):
             tree=ast.parse((ROOT/'app/local_browser.pyw').read_text('utf-8-sig'))
             method=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='_focus_existing_manager')
             scope={'ctypes':ctypes,'wintypes':wintypes,'Path':Path,'os':os,'sys':sys,
-                   'APP_ROOT':apps[22],'TITLE':'本地指纹浏览器'}
+                   'APP_ROOT':apps[22],'BASE_TITLE':'本地指纹浏览器'}
             exec(compile(ast.Module(body=[method],type_ignores=[]),'<synthetic_manager>','exec'),scope)
             with patch.object(ctypes,'WinDLL',return_value=user),patch.object(sys,'executable',str(python)),\
                     patch('psutil.Process',side_effect=process):
@@ -227,6 +254,18 @@ class DirectLaunch(unittest.TestCase):
         user.ShowWindow.assert_called_once_with(202,9)
         user.SetForegroundWindow.assert_called_once_with(202)
 
+    def test_existing_unversioned_manager_can_still_be_focused(self):
+        focused,user=self.focus_manager(title='本地指纹浏览器')
+        self.assertTrue(focused)
+        user.ShowWindow.assert_called_once_with(202,9)
+        user.SetForegroundWindow.assert_called_once_with(202)
+
+    def test_unrelated_title_in_same_process_is_not_focused(self):
+        focused,user=self.focus_manager(title='unrelated synthetic dialog')
+        self.assertFalse(focused)
+        user.ShowWindow.assert_not_called()
+        user.SetForegroundWindow.assert_not_called()
+
     def test_same_runtime_with_different_entry_never_focuses(self):
         focused,user=self.focus_manager(match=False)
         self.assertFalse(focused)
@@ -238,6 +277,34 @@ class DirectLaunch(unittest.TestCase):
         self.assertFalse(focused)
         user.ShowWindow.assert_not_called()
         user.SetForegroundWindow.assert_not_called()
+
+    def test_clean_acceptance_copies_version_and_requires_native_title(self):
+        scope=runpy.run_path(str(ROOT/'tools/verify_clean_start.py'),run_name='clean_acceptance_fixture')
+        with tempfile.TemporaryDirectory(prefix='clean-title-synthetic-') as directory:
+            root=Path(directory)
+            with patch.dict(scope['_prepare'].__globals__, _copy_tree=lambda source,target:target.mkdir()):
+                app=scope['_prepare'](root)
+            version=(root/'VERSION').read_text('utf-8-sig').strip()
+            self.assertEqual((root/'VERSION').read_bytes(), (ROOT/'VERSION').read_bytes())
+            expected='本地指纹浏览器 v'+version
+            launcher,report,nonce=scope['_ui_launcher'](app,root,expected)
+            self.assertIn('EXPECTED_TITLE='+repr(expected), launcher.read_text('utf-8'))
+            self.assertIn("document.title === '本地指纹浏览器'", scope['_readiness_expression']('about:blank'))
+            captions={101:expected,202:'本地指纹浏览器'}
+            user=types.SimpleNamespace(**{name:MagicMock() for name in ('EnumWindows','IsWindowVisible',
+                'GetWindowThreadProcessId','GetWindowTextW','GetWindowRect','PostMessageW')})
+            user.EnumWindows.side_effect=lambda callback,_:all(callback(window,0) for window in captions)
+            user.IsWindowVisible.return_value=True
+            def owner(window,pointer):pointer._obj.value=22
+            def caption(window,buffer,size):buffer.value=captions[window]
+            def rectangle(window,pointer):
+                pointer._obj.right=1460;pointer._obj.bottom=920
+                return True
+            user.GetWindowThreadProcessId.side_effect=owner
+            user.GetWindowTextW.side_effect=caption
+            user.GetWindowRect.side_effect=rectangle
+            with patch.object(ctypes,'WinDLL',return_value=user):
+                self.assertEqual(scope['Windows'](expected).visible(22), [101])
 
 
 if __name__ == '__main__':

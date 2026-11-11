@@ -23,22 +23,31 @@ class ProfileProcessSnapshot:
         self.incomplete = False
         names = {'bitbrowser.exe', *(str(name).casefold() for name in browser_names)}
         try:
-            for process in psutil.process_iter(['pid', 'cmdline', 'exe', 'create_time', 'name']):
+            # Keep every command line; defer metadata unused by the profile index.
+            for process in psutil.process_iter(['pid', 'cmdline']):
                 try:
                     info = process.info
                     self._pids.add(process.pid)
                     args = info.get('cmdline')
                     if not args:
                         self._unreadable_pids.add(process.pid)
-                        if (str(info.get('name') or '').casefold() in names or
-                                Path(info.get('exe') or '').name.casefold() in names):
+                        details = process.as_dict(attrs=['name', 'exe'])
+                        if (str(details.get('name') or '').casefold() in names or
+                                Path(details.get('exe') or '').name.casefold() in names):
                             self.incomplete = True
                         continue
-                    for value in _switch_values(args, '--user-data-dir'):
-                        if value:
-                            key = self._profile_key(value.strip('"'))
-                            self._occupied.add(key)
-                            if _is_browser(args):self._profiles.setdefault(key, {})[process.pid] = info.get('create_time')
+                    values = [value for value in _switch_values(args, '--user-data-dir') if value]
+                    if not values:
+                        continue
+                    main_process = _is_browser(args)
+                    created = process.as_dict(attrs=['create_time']).get('create_time') if main_process else None
+                    for value in values:
+                        key = self._profile_key(value.strip('"'))
+                        self._occupied.add(key)
+                        if main_process:self._profiles.setdefault(key, {})[process.pid] = created
+                except psutil.NoSuchProcess:
+                    self._pids.discard(process.pid)
+                    self._unreadable_pids.discard(process.pid)
                 except (psutil.Error, OSError, ValueError, TypeError):
                     self.incomplete = True
         except (psutil.Error, OSError, ValueError):

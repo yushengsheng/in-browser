@@ -338,7 +338,7 @@ class PreparedSources:
 
 
 def _reader(configuration):
-    """Use the owner's normal session only for first preparation, never for launch."""
+    """Use the owner's session for metadata preview or preparation, never launch."""
     values=globals_for(configuration) if (configuration.vendor_data/'db.sqlite').is_file() else {}
     session=configuration.root/'vendor-session.bin'
     if not values.get('app_token') and session.is_file():values=read_encrypted(session,root=configuration.root)

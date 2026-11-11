@@ -276,7 +276,10 @@ def main(argv=None):
             entries.append(run_command('proxy-deadline', [python, '-B', str(deadline_test)], 'unittest', env))
             removed_test = ROOT / 'tests/test_removed_features.py'
             entries.append(run_command('removed-features', [python, '-B', str(removed_test)], 'unittest', env))
-            for filename in ('test_sync_reliability.py','test_source_preparation.py','test_batch_status.py','test_profile_delete.py','test_delete_integration.py','test_background_probe.py','test_legacy_sources.py','test_core_compatibility.py','test_ip_info_page.py','test_proxy_runtime_stability.py','test_clean_install.py','test_launch_paths.py','test_release_boundary.py','test_process_path_aliases.py','test_environment_compatibility.py'):
+            entries.append(run_command('window-layout', [python, '-B', str(ROOT/'tests/test_window_layout.py')], 'unittest', env))
+            for filename in ('test_status_projection.py', 'test_signature_status.py'):
+                entries.append(run_command(filename, [python, '-B', str(ROOT/'tests'/filename)], 'unittest', env))
+            for filename in ('test_sync_reliability.py','test_source_preparation.py','test_import_progress.py','test_profile_copy.py','test_batch_status.py','test_profile_delete.py','test_delete_integration.py','test_background_probe.py','test_legacy_sources.py','test_core_compatibility.py','test_ip_info_page.py','test_proxy_runtime_stability.py','test_clean_install.py','test_launch_paths.py','test_release_boundary.py','test_process_path_aliases.py','test_environment_compatibility.py'):
                 entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
             installation = ROOT / 'tests/test_installation_inspector.py'
             entries.append(run_command('installation-inspector', [python, '-B', str(installation)], 'unittest', env))
@@ -285,6 +288,8 @@ def main(argv=None):
             creation = ROOT / 'tests/test_window_creation.py'
             entries.append(run_command('window-creation', [python, '-B', str(creation)], 'unittest', env))
             entries.append(run_command('creation-parity', [python, '-B', str(ROOT/'tests/test_creation_parity.py')], 'unittest', env))
+            entries.append(run_command('creation-runtime', [python, '-B', str(ROOT/'tests/test_creation_runtime.py')], 'unittest', env))
+            entries.append(run_command('creation-audit', [python, '-B', str(ROOT/'tests/test_creation_audit.py')], 'unittest', env))
             entries.append(run_command('bundled-core-creation', [python, '-B', str(ROOT/'tests/test_bundled_core_creation.py')], 'unittest', env))
             entries.append(run_command('portable-transfer', [python, '-B', str(ROOT/'tests/test_portable_transfer.py')], 'unittest', env))
             entries.append(run_command('direct-portable-launch', [python, '-B', str(ROOT/'tests/test_direct_portable_launch.py')], 'unittest', env))
