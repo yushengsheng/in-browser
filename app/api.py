@@ -11,7 +11,7 @@ def dispatch(service,action,payload=None):
         elif action=='list': result=service.listing()
         elif action=='status': result=service.statuses()
         elif action=='sync_preview':result=service.synchronizer().preview()
-        elif action=='sync_windows':result=service.synchronizer().start(payload.get('source_keys'))
+        elif action=='sync_windows':result=service.synchronizer().start(payload.get('source_keys'),preview_id=payload.get('preview_id'))
         elif action=='sync_status':result=service.synchronizer().status(payload['job_id'],after=payload.get('after'),missing_ok=payload.get('missing_ok') is True)
         elif action=='cancel_sync':result=service.synchronizer().cancel(payload['job_id'])
         elif action=='resume_sync':result=service.synchronizer().resume(payload['job_id'])

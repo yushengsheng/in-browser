@@ -30,6 +30,7 @@ _MAX_DATABASE_BYTES = 64 * 1024 * 1024
 _DATABASE_TIMEOUT = 10
 _DATABASES = (
     ('Default/Network/Cookies', 'cookies', 'encrypted_value'),
+    ('Default/Cookies', 'cookies', 'encrypted_value'),
     ('Default/Login Data', 'logins', 'password_value'),
     ('Default/Login Data For Account', 'logins', 'password_value'),
 )

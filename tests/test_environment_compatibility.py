@@ -1,14 +1,16 @@
 """Synthetic continuity checks; no account data, browser process, or network."""
 import copy
+import json
 from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'app'))
+sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tests')]
 
 import fingerprint_continuity as continuity
+from core_specs import CORE_SPECS
 from environment_compatibility import compatibility_candidate, validated_environment_args
 from local_state import LocalBrowserError
 
@@ -253,18 +255,20 @@ class VendorCompatibleContinuityTests(ContinuityFixture):
         }
         self.variations['fonts.metrics'][0][1][0] = 201.25
 
-    def test_nine_stock_verified_variations_pass_one_original_probe_without_mutation(self):
-        self.record['_runtime']['environment_args'] = [NO_MOTION, *GPU]
-        before = copy.deepcopy(self.record)
-        result, seen = self.verify([self.sample(self.variations)], allow_device_variance=True)
-        self.assertTrue(result['passed'])
-        self.assertEqual(result['verification_policy'], 'vendor-compatible-148')
-        self.assertEqual(result['device_variance_fields'], sorted(self.variations))
-        self.assertEqual(result['environment_args'], [])
-        self.assertEqual(seen, [[]])
-        self.assertEqual(self.record, before)
-        self.assertEqual(self.probe_records[0]['_native'], before['_native'])
-        self.assertEqual(self.probe_records[0]['_runtime']['launch_args'], before['_runtime']['launch_args'])
+    def test_all_supported_cores_accept_nine_bounded_variations_without_mutation(self):
+        for major in CORE_SPECS:
+            with self.subTest(core=major):
+                self.record['_runtime'].update(core_major=major, environment_args=[NO_MOTION, *GPU])
+                before = copy.deepcopy(self.record)
+                result, seen = self.verify([self.sample(self.variations)], allow_device_variance=True)
+                self.assertTrue(result['passed'])
+                self.assertEqual(result['verification_policy'], 'vendor-compatible-' + major)
+                self.assertEqual(result['device_variance_fields'], sorted(self.variations))
+                self.assertEqual(result['environment_args'], [])
+                self.assertEqual(seen, [[]])
+                self.assertEqual(self.record, before)
+                self.assertEqual(self.probe_records[0]['_native'], before['_native'])
+                self.assertEqual(self.probe_records[0]['_runtime']['launch_args'], before['_runtime']['launch_args'])
 
     def test_unchanged_device_has_an_empty_variance_report(self):
         result, seen = self.verify([self.sample()], allow_device_variance=True)
@@ -275,21 +279,42 @@ class VendorCompatibleContinuityTests(ContinuityFixture):
         self.assertEqual(seen, [[]])
 
     def test_default_and_explicit_strict_verification_still_require_exact_baseline(self):
-        for enabled in (None, False, 1, 'true'):
-            with self.subTest(enabled=enabled), self.assertRaises(LocalBrowserError) as raised:
-                self.verify([self.sample(self.variations), self.sample(self.variations)],
-                            allow_device_variance=enabled)
-            self.assertEqual(raised.exception.probe_count, 2)
-            self.assertEqual(raised.exception.changed_fields, sorted(self.variations))
+        for major in CORE_SPECS:
+            self.record['_runtime']['core_major'] = major
+            for enabled in (None, False, 1, 'true'):
+                with self.subTest(core=major, enabled=enabled), self.assertRaises(LocalBrowserError) as raised:
+                    self.verify([self.sample(self.variations), self.sample(self.variations)],
+                                allow_device_variance=enabled)
+                self.assertEqual(raised.exception.probe_count, 2)
+                self.assertEqual(raised.exception.changed_fields, sorted(self.variations))
 
-    def test_other_core_or_signing_provider_remain_strict(self):
-        for major, provider in (('124', 'local-v1'), ('150', 'local-v1'), ('148', 'vendor'), ('148', None)):
+    def test_unknown_core_or_other_signing_provider_remain_strict(self):
+        for major, provider in (('108', 'local-v1'), ('999', 'local-v1'), ('148.0.0.1', 'local-v1'),
+                                ('148', 'vendor'), ('148', None)):
             with self.subTest(major=major, provider=provider):
                 self.record['_runtime'].update(core_major=major, signature_provider=provider)
                 with self.assertRaises(LocalBrowserError) as raised:
                     self.verify([self.sample(self.variations), self.sample(self.variations)],
                                 allow_device_variance=True)
                 self.assertEqual(raised.exception.probe_count, 2)
+
+    def test_all_supported_cores_keep_value_completeness_and_binding_guards(self):
+        for major in CORE_SPECS:
+            self.record['_runtime']['core_major'] = major
+            before = copy.deepcopy(self.record)
+            cases = [self.sample({'devices.kinds': {'audioinput': True, 'audiooutput': 1, 'videoinput': 0}}),
+                     self.sample({'navigator.userAgent': 'synthetic-changed'}),
+                     self.sample(self.variations, missing=['canvas.geometry']),
+                     self.sample(self.variations, unstable=['fonts.metrics'])]
+            for sample in cases:
+                with self.subTest(core=major, sample=sample), self.assertRaises(LocalBrowserError):
+                    self.verify([sample, copy.deepcopy(sample)], allow_device_variance=True)
+                self.assertEqual(self.record, before)
+            with self.subTest(core=major, binding=True), self.assertRaises(LocalBrowserError) as raised:
+                self.verify([], bindings=[{'synthetic': 'changed'}], allow_device_variance=True)
+            self.assertEqual(raised.exception.probe_count, 0)
+            self.assertEqual(raised.exception.changed_fields, ['binding'])
+            self.assertEqual(self.record, before)
 
     def test_non_device_signals_are_not_accepted_alone_or_with_all_device_variations(self):
         changes = {
@@ -416,6 +441,67 @@ class VendorCompatibleContinuityTests(ContinuityFixture):
                     self.assertIn(field, raised.exception.changed_fields)
                 finally:
                     self.record['_continuity']['stable'][field] = original
+
+
+class ExactBuildGateTests(unittest.TestCase):
+    def setUp(self):
+        # Reuse the authenticated, deliberately non-executable synthetic native tree.
+        from test_vendor_runtime_restore import VendorRestoreTests
+        VendorRestoreTests.setUp(self)
+
+    def test_same_major_unknown_build_never_reaches_device_policy_or_popen(self):
+        import app_paths
+        import browser_core
+        import signature_lifetime
+        from local_signer import LocalSigner
+        from portable_vault import PortableVault
+
+        data = self.root / 'app/data'
+        PortableVault(data).initialize()
+        signer = LocalSigner(data)
+        executable = self.store.ensure('148', self.root / 'vendor-source/BitBrowser.exe', signer.public_der)
+        signature = data / 'synthetic.bin'
+        signature.write_bytes(signer._sign_payload(bytes(32)))
+        runtime = {'core_path': str(executable), 'core_major': '148',
+                   'core_sha256': browser_core.sha256(executable),
+                   'fingerprint_path': str(signature), 'fingerprint_sha256': browser_core.sha256(signature),
+                   'signature_provider': 'local-v1', 'signature_key_id': signer.key_id,
+                   'launch_args': []}
+        options = signature_lifetime.runtime_signature_options(runtime, data)
+        with patch.object(app_paths, 'APP_ROOT', self.root / 'app'):
+            # The original exact tree and signature pass the real production verifier.
+            signature_lifetime.require_current_signature(signature, core_major='148', **options)
+            chrome = executable.parent / 'chrome.dll'
+            modified = bytearray(chrome.read_bytes())
+            modified[-1] ^= 1
+            chrome.write_bytes(modified)
+            manifest_path = executable.parent / 'manifest.json'
+            manifest = json.loads(manifest_path.read_text('utf-8'))
+            manifest['files']['chrome.dll']['sha256'] = browser_core.sha256(chrome)
+            manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+
+            values = ContinuityFixture()
+            values.setUp()
+            record = values.record
+            record['_runtime'] = runtime
+            record['_continuity']['binding'] = continuity.binding_for(record, data)
+            before = copy.deepcopy(record)
+            with patch.object(continuity, '_LoopbackPage'), \
+                    patch.object(continuity, 'profile_processes', return_value=[]), \
+                    patch.object(browser_core, '_profile_browsers', return_value=[]), \
+                    patch.object(browser_core.subprocess, 'Popen') as popen, \
+                    patch.object(signature_lifetime, 'require_current_signature',
+                                 wraps=signature_lifetime.require_current_signature) as authentication, \
+                    patch.object(continuity, 'vendor_device_differences',
+                                 wraps=continuity.vendor_device_differences) as policy:
+                with self.assertRaises(LocalBrowserError):
+                    continuity.verify_continuity(record, data, allow_device_variance=True)
+                self.assertEqual(authentication.call_count, 1)
+                popen.assert_not_called()
+                policy.assert_not_called()
+            self.assertEqual(record, before)
+            with self.assertRaises(LocalBrowserError):
+                self.store.validate(executable, signer.key_id, '148')
 
 
 if __name__ == '__main__':

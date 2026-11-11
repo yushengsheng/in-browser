@@ -258,6 +258,82 @@ function fixture() {
   return { context, state, element, nodes, timers, toasts, confirmations, serviceErrors, setting, renderProfiles, refreshProfiles, nativeConfirmAction };
 }
 
+test("batch search matches any remark and ignores case, blank lines and duplicates", () => {
+  const h = fixture();
+  h.state.profiles = Array.from({ length: 6 }, (_, index) => ({
+    id: `search-${index}`, seq: index + 1, name: `Synthetic window ${index + 1}`,
+    remark: `person${index + 1}@example.invalid`, archived: index === 5,
+  }));
+  h.state.search = " PERSON4@example.invalid\r\nperson2@example.invalid\n\n person1@example.invalid ; person3@example.invalid，PERSON4@example.invalid ";
+  assert.deepEqual(Array.from(h.context.filteredProfiles(), (p) => p.id),
+    ["search-0", "search-1", "search-2", "search-3"]);
+  h.state.search = "person6@example.invalid";
+  assert.equal(h.context.filteredProfiles().length, 0);
+});
+
+test("batch search supports ten proxy IPs and rejects eleven without truncation", () => {
+  const h = fixture();
+  h.state.profiles = Array.from({ length: 11 }, (_, index) => ({
+    id: `search-${index}`, seq: index + 1, proxy: { host: `192.0.2.${index + 1}`, port: 8000 },
+  }));
+  const queries = h.state.profiles.map((p) => p.proxy.host);
+  h.state.search = queries.slice(0, 10).join("\n");
+  assert.equal(h.context.filteredProfiles().length, 10);
+  h.state.search += "\n" + queries[0].toUpperCase();
+  assert.equal(h.context.filteredProfiles().length, 10);
+  h.state.search = queries.join("\n");
+  assert.equal(h.context.filteredProfiles().length, 0);
+  h.renderProfiles();
+  assert.equal(h.element("#search-input")["aria-invalid"], "true");
+  assert.equal(h.element("#search-feedback").hidden, false);
+  assert.match(h.element("#search-feedback").textContent, /最多支持 10 项，当前 11 项/);
+  assert.equal(h.element("#profile-rows").innerHTML, "");
+  assert.equal(h.element("#empty-state h3").textContent, "搜索项超过上限");
+});
+
+test("batch search keeps field coverage, phrase matching, filters and sorting", () => {
+  const h = fixture();
+  h.state.profiles = [
+    { id: "first", seq: 1, name: "Blue room", remark: "shared", group: "A", tags: ["work"], status: "running", proxy: { host: "192.0.2.31", port: 8101 } },
+    { id: "second", seq: 2, name: "Blue other room", remark: "shared", group: "B", tags: ["work"], status: "running" },
+    { id: "third", seq: 3, name: "Third", remark: "shared", group: "A", tags: ["other"], status: "running" },
+    { id: "fourth", seq: 4, name: "Fourth", remark: "shared", group: "A", tags: ["work"], status: "closed" },
+  ];
+  h.state.search = "blue room";
+  assert.deepEqual(Array.from(h.context.filteredProfiles(), (p) => p.id), ["first"]);
+  for (const term of ["blue room", "1", "192.0.2.31", "8101", "work", "A"]) {
+    h.state.search = `missing; ${term}`;
+    assert.ok(h.context.filteredProfiles().some((p) => p.id === "first"));
+  }
+  h.state.search = "shared\nmissing";
+  h.state.group = "A"; h.state.tag = "work"; h.state.filter = "running";
+  assert.deepEqual(Array.from(h.context.filteredProfiles(), (p) => p.id), ["first"]);
+  h.state.group = ""; h.state.tag = ""; h.state.filter = "all";
+  h.state.sort = "seq"; h.state.direction = -1;
+  assert.deepEqual(Array.from(h.context.filteredProfiles(), (p) => p.id), ["fourth", "third", "second", "first"]);
+  h.state.search = "\n ; ， \n";
+  assert.equal(h.context.filteredProfiles().length, 4);
+});
+
+test("multiline search resets pagination and clearing filters restores the input", () => {
+  const h = fixture();
+  h.context.renderProfiles = h.renderProfiles;
+  const input = h.element("#search-input");
+  h.state.page = 4;
+  input.value = "one\ntwo\nthree\nfour\nfive";
+  input.oninput({ target: input });
+  assert.equal(h.state.search, input.value);
+  assert.equal(h.state.page, 1);
+  assert.equal(input.rows, 4);
+  assert.match(h.element("#search-feedback").textContent, /批量搜索 5 项/);
+  h.element("#clear-filters").onclick();
+  assert.equal(h.state.search, "");
+  assert.equal(input.value, "");
+  assert.equal(input.rows, 1);
+  assert.equal(input["aria-invalid"], "false");
+  assert.equal(h.element("#search-feedback").hidden, true);
+});
+
 test("discarded settings never change single or batch close confirmation", async () => {
   const h = fixture();
   h.state.settings = { confirm_close: true };
@@ -609,7 +685,7 @@ test("independent guidance includes complete new local sources and keeps per-sou
   assert.match(h.element("#empty-state p").textContent, /检查并导入比特本机完整窗口资料/);
   h.state.sync.loading = true;
   h.context.renderSync();
-  assert.match(h.element("#sync-source-note").textContent, /无需启动原客户端、原厂授权或联网/);
+  assert.match(h.element("#sync-source-note").textContent, /先自动检测本机来源.*开始同步.*才复制资料/);
   assert.match(h.element("#sync-explanation").textContent, /在比特中打开过的新窗口均会参与检查/);
   assert.match(h.element("#sync-preview-summary").textContent, /正在检查本机来源配置及完整资料/);
   h.state.sync.loading = false;
@@ -657,13 +733,68 @@ function syncStatus(overrides = {}) {
   };
 }
 
+test("sync entry only detects and explicit start submits its preview receipt once", async () => {
+  const h = fixture(), calls = [];
+  h.context.api = async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "sync_preview") return { preview_id: "detected-fixture", items: [
+      { source_key: "ready-fixture", name: "Synthetic", status: "ready", has_local_data: true },
+      { source_key: "busy-fixture", name: "Synthetic busy", status: "source_open" },
+    ] };
+    if (action === "sync_windows") return { job_id: "fixture-job" };
+    return syncStatus({ state: "completed", total: 1, completed: 1 });
+  };
+  h.element("#create-button").onclick();
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.map((call) => call.action), ["sync_preview"]);
+  assert.equal(h.state.sync.jobId, null);
+  assert.match(h.element("#sync-preview-summary").textContent, /可导入 1 个/);
+  assert.equal(h.element("#sync-start").textContent, "开始同步 1 个窗口");
+  await h.context.startSync();
+  await new Promise(setImmediate);
+  assert.equal(calls.filter((call) => call.action === "sync_windows").length, 1);
+  assert.equal(calls.find((call) => call.action === "sync_windows").payload.preview_id, "detected-fixture");
+});
+
+test("closing detection before its response never starts copying and redetection replaces the receipt", async () => {
+  const h = fixture(), pending = deferred(), calls = [];
+  h.context.api = async (action) => { calls.push(action); return pending.promise; };
+  h.context.openSyncDialog({ autoStart: true });
+  h.context.closeSyncDialog();
+  pending.resolve({ preview_id: "first-fixture", items: [{ source_key: "ready-fixture", status: "ready" }] });
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, ["sync_preview"]);
+  assert.equal(h.state.sync.jobId, null);
+  h.context.api = async () => ({ preview_id: "second-fixture", items: [] });
+  await h.context.loadSyncPreview();
+  assert.equal(h.state.sync.previewId, "second-fixture");
+  assert.equal(h.state.sync.selected.size, 0);
+  assert.equal(h.element("#sync-start").disabled, true);
+});
+
+test("missing or failed detection cannot reuse an older receipt or start copying", async () => {
+  const h = fixture();
+  h.state.sync.previewId = "old-fixture";
+  h.context.api = async () => ({ items: [{ source_key: "ready-fixture", status: "ready" }] });
+  await h.context.loadSyncPreview();
+  assert.equal(h.state.sync.previewId, null);
+  assert.equal(h.element("#sync-start").disabled, true);
+  h.state.sync.preview = [{ source_key: "ready-fixture", status: "ready" }];
+  h.state.sync.selected.add("ready-fixture");
+  let calls = 0;
+  h.context.api = async () => { calls++; };
+  await h.context.startSync();
+  assert.equal(calls, 0);
+  assert.match(h.state.sync.error, /重新检测/);
+});
+
 test("10k candidates keep all rows available and cap each cross-page batch at 9999", async () => {
   const h = fixture();
   const candidates = Array.from({ length: 10000 }, (_, i) => ({
     source_key: `fixture-${i}`, name: `Window ${i}`, seq: i + 1,
     status: "ready", has_local_data: true,
   }));
-  h.context.api = async () => ({ items: [...candidates, candidates[0], null] });
+  h.context.api = async () => ({ preview_id: "fixture-preview", items: [...candidates, candidates[0], null] });
   await h.context.loadSyncPreview();
   assert.equal(h.state.sync.preview.length, 10000);
   assert.equal(h.state.sync.selected.size, 9999);
@@ -699,6 +830,7 @@ test("10k candidates keep all rows available and cap each cross-page batch at 99
   const first = h.context.startSync();
   await h.context.startSync();
   assert.equal(requests.length, 1);
+  assert.equal(requests[0].payload.preview_id, "fixture-preview");
   const keys = requests[0].payload.source_keys;
   assert.equal(keys.length, 9999);
   assert.equal(new Set(keys).size, 9999);
@@ -712,7 +844,7 @@ test("10k candidates keep all rows available and cap each cross-page batch at 99
   assert.equal(h.timers.size, 0);
   assert.match(h.element("#sync-background-note").textContent, /本批未选 1 个来源.*下批同步/);
   const imported = new Set(keys);
-  h.context.api = async () => ({ items: candidates.map((item) => ({
+  h.context.api = async () => ({ preview_id: "fixture-preview", items: candidates.map((item) => ({
     ...item, status: imported.has(item.source_key) ? "already_imported" : "ready",
   })) });
   await h.context.loadSyncPreview();
@@ -1454,13 +1586,13 @@ test("source preview requested before deletion cannot overwrite the refreshed pr
   const h = deletionFixture(), oldPreview = deferred(); let previews = 0;
   h.context.loadSyncPreview = h.loadSyncPreview;
   h.context.api = async (action) => {
-    if (action === "sync_preview") return ++previews === 1 ? oldPreview.promise : { items: [{ source_key: "new-fixture", name: "New fixture", status: "ready" }] };
+    if (action === "sync_preview") return ++previews === 1 ? oldPreview.promise : { preview_id: "fixture-preview", items: [{ source_key: "new-fixture", name: "New fixture", status: "ready" }] };
     return { deleted: true, cleanup_complete: true };
   };
   const old = h.context.loadSyncPreview();
   await h.context.performAction("delete", "fixture-0");
   assert.equal(previews, 2);
-  oldPreview.resolve({ items: [{ source_key: "old-fixture", name: "Old fixture", status: "already_imported" }] }); await old;
+  oldPreview.resolve({ preview_id: "fixture-preview", items: [{ source_key: "old-fixture", name: "Old fixture", status: "already_imported" }] }); await old;
   assert.equal(h.state.sync.preview[0].source_key, "new-fixture");
   assert.equal(h.state.sync.names.has("old-fixture"), false);
   assert.deepEqual(Array.from(h.state.sync.selected), ["new-fixture"]);
@@ -1608,7 +1740,7 @@ test("deleting the final interrupted-job record clears the missing job and loads
       return null;
     }
     assert.equal(action, "sync_preview");
-    return { items: [{ source_key: "available-fixture", name: "Available fixture", status: "ready" }] };
+    return { preview_id: "fixture-preview", items: [{ source_key: "available-fixture", name: "Available fixture", status: "ready" }] };
   };
   await h.context.performAction("delete", "fixture-0");
   assert.deepEqual(calls, ["delete", "sync_status", "sync_preview"]);
@@ -1628,7 +1760,7 @@ test("deletion refreshes a surviving interrupted job's counts and bounded result
   h.context.restoreSyncJob(syncStatus({ state: "interrupted", total: 3, completed: 2, items: [{ name: "Old fixture", status: "completed" }] }));
   h.context.api = async (action, payload) => {
     if (action === "delete") return { deleted: true, cleanup_complete: true };
-    if (action === "sync_preview") { previews++; return { items: [] }; }
+    if (action === "sync_preview") { previews++; return { preview_id: "fixture-preview", items: [] }; }
     assert.equal(action, "sync_status");
     assert.equal(payload.missing_ok, true);
     return syncStatus({ state: "interrupted", total: 2, completed: 1, items: [{ name: "Remaining fixture", status: "completed" }] });
@@ -1660,7 +1792,7 @@ test("a failed post-delete job check retains the interrupted task and a later ex
   assert.ok(h.serviceErrors.some((message) => /同步任务核对失败/.test(message)));
   h.context.api = async (action, payload) => {
     if (action === "sync_status") { assert.equal(payload.missing_ok, true); return null; }
-    assert.equal(action, "sync_preview"); return { items: [] };
+    assert.equal(action, "sync_preview"); return { preview_id: "fixture-preview", items: [] };
   };
   h.context.resumeSyncStatus(); await new Promise(setImmediate);
   assert.equal(h.state.sync.jobId, null);
@@ -1678,7 +1810,7 @@ test("late pre-deletion status and bootstrap replies cannot resurrect a removed 
     if (action === "bootstrap") return oldBootstrap.promise;
     if (action === "sync_status") return payload.missing_ok && h.state.deleteBusy ? null : oldStatus.promise;
     if (action === "delete") return { deleted: true, cleanup_complete: true };
-    assert.equal(action, "sync_preview"); return { items: [] };
+    assert.equal(action, "sync_preview"); return { preview_id: "fixture-preview", items: [] };
   };
   const polling = h.context.pollSyncStatus();
   h.context.confirmAction = async () => confirmation.promise;
@@ -1733,7 +1865,7 @@ test("deletion checks a locally running task that the backend has finished and r
       return null;
     }
     assert.equal(action, "sync_preview");
-    return { items: [{ source_key: "available-fixture", status: "ready" }] };
+    return { preview_id: "fixture-preview", items: [{ source_key: "available-fixture", status: "ready" }] };
   };
   await h.context.performAction("delete", "fixture-0");
   assert.deepEqual(calls, ["delete", "sync_status", "sync_preview"]);
@@ -1750,7 +1882,7 @@ test("a post-delete check keeps a task that the backend still reports running", 
   h.context.restoreSyncJob(syncStatus({ state: "running", completed: 1, total: 3 }));
   h.context.api = async (action, payload) => {
     if (action === "delete") return { deleted: true, cleanup_complete: true };
-    if (action === "sync_preview") { previews++; return { items: [] }; }
+    if (action === "sync_preview") { previews++; return { preview_id: "fixture-preview", items: [] }; }
     assert.equal(action, "sync_status");
     assert.equal(payload.missing_ok, true); checks++;
     return syncStatus({ state: "running", completed: 2, total: 3 });
@@ -1778,7 +1910,7 @@ test("a failed stale-running task check preserves the job and manual status read
   assert.equal(h.state.sync.pollPaused, true);
   h.context.api = async (action, payload) => {
     if (action === "sync_status") { assert.equal(payload.missing_ok, true); return null; }
-    assert.equal(action, "sync_preview"); return { items: [] };
+    assert.equal(action, "sync_preview"); return { preview_id: "fixture-preview", items: [] };
   };
   h.context.resumeSyncStatus(); await new Promise(setImmediate);
   assert.equal(h.state.sync.jobId, null);

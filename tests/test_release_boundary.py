@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -18,10 +19,11 @@ class ReleaseBoundary(unittest.TestCase):
     def source_tree(root):
         names=list(build_release.TOP)+['app/main.py','app/ui/app.js','app/ui/index.html',
                 'app/ui/style.css','app/ui/README.md','app/resources/electron-main.js',
-                'app/resources/crypto.worker.js','app/resources/defaults.json','app/resources/signature-verification-public.der','app/resources/creation-catalog.json']
+                'app/resources/crypto.worker.js','app/resources/defaults.json','app/resources/signature-verification-public.der','app/resources/creation-catalog.json','app/resources/pythonnet.config']
         names+=['analysis/'+name for name in build_release.FIXTURES]
         for name in names:
             path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('synthetic','utf-8')
+        (root/'app/resources/pythonnet.config').write_bytes((ROOT/'app/resources/pythonnet.config').read_bytes())
         return names
 
     def test_only_named_ui_and_resources_are_exported(self):
@@ -42,7 +44,9 @@ class ReleaseBoundary(unittest.TestCase):
             self.source_tree(root)
             runtime=root/'runtime-source'
             (runtime/'python/empty-runtime').mkdir(parents=True)
-            (runtime/'python/python.exe').write_bytes(b'synthetic')
+            for name in build_release.RUNTIME_EXECUTABLES:
+                path=runtime/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'synthetic')
+            (runtime/'python/python.exe.config').write_text('<configuration />','utf-8')
             (root/'app/engines/148/Dictionaries').mkdir(parents=True)
             (root/'app/engines/148/chrome.exe').write_bytes(b'synthetic')
             (root/'app/data').mkdir()
@@ -63,6 +67,12 @@ class ReleaseBoundary(unittest.TestCase):
             for name in ('runtime/python/empty-runtime','app/engines/148/Dictionaries'):
                 self.assertTrue((extracted/name).is_dir())
                 self.assertEqual(list((extracted/name).iterdir()),[])
+            for name in ('python.exe.config','pythonw.exe.config'):
+                path=extracted/'runtime/python'/name
+                self.assertEqual(path.read_bytes(),(root/'app/resources/pythonnet.config').read_bytes())
+                setting=ET.parse(path).find('runtime/loadFromRemoteSources')
+                self.assertIsNotNone(setting)
+                self.assertEqual(setting.get('enabled'),'true')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

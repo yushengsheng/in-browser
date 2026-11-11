@@ -1,4 +1,4 @@
-"""Compare stock and independent 148 only in the synthetic portable package.
+"""Compare stock and independent kernels only in a synthetic portable package.
 
 Without --execute no fixture is opened or changed. This is an offline diagnostic,
 not device acceptance: the production continuity gate and saved baseline remain
@@ -49,21 +49,28 @@ def _vendor_signature(path, configuration, native):
     _require(configuration.decode(path) == native)
 
 
+def _runtime_inventory(folder, major, expected_directories):
+    import local_engine as engine
+    files, directories = engine._inventory(folder)
+    return files, engine._runtime_directories(str(major), files, directories, expected_directories)
+
+
 def _stock_engine(record, fixture, root):
     """Restore only the authenticated public root into a new, bounded copy."""
     import local_engine as engine
     from core_specs import CORE_SPECS
     runtime = record['_runtime']
+    major = str(runtime.get('core_major', '148'))
     executable = fixture._inside(runtime['core_path'], root)
     engine.LocalEngineStore(root / 'app/local-engines').validate(
-        executable, runtime['signature_key_id'], '148')
+        executable, runtime['signature_key_id'], major)
     source = executable.parent
     manifest = fixture._json_file(source / 'manifest.json', root, limit=16 * 1024 * 1024)
     files, directories = manifest['files'], manifest['directories']
     total = sum(item['size'] for item in files.values())
     _require(0 < len(files) <= 10000 and len(directories) <= 10000
              and 0 < total <= _MAX_ENGINE_BYTES)
-    spec = CORE_SPECS['148']
+    spec = CORE_SPECS[major]
     vendor_der = engine._public_der(base64.b64decode(
         manifest['local_trust']['vendor_public_der'], validate=True))
     _require(hashlib.sha256(vendor_der).hexdigest() == engine._VENDOR_DER_SHA256)
@@ -91,8 +98,8 @@ def _stock_engine(record, fixture, root):
         original = fixture._inside(source / name, root)
         copied = fixture._inside(destination / name, root, exists=False)
         shutil.copy2(original, copied, follow_symlinks=False)
-    _require(engine._inventory(destination) == (files, directories)
-             and engine._inventory(source) == (files, directories))
+    _require(_runtime_inventory(destination, major, directories) == (files, directories)
+             and _runtime_inventory(source, major, directories) == (files, directories))
     chrome = fixture._inside(destination / chrome_name, root)
     original_mode = stat.S_IMODE(chrome.stat().st_mode)
     try:
@@ -109,8 +116,8 @@ def _stock_engine(record, fixture, root):
         _require(engine._sha256(resource_path) == resource['sha256'])
     _require(engine._sha256(chrome) == spec['sha256']
              and not (destination / 'manifest.json').exists()
-             and engine._inventory(destination) == (expected, directories)
-             and engine._inventory(source) == (files, directories))
+             and _runtime_inventory(destination, major, directories) == (expected, directories)
+             and _runtime_inventory(source, major, directories) == (files, directories))
     return fixture._inside(destination / executable.name, root), expected, directories
 
 
@@ -135,6 +142,90 @@ def _changed(first, second, continuity):
     return sorted(field for field in first.keys() | second.keys()
                   if continuity._safe_field(field)
                   and (field not in first or field not in second or first[field] != second[field]))
+
+
+def _background_comparison(record, data, root, stock_core, vendor_signature,
+                           configuration, fixture, report):
+    """Use the unchanged production probe shape for both authenticated kernels."""
+    import browser_core
+    import fingerprint_continuity as continuity
+    from browser_processes import profile_processes
+    from signature_lifetime import require_current_signature, runtime_signature_options
+    expected = record['_continuity']['stable']
+    original_popen = browser_core.subprocess.Popen
+    owned = []
+    snapshots = {}
+    report['background_rounds'] = []
+    try:
+        for side in ('vendor', 'local'):
+            probe = copy.deepcopy(record)
+            runtime = probe['_runtime']
+            runtime.update(environment_args=[], initial_urls=[], open_urls_once=[])
+            if side == 'vendor':
+                runtime.update(core_path=str(stock_core), core_sha256=browser_core.sha256(stock_core),
+                    fingerprint_path=str(vendor_signature), fingerprint_sha256=browser_core.sha256(vendor_signature))
+                runtime.pop('signature_provider', None)
+                runtime.pop('signature_key_id', None)
+            core = fixture._inside(runtime['core_path'], root)
+            signature = fixture._inside(runtime['fingerprint_path'], root)
+
+            def launch(arguments, *values, **options):
+                _require(isinstance(arguments, (list, tuple)) and not options.get('shell')
+                         and all(isinstance(argument, str) for argument in arguments))
+                _require(_launch_core(arguments[0], core, fixture, root) == core)
+                profiles = [argument.split('=', 1)[1] for argument in arguments
+                            if argument.startswith('--user-data-dir=')]
+                _require(len(profiles) == 1)
+                profile = fixture._inside(profiles[0], root)
+                _require(profile.name == 'profile' and profile.parent.parent == data
+                         and profile.parent.name.startswith('continuity-probe-')
+                         and not profile_processes(profile, require_inspectable=True))
+                _require(_OFFLINE_ARGUMENTS <= set(arguments) and '--restore-last-session' not in arguments
+                         and arguments[-1] == 'about:blank'
+                         and ('--headless=new' in arguments) == (str(runtime['core_major']) != '104'))
+                _require([argument.split('=', 1)[1] for argument in arguments
+                          if argument.startswith('--fingerprint-config=')] == [str(signature)])
+                _require(browser_core.sha256(core) == runtime['core_sha256']
+                         and browser_core.sha256(signature) == runtime['fingerprint_sha256'])
+                if side == 'vendor':
+                    _vendor_signature(signature, configuration, record['_native'])
+                else:
+                    require_current_signature(signature, core_major=runtime['core_major'],
+                                              **runtime_signature_options(runtime, data))
+                process = original_popen(arguments, *values, **options)
+                owned.append((process, profile))
+                return process
+
+            rounds = []
+            with patch.object(browser_core.subprocess, 'Popen', side_effect=launch):
+                for round_number in (1, 2):
+                    before = len(owned)
+                    sample = continuity.probe_snapshot(probe, data)
+                    _require(len(owned) == before + 1 and owned[-1][0].poll() is not None
+                             and not owned[-1][1].exists())
+                    _require(set(expected) <= sample['values'].keys()
+                             and not set(expected).intersection(sample.get('unstable', [])))
+                    rounds.append({'values': {field: sample['values'][field] for field in expected},
+                                   'unavailable': sample.get('unavailable', [])})
+                    report['background_rounds'].append({'side': side, 'round': round_number,
+                                                       'stable_field_count': len(expected)})
+            merged = continuity._merge_samples(*rounds)
+            report['checks'][side + '_background_stable_complete'] = (
+                not merged['unstable'] and set(merged['values']) == set(expected))
+            _require(report['checks'][side + '_background_stable_complete'])
+            snapshots[side] = merged['values']
+        report['source_vs_vendor_background_changed_fields'] = _changed(expected, snapshots['vendor'], continuity)
+        report['source_vs_local_background_changed_fields'] = _changed(expected, snapshots['local'], continuity)
+        report['vendor_vs_local_background_changed_fields'] = _changed(snapshots['vendor'], snapshots['local'], continuity)
+        report['checks']['same_device_background_vendor_local_46_fields_match'] = (
+            not report['vendor_vs_local_background_changed_fields'])
+        _require(report['checks']['same_device_background_vendor_local_46_fields_match'])
+    finally:
+        report['background_probe_process_count'] = len(owned)
+        report['checks']['background_owned_processes_closed'] = all(
+            process.poll() is not None and not profile_processes(profile, require_inspectable=True)
+            for process, profile in owned)
+        _require(report['checks']['background_owned_processes_closed'])
 
 
 def _close_owned(controller, original_close, owned, profile, fixture):
@@ -176,12 +267,16 @@ def _write_report(root, report, fixture):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
-    if not parser.parse_args(argv).execute:
+    parser.add_argument('--core', choices=('104','112','118','122','124','126','128','130',
+        '132','134','136','138','140','142','144','146','148','150','152','154','156'), default='148')
+    args = parser.parse_args(argv)
+    if not args.execute:
         print(json.dumps({'executed': False, 'requires_execute': True}))
         return 0
     sys.dont_write_bytecode = True
     sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tools')]
     report = {'success': False, 'executed': True, 'diagnostic_only': True,
+              'core': args.core,
               'device_compatibility_not_accepted': True, 'continuity_gate_enforced': False,
               'checks': {}, 'rounds': []}
     fixture = storage = server = server_thread = None
@@ -193,6 +288,7 @@ def main(argv=None):
     try:
         import verify_portable_fixture as fixture
         import verify_login_storage as storage
+        fixture.CORE = args.core
         _require(fixture.ROOT.resolve() == ROOT and storage.ROOT.resolve() == ROOT)
         import app_paths
         _require(app_paths.APP_ROOT.resolve() == (ROOT / 'app').resolve())
@@ -217,7 +313,7 @@ def main(argv=None):
                  and not record['_runtime'].get('local_proxy_port'))
         configuration = Configuration(data)
         _require(configuration.independent)
-        require_current_signature(saved['signature'], core_major='148',
+        require_current_signature(saved['signature'], core_major=args.core,
                                   **runtime_signature_options(record['_runtime'], data))
         _require(configuration.decode(saved['signature']) == saved['native'])
         vendor_signature = fixture._inside(ROOT / 'vendor-signature.bin', ROOT)
@@ -226,6 +322,8 @@ def main(argv=None):
         report['checks']['both_signatures_match_same_native'] = True
         stock_core, stock_files, stock_directories = _stock_engine(record, fixture, ROOT)
         report['checks']['stock_core_exactly_restored'] = True
+        _background_comparison(record, data, ROOT, stock_core, vendor_signature,
+                               configuration, fixture, report)
         original_popen = browser_core.subprocess.Popen
 
         def launch(arguments, *values, **options):
@@ -258,7 +356,7 @@ def main(argv=None):
             if signature == vendor_signature:
                 _vendor_signature(signature, configuration, saved['native'])
             else:
-                require_current_signature(signature, core_major='148',
+                require_current_signature(signature, core_major=args.core,
                                           **runtime_signature_options(runtime, data))
             _require(not profile_processes(profile, require_inspectable=True))
             process = original_popen(arguments, *values, **options)
@@ -383,12 +481,13 @@ def main(argv=None):
                 if stock_core is not None:
                     report['checks']['stock_core_unchanged'] = (
                         not (stock_core.parent / 'manifest.json').exists()
-                        and engine._inventory(stock_core.parent) == (stock_files, stock_directories))
+                        and _runtime_inventory(stock_core.parent, args.core, stock_directories)
+                        == (stock_files, stock_directories))
                 report['success'] = report['success'] and all(report['checks'].values())
             except Exception as error:
                 report['protection_error_type'] = type(error).__name__
                 report['success'] = False
-        report['created_process_count'] = len(owned)
+        report['created_process_count'] = len(owned) + report.get('background_probe_process_count', 0)
         if validated:
             try:
                 _write_report(ROOT, report, fixture)

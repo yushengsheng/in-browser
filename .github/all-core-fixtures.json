@@ -1,0 +1,132 @@
+{
+  "format": 1,
+  "release_tag": "validation-v0.2.6",
+  "fixtures": [
+    {
+      "core": "104",
+      "asset": "all-core-104.zip",
+      "sha256": "abeeca754a6a772aed68ce0c46b6a58511be2c40f88ae55a786bc4d06cbc0f93",
+      "bytes": 137200337
+    },
+    {
+      "core": "112",
+      "asset": "all-core-112.zip",
+      "sha256": "a532c70b5303015329cb0201a49b419ded30b234b60d707ef8574977f3deeeae",
+      "bytes": 141778460
+    },
+    {
+      "core": "118",
+      "asset": "all-core-118.zip",
+      "sha256": "a87854338dd5dc2a063345220235def604ba52df735589069ce984b9b533819a",
+      "bytes": 157369190
+    },
+    {
+      "core": "122",
+      "asset": "all-core-122.zip",
+      "sha256": "507e690625fc04e5732ab44651d0794d985e44d61a7e1825bc1306c494d9069c",
+      "bytes": 167711570
+    },
+    {
+      "core": "124",
+      "asset": "all-core-124.zip",
+      "sha256": "4646f41e2a1011ea7eac46361a659d323d067ac4a5593bb001495c862005d1a5",
+      "bytes": 166594878
+    },
+    {
+      "core": "126",
+      "asset": "all-core-126.zip",
+      "sha256": "15b39740801c469dd3b7972fa13ddfd55e84c6df38315dd9eb0e77de7a5ba4da",
+      "bytes": 169427768
+    },
+    {
+      "core": "128",
+      "asset": "all-core-128.zip",
+      "sha256": "d21520c389129698a93b0bc62f700e1b75d6589e1e7be3db494e0a3a919e2479",
+      "bytes": 171080741
+    },
+    {
+      "core": "130",
+      "asset": "all-core-130.zip",
+      "sha256": "8aeeea189ac40e481d1e3aac385e65d21bab5140ba98f3df11e200c7a5ccb7c8",
+      "bytes": 174807410
+    },
+    {
+      "core": "132",
+      "asset": "all-core-132.zip",
+      "sha256": "43fb2eaa799ca62b541e26db5bcbc5c1865b85bfce40cf932870b9d0d8c03b26",
+      "bytes": 175750224
+    },
+    {
+      "core": "134",
+      "asset": "all-core-134.zip",
+      "sha256": "c6e3ddc9eeb86d801a17c2e3bfa72f87677c004cdacd5cbb940e80b0c0978734",
+      "bytes": 181104971
+    },
+    {
+      "core": "136",
+      "asset": "all-core-136.zip",
+      "sha256": "a6cbf0f2a11da9797dda24a1c2bb44ae26a184d01e2b11643521e00b0655824c",
+      "bytes": 186388055
+    },
+    {
+      "core": "138",
+      "asset": "all-core-138.zip",
+      "sha256": "6459edc5fae71796504a2082e9cc2f5e446328a4cdef6d307e3f9e28429c33d2",
+      "bytes": 188746408
+    },
+    {
+      "core": "140",
+      "asset": "all-core-140.zip",
+      "sha256": "471cb2af4c575821049483bb7b095ce068914ecb3a73c4d3d6df68c004b3c162",
+      "bytes": 192583324
+    },
+    {
+      "core": "142",
+      "asset": "all-core-142.zip",
+      "sha256": "0a65001855fb42f512712655e7701d457c4d90624dcea84adb94751eef188bb8",
+      "bytes": 193867249
+    },
+    {
+      "core": "144",
+      "asset": "all-core-144.zip",
+      "sha256": "901345771bb5cf23a0ca17a6956188c4db2e8405ec06c9553617f9d9534233bc",
+      "bytes": 196318196
+    },
+    {
+      "core": "146",
+      "asset": "all-core-146.zip",
+      "sha256": "772469607d0fc68a2c420c29bc0676e9f713e5f2d2498f810d196a7fc3830c1f",
+      "bytes": 207137150
+    },
+    {
+      "core": "148",
+      "asset": "all-core-148.zip",
+      "sha256": "dc8f22a0f9056e166f65542a4088ca743fb4ecb0a9d6f5add040553e5749a108",
+      "bytes": 206764707
+    },
+    {
+      "core": "150",
+      "asset": "all-core-150.zip",
+      "sha256": "b914e5f2f08934ef6a9020b7532a7d92f2e9c4cc1970160990f7f6cefd10eceb",
+      "bytes": 211230201
+    },
+    {
+      "core": "152",
+      "asset": "all-core-152.zip",
+      "sha256": "359414a6211480dcf6633fe4d7982386dbf75b7b7551f64f7ec5c92277b20ec2",
+      "bytes": 217977999
+    },
+    {
+      "core": "154",
+      "asset": "all-core-154.zip",
+      "sha256": "c5128af50058f273a1f39597f2f2a666a462168c6f1b4cc5f5dd62654b944d31",
+      "bytes": 220688555
+    },
+    {
+      "core": "156",
+      "asset": "all-core-156.zip",
+      "sha256": "cd93842e1b77820c97b0cb325b2ce06074ca63128bf5d71b75382e4565e6de39",
+      "bytes": 222295651
+    }
+  ]
+}

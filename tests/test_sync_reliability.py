@@ -118,6 +118,72 @@ class SyncReliabilityTests(unittest.TestCase):
         self.assertFalse(sync.worker.is_alive())
         return sync.status(sync.active)
 
+    def test_public_preview_is_read_only_and_start_requires_its_receipt(self):
+        from api import dispatch
+        service,sync,items=fixture(self.root,count=1)
+        service.synchronizer=lambda:sync
+        before=manifest(service.root)
+        with patch.object(service,'_copy_profile',side_effect=AssertionError('Unexpected copy')):
+            preview=dispatch(service,'sync_preview')['data']
+            self.assertEqual(preview['counts']['ready'],1)
+            self.assertEqual(preview['expires_in'],600)
+            self.assertEqual(manifest(service.root),before)
+            self.assertIsNone(sync.latest())
+            for payload in ({},{'source_keys':[items[0]['source_key']]},
+                            {'source_keys':[items[0]['source_key']],'preview_id':'wrong'}):
+                self.assertFalse(dispatch(service,'sync_windows',payload)['ok'])
+            self.assertIsNone(sync.latest())
+            self.assertEqual(service.store.all(),[])
+
+    def test_expired_or_replaced_preview_and_changed_source_refuse_before_job_creation(self):
+        service,sync,items=fixture(self.root,count=1)
+        keys=[items[0]['source_key']]
+        first=sync.preview()['preview_id'];second=sync.preview()['preview_id']
+        with self.assertRaises(LocalBrowserError):sync.start(keys,preview_id=first)
+        with patch.object(window_sync.time,'monotonic',return_value=sync.preview_created+601):
+            with self.assertRaises(LocalBrowserError):sync.start(keys,preview_id=second)
+        for change in ('_snapshot','profile_path','info','status'):
+            sync.provider=Provider(copy.deepcopy(items));preview=sync.preview()
+            if change=='info':sync.provider.items[0]['info']['name']='changed'
+            else:sync.provider.items[0][change]='changed'
+            with self.assertRaises(LocalBrowserError):sync.start(keys,preview_id=preview['preview_id'])
+            self.assertIsNone(sync.latest())
+        sync.provider=Provider(copy.deepcopy(items));preview=sync.preview()
+        service.store.commit_import(record('synthetic',items[0]['source_id']),keys[0])
+        with self.assertRaises(LocalBrowserError):sync.start(keys,preview_id=preview['preview_id'])
+        self.assertIsNone(sync.latest())
+
+    def test_confirmed_start_is_idempotent_after_finish_and_rejects_changed_selection(self):
+        service,sync,items=fixture(self.root,count=2)
+        preview=sync.preview();keys=[items[0]['source_key']]
+        job=sync.start(keys,preview_id=preview['preview_id']);status=self.wait(sync)
+        self.assertEqual(status['completed'],1)
+        self.assertEqual(sync.start(keys,preview_id=preview['preview_id']),job)
+        with self.assertRaises(LocalBrowserError):sync.start([items[1]['source_key']],preview_id=preview['preview_id'])
+        self.assertEqual(len(service.store.all()),1)
+        next_preview=sync.preview()
+        self.assertEqual(next_preview['counts']['ready'],1)
+        sync.start([items[1]['source_key']],preview_id=next_preview['preview_id'])
+        self.assertEqual(self.wait(sync)['completed'],1)
+
+    def test_cancelled_confirmed_start_retry_preserves_cancelled_job(self):
+        service,sync,items=fixture(self.root,count=1)
+        preview=sync.preview();keys=[items[0]['source_key']]
+        with patch.object(sync,'_launch',side_effect=lambda identity:setattr(sync,'active',identity)):
+            job=sync.start(keys,preview_id=preview['preview_id'])
+        sync.cancel(job['job_id']);sync._run(job['job_id'])
+        self.assertEqual(sync.status(job['job_id'])['state'],'cancelled')
+        self.assertEqual(sync.start(keys,preview_id=preview['preview_id']),job)
+        self.assertEqual(service.store.all(),[])
+
+    def test_failed_redetection_invalidates_previous_receipt(self):
+        _,sync,items=fixture(self.root,count=1)
+        preview=sync.preview()
+        with patch.object(sync.provider,'discover',side_effect=LocalBrowserError('Synthetic unavailable')):
+            with self.assertRaises(LocalBrowserError):sync.preview()
+        with self.assertRaises(LocalBrowserError):sync.start([items[0]['source_key']],preview_id=preview['preview_id'])
+        self.assertIsNone(sync.latest())
+
     def junction(self,link,target):
         if os.name=='nt':
             result=subprocess.run(['cmd','/c','mklink','/J',str(link),str(target)],

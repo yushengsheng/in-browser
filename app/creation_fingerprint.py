@@ -115,6 +115,28 @@ def random_fingerprint(fp):
     return fp
 
 
+def _font_name_round_trips(name):
+    return isinstance(name,str) and bool(name) and name==name.strip() and ',' not in name
+
+
+def freeze_random_font(configuration,fp):
+    if str(fp.get('fontType'))!='2' or str(fp.get('font') or '').strip():return False
+    requested=copy.deepcopy(fp);requested['fontType']='1'
+    names=configuration._font_config(requested)['Names']
+    names=[name for name in names if _font_name_round_trips(name)]
+    if not names:raise LocalBrowserError('未找到可用于随机选择的字体，请改用系统字体或指定本机已有字体。')
+    count=max(1,min(len(names),max(20,len(names)*3//4)))
+    from fingerprint_continuity import _font_names
+    selected=[];probe={'_native':{'FontConfig':{'Names':selected}}}
+    for name in secrets.SystemRandom().sample(names,count):
+        selected.append(name)
+        try:_font_names(probe)
+        except LocalBrowserError:selected.pop()
+    if not selected:raise LocalBrowserError('未找到可用于随机选择的字体，请改用系统字体或指定本机已有字体。')
+    fp['font']=','.join(sorted(selected))
+    return True
+
+
 def validate_profile(incoming):
     if not isinstance(incoming,dict) or incoming.get('id'):
         raise LocalBrowserError('新建配置格式不正确。')
@@ -193,8 +215,25 @@ def resolve_geo(proxy):
     return checked['geo']
 
 
+def _previous_font_config(fp,previous_native):
+    if str(fp.get('fontType','0')) not in ('1','2') or not isinstance(previous_native,dict):return None
+    font=previous_native.get('FontConfig')
+    if not isinstance(font,dict) or font.get('Files')!=[]:return None
+    names=font.get('Names')
+    if not isinstance(names,list) or not names or any(not isinstance(name,str) or not name.strip() for name in names):return None
+    requested=[name.strip() for name in str(fp.get('font') or '').split(',') if name.strip()]
+    if requested and requested!=names:return None
+    # Automatic IP/noise recompilation must retain the already signed selection,
+    # including older random records whose public font field was left empty.
+    if not requested and str(fp.get('fontType'))=='2' and all(_font_name_round_trips(name) for name in names):
+        fp['font']=','.join(names)
+    return copy.deepcopy(font)
+
+
 def build_native(configuration,profile,previous_native=None):
     """New keys belong only to this new window; imported payloads never enter here."""
+    font=_previous_font_config(profile['fingerprint'],previous_native)
+    if font is None:freeze_random_font(configuration,profile['fingerprint'])
     fp=copy.deepcopy(profile['fingerprint']);prefs=profile['preferences']
     for field in ('lat','lng','precisionData'):
         if fp.get(field)=='':fp[field]=None
@@ -212,14 +251,9 @@ def build_native(configuration,profile,previous_native=None):
     for field in ('mediaDeviceValue','speechVoicesValue','plugins'):
         if isinstance(fp.get(field),(list,dict)):fp[field]=json.dumps(fp[field],ensure_ascii=False)
     if isinstance(fp.get('webgpu'),str):fp['webgpu']=json.loads(fp['webgpu']) if fp['webgpu'].strip() else None
-    font=None
-    if str(fp.get('fontType','0'))!='0':
+    if font is None and str(fp.get('fontType','0'))!='0':
         requested=copy.deepcopy(fp);requested['fontType']='1'
         font=configuration._font_config(requested)
-        if str(fp.get('fontType'))=='2' and not str(fp.get('font') or '').strip():
-            names=font['Names'];count=max(1,min(len(names),max(20,len(names)*3//4)))
-            names=sorted(secrets.SystemRandom().sample(names,count))
-            font['Names']=names;profile['fingerprint']['font']=','.join(names)
     data=catalog()
     payload={'sourceFile':str(configuration.resources/'electron-main.js'),
         'info':{'id':profile['id'],'seq':profile['seq'],'browserFingerPrint':fp,'proxyType':'noproxy',

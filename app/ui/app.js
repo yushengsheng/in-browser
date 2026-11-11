@@ -232,11 +232,11 @@ const state = {
   preparingSave: false,
   sync: {
     preview: [], names: new Map(), selected: new Set(), search: "", page: 1,
-    previewRevision: 0,
+    previewRevision: 0, previewId: null,
     loading: false, starting: false, jobId: null, status: null,
     timer: null, polling: false, pollErrors: 0, pollPaused: false, requestRevision: 0,
     cancelling: false, cancelRequested: false, finishedJobId: null,
-    error: "", returnFocus: null, autoStart: false, deferred: 0,
+    error: "", returnFocus: null, deferred: 0,
   },
 };
 
@@ -391,13 +391,13 @@ function confirmAction(title, message, accept = "确定") {
 function sourceGuidance() {
   if (state.capabilities.independent_runtime) return {
     helpTitle: "导入本机完整窗口",
-    helpDescription: "点击“同步窗口”导入已准备的来源及比特本机完整资料，无需启动原客户端、原厂授权或联网。新建窗口在比特中打开过、资料完整落地并正常关闭后，也会参与来源检查。",
+    helpDescription: "点击“同步窗口”先检测本机来源，查看可同步数量后，再点击“开始同步”复制。新建窗口在比特中打开过、资料完整落地并正常关闭后，也会参与来源检查；没有比特不影响本地已有窗口和新建窗口。",
     helpNotice: "本地副本保留来源指纹，界面仅供查看。只有完整配置、内核和浏览器资料通过检查，来源已正常关闭且复制保存完成才计为成功；缺失配置或资料时会逐项说明原因。",
     listEmpty: "点击“同步窗口”，检查并导入比特本机完整窗口资料",
-    syncNote: "扫描已准备来源及比特本机完整资料，无需启动原客户端、原厂授权或联网",
-    syncExplanation: "已准备来源和在比特中打开过的新窗口均会参与检查，完整配置及资料通过检查后导入独立副本。已导入的副本不会重复、覆盖，来源删除不会删除本地副本。来源运行中请先正常关闭；缺失配置或资料时会说明原因，不会记为成功。",
+    syncNote: "先自动检测本机来源并显示数量，点击“开始同步”后才复制资料",
+    syncExplanation: "已准备来源和在比特中打开过的新窗口均会参与检查。检测只读取本机资料，不复制窗口；检测结果保留10分钟。开始同步后仍须完成配置、内核和完整资料检查，新来源缺少配置时可能需要比特的有效登录会话及联网。已导入副本不会重复、覆盖，来源删除不会删除本地副本。",
     previewLoading: "正在检查本机来源配置及完整资料…",
-    previewEmpty: "未发现可导入的本机来源。新窗口请先在比特中打开，待完整资料落地后正常关闭，再重新预览。",
+    previewEmpty: "未发现可导入的本机来源。没有比特不影响本地已有窗口和新建窗口；比特新窗口请先在比特中打开，待完整资料落地后正常关闭，再重新检测。",
     sourceOpen: "请正常关闭来源窗口后重新预览；完整配置和浏览器资料仍须通过检查。",
     missingData: "此来源缺少完整的本地配置或浏览器资料，暂不能导入。",
   };
@@ -454,7 +454,7 @@ function clearSyncJob() {
   sync.finishedJobId = null;
   sync.pollErrors = 0;
   sync.pollPaused = false;
-  sync.autoStart = false;
+  sync.previewId = null;
   sync.deferred = 0;
   $("#sync-result-list").innerHTML = "";
   showSyncError();
@@ -504,7 +504,7 @@ function restoreSyncJob(status) {
   sync.cancelRequested = Boolean(status.cancel_requested);
   sync.pollErrors = 0;
   sync.pollPaused = false;
-  sync.autoStart = false;
+  sync.previewId = null;
   sync.deferred = 0;
   showSyncError();
   renderSync();
@@ -521,7 +521,7 @@ function showSyncError(message = "") {
   $("#sync-error").textContent = message;
   $("#sync-error").hidden = !message;
 }
-function openSyncDialog({ autoStart = false } = {}) {
+function openSyncDialog() {
   const dialog = $("#sync-dialog");
   if (!dialog.open) {
     state.sync.returnFocus = document.activeElement;
@@ -532,18 +532,17 @@ function openSyncDialog({ autoStart = false } = {}) {
     if (state.sync.pollPaused) resumeSyncStatus();
     return;
   }
-  state.sync.autoStart = autoStart;
-  if (!state.sync.loading) loadSyncPreview({ autoStart });
+  if (!state.sync.loading) loadSyncPreview();
 }
 function closeSyncDialog() {
   $("#sync-dialog").close();
   state.sync.returnFocus?.focus();
 }
-async function loadSyncPreview({ autoStart = false } = {}) {
+async function loadSyncPreview() {
   const sync = state.sync;
   if (sync.loading || syncRunning() || syncInterrupted()) return;
   const previewRevision = ++sync.previewRevision;
-  sync.autoStart = autoStart;
+  sync.previewId = null;
   invalidateSyncStatus();
   sync.loading = true;
   sync.jobId = null;
@@ -561,6 +560,8 @@ async function loadSyncPreview({ autoStart = false } = {}) {
     const data = await api("sync_preview");
     if (previewRevision !== sync.previewRevision) return;
     if (!Array.isArray(data?.items)) throw new Error("本地服务未返回同步预览，请重试。");
+    if (typeof data.preview_id !== "string" || !data.preview_id) throw new Error("本地服务未返回有效检测结果，请重新检测。");
+    sync.previewId = data.preview_id;
     const seen = new Set();
     sync.preview = data.items.filter((item) => {
       if (!item || typeof item.source_key !== "string" || !item.source_key || seen.has(item.source_key)) return false;
@@ -578,10 +579,6 @@ async function loadSyncPreview({ autoStart = false } = {}) {
       renderSync();
     }
   }
-  if (previewRevision !== sync.previewRevision) return;
-  const shouldStart = sync.autoStart && sync.selected.size > 0;
-  sync.autoStart = false;
-  if (shouldStart) startSync();
 }
 function renderSync() {
   const sync = state.sync;
@@ -600,14 +597,14 @@ function renderSync() {
   $("#sync-reload").disabled = sync.loading || sync.starting;
   $("#sync-search").disabled = sync.loading || sync.starting;
   $("#sync-start").hidden = running && !sync.starting;
-  $("#sync-start").disabled = sync.loading || sync.starting || (!hasJob && !sync.selected.size);
+  $("#sync-start").disabled = sync.loading || sync.starting || (!hasJob && (!sync.previewId || !sync.selected.size));
   $("#sync-start").classList.toggle("is-loading", sync.starting);
-  $("#sync-start").textContent = sync.starting ? "正在开始同步…" : interrupted ? "继续剩余同步" : hasJob ? "重新预览" : `同步所选 ${sync.selected.size} 个窗口`;
+  $("#sync-start").textContent = sync.starting ? "正在开始同步…" : interrupted ? "继续剩余同步" : hasJob ? "重新检测" : `开始同步 ${sync.selected.size} 个窗口`;
   $("#sync-cancel-job").hidden = !hasJob || (!running && !interrupted);
   $("#sync-cancel-job").disabled = sync.cancelling || (!interrupted && sync.cancelRequested);
   $("#sync-cancel-job").textContent = sync.cancelRequested && !interrupted ? "已请求取消" : sync.cancelling ? "正在请求取消…" : "取消剩余同步";
   $("#sync-retry-status").hidden = !sync.pollPaused || (!running && !interrupted);
-  $("#sync-footer-note").textContent = running || interrupted ? "同步只添加新副本，不覆盖本地已有窗口" : independent ? "只导入通过完整性检查的本机来源，不访问原厂服务" : "其他云端窗口不在本次同步范围内";
+  $("#sync-footer-note").textContent = running || interrupted ? "同步只添加新副本，不覆盖本地已有窗口" : "检测不复制资料；点击开始同步后仍须通过完整性检查";
   if (hasJob) renderSyncProgress();
   else renderSyncPreview();
 }
@@ -682,13 +679,17 @@ async function startSync() {
     showSyncError(`单次最多同步 ${SYNC_BATCH_LIMIT} 个来源，请重新预览并分批选择。`);
     return;
   }
+  if (!sync.previewId) {
+    showSyncError("请先重新检测可同步窗口，再点击开始同步。");
+    return;
+  }
   sync.deferred = sync.preview.filter(syncCanImport).length - keys.length;
   invalidateSyncStatus();
   sync.starting = true;
   showSyncError();
   renderSync();
   try {
-    const result = await api("sync_windows", { source_keys: keys });
+    const result = await api("sync_windows", { source_keys: keys, preview_id: sync.previewId });
     if (!result?.job_id) throw new Error("本地服务未返回同步任务编号，请重新预览确认结果。");
     sync.jobId = String(result.job_id);
     sync.status = { state: "running", phase: "preparing", total: keys.length, completed: 0, skipped: 0, failed: 0, items: [] };
@@ -1016,17 +1017,25 @@ function renderFilters() {
   replace("#group-filter", groups, "全部分组", state.group);
   replace("#tag-filter", tags, "全部标签", state.tag);
 }
+const MAX_SEARCH_TERMS = 10;
+function profileSearchTerms(value) {
+  return [...new Set(String(value).split(/[\r\n,，;；]+/)
+    .map((term) => term.trim().toLowerCase()).filter(Boolean))];
+}
 function filteredProfiles() {
-  const search = state.search.toLowerCase();
+  const terms = profileSearchTerms(state.search);
+  if (terms.length > MAX_SEARCH_TERMS) return [];
+  const searches = terms.map((term) => terms.length > 1 && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(term)
+    ? new RegExp(`(^|[^\\d.])${term.replace(/\./g, "\\.")}(?![\\d.])`)
+    : term);
   return state.profiles
     .filter((p) => !isArchived(p))
     .filter((p) => state.filter !== "running" || isRunning(p))
     .filter((p) => !state.group || p.group === state.group)
     .filter((p) => !state.tag || (p.tags || []).includes(state.tag))
-    .filter(
-      (p) =>
-        !search ||
-        [
+    .filter((p) => {
+      if (!terms.length) return true;
+      const text = [
           p.name,
           p.seq,
           p.remark,
@@ -1036,9 +1045,9 @@ function filteredProfiles() {
           ...(p.tags || []),
         ]
           .join(" ")
-          .toLowerCase()
-          .includes(search),
-    )
+          .toLowerCase();
+      return searches.some((search) => typeof search === "string" ? text.includes(search) : search.test(text));
+    })
     .sort((a, b) => {
       let av = a[state.sort] ?? "",
         bv = b[state.sort] ?? "";
@@ -1051,6 +1060,15 @@ function filteredProfiles() {
     });
 }
 function renderProfiles() {
+  const terms = profileSearchTerms(state.search);
+  const tooManyTerms = terms.length > MAX_SEARCH_TERMS;
+  const searchFeedback = $("#search-feedback");
+  searchFeedback.hidden = terms.length < 2;
+  searchFeedback.classList.toggle("error", tooManyTerms);
+  searchFeedback.textContent = tooManyTerms
+    ? `最多支持 ${MAX_SEARCH_TERMS} 项，当前 ${terms.length} 项，请删减后搜索`
+    : `批量搜索 ${terms.length} 项，匹配任意一项`;
+  $("#search-input").setAttribute("aria-invalid", String(tooManyTerms));
   const active = state.profiles.filter((p) => !isArchived(p));
   const list = filteredProfiles();
   const maxPage = Math.max(1, Math.ceil(list.length / state.pageSize));
@@ -1067,10 +1085,10 @@ function renderProfiles() {
   const filtered = Boolean(
     state.search || state.group || state.tag || state.filter === "running",
   );
-  $("#empty-state h3").textContent = filtered
+  $("#empty-state h3").textContent = tooManyTerms ? "搜索项超过上限" : filtered
     ? "没有符合条件的窗口"
     : "暂无浏览器窗口";
-  $("#empty-state p").textContent = filtered
+  $("#empty-state p").textContent = tooManyTerms ? `最多支持 ${MAX_SEARCH_TERMS} 项，请删减后搜索` : filtered
     ? "尝试更换筛选条件，或重置筛选"
     : state.capabilities.create_windows ? "点击“新建窗口”创建本地窗口，或点击“同步窗口”导入本机来源" : sourceGuidance().listEmpty;
   $("#selected-count").textContent = state.selected.size;
@@ -2080,7 +2098,7 @@ function forgetDeletedProfiles(ids) {
   $("#row-menu").innerHTML = "";
   state.sync.previewRevision++;
   state.sync.loading = false;
-  state.sync.autoStart = false;
+  state.sync.previewId = null;
   state.sync.preview = [];
   state.sync.names.clear();
   state.sync.selected.clear();
@@ -2518,7 +2536,7 @@ function bindEvents() {
       return;
     await bootstrap();
   };
-  $("#create-button").onclick = () => openSyncDialog({ autoStart: true });
+  $("#create-button").onclick = () => openSyncDialog();
   $("#sync-preview-button").onclick = () => openSyncDialog();
   $("#sync-close").onclick = closeSyncDialog;
   $("#sync-dismiss").onclick = closeSyncDialog;
@@ -2572,6 +2590,7 @@ function bindEvents() {
   );
   $("#search-input").oninput = (event) => {
     state.search = event.target.value.trim();
+    event.target.rows = Math.min(4, Math.max(1, event.target.value.split(/\r\n|\r|\n/).length));
     state.page = 1;
     renderProfiles();
   };
@@ -2591,6 +2610,7 @@ function bindEvents() {
     state.tag = "";
     state.page = 1;
     $("#search-input").value = "";
+    $("#search-input").rows = 1;
     renderFilters();
     renderProfiles();
   };

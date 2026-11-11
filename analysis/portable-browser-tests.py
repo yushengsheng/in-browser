@@ -111,6 +111,100 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(database.read_bytes() == before_database)
         self.assertFalse(portable.prepare_profile(self.profile, private))
 
+    def test_legacy_cookie_database_keeps_ciphertext_across_user_rewrap(self):
+        database = self.profile / 'Default/Cookies'
+        (self.profile / 'Default/Network/Cookies').rename(database)
+        before_database = database.read_bytes()
+        before = self.before()
+        private = portable.capture_profile(self.profile)
+        self.assertTrue(base64.b64decode(private['key']) == self.key)
+        self.assertFalse(portable.prepare_profile(self.profile, private))
+        self.assertTrue(self.before() == before)
+        self.user = 'second'
+        self.assertTrue(portable.prepare_profile(self.profile, private))
+        state = json.loads((self.profile / 'Local State').read_text(encoding='utf-8'))
+        self.assertTrue(portable._unwrap(state['os_crypt']['encrypted_key']) == self.key)
+        self.assertTrue(database.read_bytes() == before_database)
+        self.assertFalse(portable.prepare_profile(self.profile, private))
+
+    def test_invalid_legacy_cookie_values_are_refused_without_state_write(self):
+        private = portable.capture_profile(self.profile)
+        database = self.profile / 'Default/Cookies'
+        (self.profile / 'Default/Network/Cookies').rename(database)
+        encrypted = self.encrypt(self.key, b'synthetic-cookie')
+        values = {
+            'wrong_key': self.encrypt(os.urandom(32), b'synthetic-cookie'),
+            'damaged_tag': encrypted[:-1] + bytes([encrypted[-1] ^ 1]),
+            'truncated_v10': b'v10' + bytes(12),
+            'v20': b'v20' + os.urandom(64),
+            'v11': b'v11' + os.urandom(64),
+            'unknown': b'unknown-format',
+        }
+        for name, value in values.items():
+            self.user = 'first'
+            self.write_state(self.state)
+            with closing(sqlite3.connect(database)) as con, con:
+                con.execute('UPDATE cookies SET encrypted_value=? WHERE rowid=1', (value,))
+            before_database = database.read_bytes()
+            for operation in ('capture', 'prepare'):
+                with self.subTest(value=name, operation=operation):
+                    if operation == 'capture':
+                        self.assert_fixed_failure(lambda: portable.capture_profile(self.profile))
+                    else:
+                        self.user = 'second'
+                        self.assert_fixed_failure(lambda: portable.prepare_profile(self.profile, private))
+                    self.assertTrue(database.read_bytes() == before_database)
+
+    def test_corrupt_legacy_cookie_database_is_refused_without_state_write(self):
+        private = portable.capture_profile(self.profile)
+        (self.profile / 'Default/Network/Cookies').unlink()
+        database = self.profile / 'Default/Cookies'
+        database.write_bytes(b'not-a-sqlite-database')
+        before_database = database.read_bytes()
+        for operation in ('capture', 'prepare'):
+            with self.subTest(operation=operation):
+                if operation == 'capture':
+                    self.assert_fixed_failure(lambda: portable.capture_profile(self.profile))
+                else:
+                    self.user = 'second'
+                    self.assert_fixed_failure(lambda: portable.prepare_profile(self.profile, private))
+                self.assertTrue(database.read_bytes() == before_database)
+
+    def test_both_cookie_locations_are_authenticated(self):
+        self.make_database('Default/Cookies', 'cookies', 'encrypted_value',
+                           [(self.encrypt(self.key, b'synthetic-legacy-cookie'),)])
+        private = portable.capture_profile(self.profile)
+        locations = ('Default/Cookies', 'Default/Network/Cookies')
+        for invalid in locations:
+            self.user = 'first'
+            self.write_state(self.state)
+            for relative in locations:
+                key = os.urandom(32) if relative == invalid else self.key
+                with closing(sqlite3.connect(self.profile / relative)) as con, con:
+                    con.execute('UPDATE cookies SET encrypted_value=? WHERE rowid=1',
+                                (self.encrypt(key, b'synthetic-cookie'),))
+            before_databases = [(self.profile / relative).read_bytes() for relative in locations]
+            for operation in ('capture', 'prepare'):
+                with self.subTest(location=invalid, operation=operation):
+                    if operation == 'capture':
+                        self.assert_fixed_failure(lambda: portable.capture_profile(self.profile))
+                    else:
+                        self.user = 'second'
+                        self.assert_fixed_failure(lambda: portable.prepare_profile(self.profile, private))
+                    self.assertTrue([(self.profile / relative).read_bytes() for relative in locations]
+                                    == before_databases)
+
+    def test_legacy_cookie_database_retains_validation_limits(self):
+        (self.profile / 'Default/Network/Cookies').rename(self.profile / 'Default/Cookies')
+        (self.profile / 'Default/Login Data').unlink()
+        private = portable.capture_profile(self.profile)
+        for name in ('_MAX_ROWS', '_MAX_BLOB_BYTES', '_MAX_DATABASE_BYTES', '_DATABASE_TIMEOUT'):
+            with self.subTest(limit=name), patch.object(portable, name, 0):
+                self.assert_fixed_failure(lambda: portable.capture_profile(self.profile))
+                self.user = 'second'
+                self.assert_fixed_failure(lambda: portable.prepare_profile(self.profile, private))
+            self.user = 'first'
+
     def test_current_wrapper_for_different_key_is_corrected(self):
         private = portable.capture_profile(self.profile)
         state = copy.deepcopy(self.state)

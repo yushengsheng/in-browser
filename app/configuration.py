@@ -287,6 +287,7 @@ class Configuration:
 
     def local_core(self,major):
         from core_specs import supports_major
+        from engine_store import EngineStore
         from local_engine import LocalEngineStore
         from local_signer import LocalSigner
         from bit_source import BitSource
@@ -306,8 +307,11 @@ class Configuration:
                 return existing
             signer=LocalSigner(self.root,load_private=False)
             if signer.key_id!=archive['key_id']:raise LocalBrowserError('本地内核与签名根不匹配，未更新映射。')
-            reader=copy.copy(self);reader.independent=False
-            source=BitSource(reader)._core_path(major)
+            bundled=EngineStore();candidate=bundled.root/major
+            if candidate.exists() or candidate.is_symlink():source=bundled.resolve(major)
+            else:
+                reader=copy.copy(self);reader.independent=False
+                source=BitSource(reader)._core_path(major)
             path=store.ensure(major,source,signer.public_der)
             path=store.ensure_current(path,archive['key_id'],major)
             path=store.validate(path,archive['key_id'],major)
@@ -325,11 +329,9 @@ class Configuration:
 
     @staticmethod
     def _config_command():
-        import shutil
         bundled=APP_ROOT.parent/'runtime/node/node.exe'
-        node=str(bundled) if bundled.is_file() else shutil.which('node')
-        if not node:raise LocalBrowserError('来源配置转换运行环境缺失，请保留完整程序目录和runtime。')
-        return [node,str(APP_ROOT/'config_factory.js')]
+        if not bundled.is_file():raise LocalBrowserError('随包配置转换运行环境缺失，请恢复完整便携目录和runtime。')
+        return [str(bundled),str(APP_ROOT/'config_factory.js')]
 
     def _display(self):
         # Same primary-monitor logical units used by the original Electron screen API.

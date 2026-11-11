@@ -113,6 +113,41 @@ class VendorRestoreTests(unittest.TestCase):
         self.assertEqual(self.snapshot(r2.parent), before)
         self.assertEqual(self.store.validate(r2, self.key_id, '148'), r2)
 
+    def test_selected_non148_core_uses_its_exact_spec_and_binding(self):
+        with patch.dict(core_specs.CORE_SPECS, {'112': self.spec}), \
+                patch('engine_store.executable_major', return_value='112'):
+            original = self.store.ensure('112', self.root / 'vendor-source/BitBrowser.exe', self.local)
+            current = self.store.ensure_current(original, self.key_id, '112')
+            record = self.record(current)
+            record['_runtime']['core_major'] = '112'
+            before = self.snapshot(current.parent)
+            result, files, directories = comparison._stock_engine(record, Fixture, self.root)
+            self.assertEqual(engine._inventory(result.parent), self.vendor_inventory)
+            self.assertEqual((files, directories), self.vendor_inventory)
+            self.assertEqual(self.snapshot(current.parent), before)
+
+    def test_104_empty_runtime_dictionary_matches_production_rule_only(self):
+        with patch.dict(core_specs.CORE_SPECS, {'104': self.spec}), \
+                patch('engine_store.executable_major', return_value='104'):
+            original = self.store.ensure('104', self.root / 'vendor-source/BitBrowser.exe', self.local)
+            current = self.store.ensure_current(original, self.key_id, '104')
+            (current.parent / 'Dictionaries').mkdir()
+            self.assertEqual(self.store.validate(current, self.key_id, '104'), current)
+            record = self.record(current)
+            record['_runtime']['core_major'] = '104'
+            result, files, directories = comparison._stock_engine(record, Fixture, self.root)
+            dictionary = result.parent / 'Dictionaries'
+            dictionary.mkdir()
+            self.assertEqual(comparison._runtime_inventory(result.parent, '104', directories),
+                             (files, directories))
+            (dictionary / 'unexpected-file').write_bytes(b'synthetic mutation')
+            self.assertNotEqual(comparison._runtime_inventory(result.parent, '104', directories),
+                                (files, directories))
+            (dictionary / 'unexpected-file').unlink()
+            (dictionary / 'unexpected-directory').mkdir()
+            self.assertNotEqual(comparison._runtime_inventory(result.parent, '104', directories),
+                                (files, directories))
+
     def test_unknown_resource_revision_is_refused_by_real_authentication_before_copy(self):
         manifest_path = self.r1.parent / 'manifest.json'
         manifest = json.loads(manifest_path.read_text())

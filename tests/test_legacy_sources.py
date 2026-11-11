@@ -45,6 +45,8 @@ class LegacySourceTests(unittest.TestCase):
         self.configuration.root=self.root;self.configuration._key=hashlib.sha256(b'synthetic aes key').digest()
         self.configuration.vendor_data=self.base/'vendor';self.configuration.vendor_data.mkdir()
         self.configuration.independent=True
+        engines=patch('engine_store.APP_ROOT',self.base)
+        engines.start();self.addCleanup(engines.stop)
         self.cache=PreparedSources(self.root)
         self.configuration.prepared_sources=lambda:self.cache
 

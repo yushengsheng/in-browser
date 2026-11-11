@@ -1,8 +1,9 @@
-"""Bounded stock-verified device variations and strict compatibility choices."""
+"""Bounded vendor-compatible device variations and strict compatibility choices."""
 import math
 import re
 
 from local_state import LocalBrowserError
+from core_specs import supports_major
 
 
 _REDUCED_MOTION = '--force-prefers-reduced-motion'
@@ -58,13 +59,23 @@ def _device_value_valid(field, original, actual):
     return False
 
 
+def vendor_compatibility_policy(runtime):
+    """Select a policy only after the caller authenticates the exact engine tree."""
+    major = str(runtime.get('core_major', ''))
+    return ('vendor-compatible-' + major
+            if runtime.get('signature_provider') == 'local-v1' and supports_major(major)
+            else 'strict')
+
+
 def vendor_device_differences(runtime, original, actual):
-    """Only 148 has cross-device stock/local evidence; other builds stay strict.
+    """Apply the bounded policy to supported, authenticated independent builds.
 
     Call after validating the unchanged native payload, engine binding and a
     complete stable probe. Neither recorded values nor launch options change.
+    Source-device parity is verified for all supported cores; cross-device
+    evidence for 148 does not establish every other core/device combination.
     """
-    if runtime.get('signature_provider') != 'local-v1' or str(runtime.get('core_major')) != '148':
+    if vendor_compatibility_policy(runtime) == 'strict':
         return []
     return sorted(field for field in _VENDOR_FIELDS
                   if field in original and field in actual and original[field] != actual[field]

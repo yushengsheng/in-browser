@@ -1,8 +1,8 @@
 name: Windows release acceptance
 
 on:
-  push:
-    branches: ['release/validation-*']
+  # Historical fixed fixtures remain available explicitly. New releases use
+  # clean-release-validation and all-core-release-validation with pinned assets.
   workflow_dispatch:
     inputs:
       private_session:

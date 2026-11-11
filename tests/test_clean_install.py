@@ -227,6 +227,9 @@ class CleanInstallTests(unittest.TestCase):
         reader.independent = False
         native = {'Resource': {'fixture': True}, 'DataProtect': None}
         reply = SimpleNamespace(returncode=0, stdout=json.dumps(native).encode())
+        bundled_node = self.app.parent / 'runtime/node/node.exe'
+        bundled_node.parent.mkdir(parents=True)
+        bundled_node.write_bytes(b'synthetic executable, subprocess is mocked')
         info = {'id': '1' * 32, 'browserFingerPrint': {'coreVersion': '104', 'coreProduct': 'chrome', 'fontType': '0'}}
         with patch.object(reader, '_display', return_value={}), \
                 patch.object(configuration.subprocess, 'run', return_value=reply) as run, \

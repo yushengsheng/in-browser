@@ -1,22 +1,19 @@
 @echo off
-setlocal
-if exist "%~dp0runtime\python\pythonw.exe" (
-    start "" /D "%~dp0app" "%~dp0runtime\python\pythonw.exe" "%~dp0app\local_browser.pyw"
-    exit /b 0
-)
-if exist "%~dp0app\data\portable-mode.bin" (
-    echo Portable runtime is missing. Please copy the complete program folder including runtime.
+setlocal DisableDelayedExpansion
+if not exist "%~dp0runtime\python\pythonw.exe" (
+    echo Portable runtime is incomplete. Restore the complete portable folder including runtime.
     pause
     exit /b 1
 )
-if exist "%~dp0app\launcher.lnk" (
-    start "" "%~dp0app\launcher.lnk"
-    exit /b 0
-)
-where pythonw.exe >nul 2>nul
-if errorlevel 1 (
-    echo Python runtime was not found. Please use the existing Python environment.
+if not exist "%~dp0runtime\webview2\msedgewebview2.exe" (
+    echo Portable WebView2 is missing. Restore the complete portable folder including runtime.
     pause
     exit /b 1
 )
-start "" /D "%~dp0app" pythonw.exe "%~dp0app\local_browser.pyw"
+if not exist "%~dp0app\local_browser.pyw" (
+    echo Portable application is incomplete. Restore the complete portable folder.
+    pause
+    exit /b 1
+)
+start "" /D "%~dp0app" "%~dp0runtime\python\pythonw.exe" -B "%~dp0app\local_browser.pyw"
+exit /b 0

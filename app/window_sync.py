@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import threading
+import time
 import traceback
 import uuid
 from urllib.parse import unquote
@@ -23,6 +25,8 @@ from window_store import now,source_time
 from sync_state import SyncState,WorkerLease
 
 MAX_SYNC_SOURCES=9999
+SYNC_PREVIEW_TTL=600
+_INTERNAL_START=object()
 
 
 def source_key(identity):
@@ -49,6 +53,7 @@ class WindowSynchronizer:
         from profile_delete import get_pending_ids
         self.service=service;self.provider=provider or BitSource(service.configuration)
         self.lock=threading.RLock();self.candidates={};self.active=None;self.diagnostics={}
+        self.preview_id=None;self.preview_created=0;self.confirmed_jobs={}
         self.state=SyncState(service.store);self.lease=WorkerLease(service.root);self._job_item=None
         if self.lease.acquire():
             try:
@@ -78,16 +83,23 @@ class WindowSynchronizer:
             key=source_key(identity)
             self.service.store.bind_existing(alias,key,{'provider':'bitbrowser-local-v1','source_key':key,'source_id':identity,'imported_at':now(),'legacy':True})
 
-    def preview(self):
-        candidates=self.provider.discover();items=[];unique={};conflicts=set()
+    def _discover(self):
+        candidates=self.provider.discover();unique={};conflicts=set()
         for candidate in candidates:
             key=candidate['source_key']
             if key in unique and unique[key]!=candidate:conflicts.add(key)
             else:unique[key]=candidate
         for key in conflicts:
             unique[key]=dict(unique[key],status='unsupported',reason='同一来源标识出现冲突，未选择或覆盖任何资料。')
-        bindings=self.service.store.source_bindings()
+        return unique,conflicts
+
+    def preview(self):
         with self.lock:
+            if getattr(self,'worker',None) is not None and self.worker.is_alive():
+                raise LocalBrowserError('同步任务正在处理，请先查看当前进度。')
+            self.preview_id=None;self.candidates={}
+            unique,conflicts=self._discover();items=[]
+            bindings=self.service.store.source_bindings()
             self.candidates=unique
             for candidate in unique.values():
                 info=candidate.get('info') or {};fp=info.get('browserFingerPrint') or {};key=candidate['source_key']
@@ -98,11 +110,40 @@ class WindowSynchronizer:
                     'created_at':source_time(info.get('createdTime')),'status':status,
                     'reason':'已保留独立本地副本，本次跳过，不覆盖现有资料。' if bound else candidate.get('reason'),
                     'has_local_data':candidate['status'] in ['ready','source_open']})
-        return {'items':items,'counts':{key:sum(p['status']==key for p in items) for key in ['ready','already_imported','source_open','missing_data','unsupported']}}
+            self.preview_id=secrets.token_hex(16);self.preview_created=time.monotonic()
+            return {'preview_id':self.preview_id,'expires_in':SYNC_PREVIEW_TTL,'items':items,
+                    'counts':{key:sum(p['status']==key for p in items) for key in ['ready','already_imported','source_open','missing_data','unsupported']}}
 
-    def start(self,keys=None):
+    def _confirm_preview(self,keys,preview_id):
+        if not isinstance(preview_id,str) or not preview_id:
+            raise LocalBrowserError('请先检测可同步窗口，再点击开始同步。')
+        if not isinstance(keys,list) or any(not isinstance(key,str) for key in keys):
+            raise LocalBrowserError('同步来源选择格式无效。')
+        selected=tuple(dict.fromkeys(keys))
+        if not selected or len(selected)>MAX_SYNC_SOURCES:
+            raise LocalBrowserError('请选择1至9999个已检测的窗口，再开始同步。')
+        previous=self.confirmed_jobs.get(preview_id)
+        if previous:
+            if frozenset(selected)!=previous['keys']:
+                raise LocalBrowserError('本次检测已开始同步，请重新检测后选择窗口。')
+            return {'job_id':previous['job_id']}
+        if preview_id!=self.preview_id or time.monotonic()-self.preview_created>SYNC_PREVIEW_TTL:
+            raise LocalBrowserError('检测结果已过期，请重新检测可同步窗口。')
+        if any(key not in self.candidates or self.candidates[key]['status']!='ready' for key in selected):
+            raise LocalBrowserError('所选来源不在可同步检测结果内，请重新检测。')
+        fresh,conflicts=self._discover()
+        bindings=self.service.store.source_bindings()
+        if any(key in conflicts or key in bindings or fresh.get(key)!=self.candidates[key] for key in selected):
+            self.preview_id=None
+            raise LocalBrowserError('来源资料、位置或同步状态已变化，请重新检测；尚未开始复制。')
+        return None
+
+    def start(self,keys=None,*,preview_id=_INTERNAL_START):
         with self.lock:
             self._require_delete_finished()
+            if preview_id is not _INTERNAL_START:
+                existing=self._confirm_preview(keys,preview_id)
+                if existing:return existing
             if getattr(self,'worker',None) is not None and self.worker.is_alive():return {'job_id':self.active}
             if keys is not None and (not isinstance(keys,list) or any(not isinstance(key,str) for key in keys)):
                 raise LocalBrowserError('同步来源选择格式无效。')
@@ -120,6 +161,9 @@ class WindowSynchronizer:
                 self.state.interrupt_running()
                 self.state.create(identity,(self.candidates[key] for key in selected))
                 self._launch(identity)
+                if preview_id is not _INTERNAL_START:
+                    self.confirmed_jobs[preview_id]={'keys':frozenset(selected),'job_id':identity}
+                    for previous in list(self.confirmed_jobs)[:-8]:self.confirmed_jobs.pop(previous,None)
             except Exception:
                 self.lease.release();raise
             return {'job_id':identity}
@@ -199,6 +243,8 @@ class WindowSynchronizer:
 
     def _extensions(self,source,staged,final):
         """Rebase extension filesystem references; never enable vendor cloud sync."""
+        from extension_portability import verify_secure_extension_paths
+        verify_secure_extension_paths(staged)
         path=staged/'Default/Preferences'
         try:data=json.loads(path.read_text(encoding='utf-8-sig'))
         except Exception:raise LocalBrowserError('来源浏览器偏好文件无法完整读取，未提交副本。') from None

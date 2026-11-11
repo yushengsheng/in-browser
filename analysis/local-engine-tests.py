@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'app'))
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import engine_store
+import fingerprint_continuity
 import local_engine
 from engine_validation import digest_file, verification_scope
 from local_state import LocalBrowserError
@@ -67,6 +68,19 @@ class LocalEngineTests(unittest.TestCase):
     def deploy(self):
         return self.store.ensure(self.major, self.executable, self.own)
 
+    def legacy_layout(self, executable):
+        data = json.loads((executable.parent / 'manifest.json').read_text(encoding='utf-8'))
+        suffix = '-r2' if data['local_trust'].get('resource_root_revision') else ''
+        folder = self.store.root / self.own_id / (self.major + '-' + data['local_trust']['source_tree_digest'] + suffix)
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        executable.parent.rename(folder)
+        return folder / executable.name
+
+    def engine_binding(self, executable):
+        return fingerprint_continuity._engine_binding({
+            'core_path':str(executable), 'core_major':self.major,
+            'core_sha256':hashlib.sha256(executable.read_bytes()).hexdigest()})
+
     def delayed_resource(self):
         # An independent synthetic encoding of the resource's public-key span.
         header = bytearray(78)
@@ -110,6 +124,209 @@ class LocalEngineTests(unittest.TestCase):
         patched = (repaired.parent/spec['file']).read_bytes()
         self.assertEqual(patched[:start],original[:start])
         self.assertEqual(patched[start+294:],original[start+294:])
+        self.assert_no_staging()
+
+    def test_compact_layout_keeps_full_identities_and_saves_96_path_units(self):
+        deployed = self.deploy()
+        data = json.loads((deployed.parent / 'manifest.json').read_text(encoding='utf-8'))
+        digest = data['local_trust']['source_tree_digest']
+        self.assertEqual(deployed.parent.parent.name, self.own_id[:16])
+        self.assertEqual(deployed.parent.name, self.major + '-' + digest[:16])
+        self.assertEqual(data['local_trust']['key_id'], self.own_id)
+        self.assertEqual(len(digest), 64)
+        legacy = self.store.root / self.own_id / (self.major + '-' + digest) / deployed.name
+        self.assertEqual(len(str(legacy).encode('utf-16-le')) // 2
+                         - len(str(deployed).encode('utf-16-le')) // 2, 96)
+
+    def test_legacy_layout_remains_valid_and_compacts_both_revisions_without_binding_change(self):
+        self.delayed_resource()
+        legacy = self.legacy_layout(self.deploy())
+        original_tree = local_engine._inventory(legacy.parent)
+        original_manifest = (legacy.parent / 'manifest.json').read_bytes()
+        binding = self.engine_binding(legacy)
+        self.assertEqual(self.store.validate(legacy, self.own_id, self.major), legacy)
+        repaired = self.store.ensure_current(legacy, self.own_id, self.major)
+        self.assertEqual(self.engine_binding(repaired), binding)
+        self.assertEqual(local_engine._inventory(legacy.parent), original_tree)
+        self.assertEqual((legacy.parent / 'manifest.json').read_bytes(), original_manifest)
+        legacy_current = self.legacy_layout(repaired)
+        current_tree = local_engine._inventory(legacy_current.parent)
+        current_manifest = json.loads((legacy_current.parent / 'manifest.json').read_text(encoding='utf-8'))
+        compact = self.store.ensure_current(legacy_current, self.own_id, self.major)
+        self.assertNotEqual(compact, legacy_current)
+        self.assertEqual(self.engine_binding(compact), binding)
+        self.assertEqual(local_engine._inventory(legacy_current.parent), current_tree)
+        self.assertEqual(json.loads((compact.parent / 'manifest.json').read_text(encoding='utf-8')), current_manifest)
+        self.assertEqual(self.store.validate(legacy_current, self.own_id, self.major), legacy_current)
+        with patch.object(local_engine.shutil, 'copy2', side_effect=AssertionError('Unexpected copy')):
+            self.assertEqual(self.store.ensure_current(legacy, self.own_id, self.major), compact)
+            self.assertEqual(self.store.ensure_current(legacy_current, self.own_id, self.major), compact)
+            self.assertEqual(self.store.ensure_current(compact, self.own_id, self.major), compact)
+        self.assert_no_staging()
+
+    def test_mixed_full_and_short_layouts_are_refused(self):
+        deployed = self.deploy()
+        data = json.loads((deployed.parent / 'manifest.json').read_text(encoding='utf-8'))
+        for parent, leaf in ((self.own_id, deployed.parent.name),
+                             (self.own_id[:16], self.major + '-' + data['local_trust']['source_tree_digest'])):
+            with self.subTest(parent_length=len(parent)):
+                destination = self.store.root / parent / leaf
+                shutil.copytree(deployed.parent, destination)
+                with self.assertRaises(LocalBrowserError):
+                    self.store.validate(destination / deployed.name, self.own_id, self.major)
+
+    def test_source_prefix_collision_refuses_without_copy_or_overwrite(self):
+        with patch.object(local_engine, '_SHORT_ID_LENGTH', 1):
+            deployed = self.deploy()
+            manifest = (deployed.parent / 'manifest.json').read_bytes()
+            first = json.loads(manifest)['local_trust']['source_tree_digest']
+            for number in range(1024):
+                self.resource.write_bytes(('synthetic collision candidate ' + str(number)).encode())
+                files, directories = local_engine._inventory(self.source)
+                candidate = local_engine._tree_digest(files, directories)
+                if candidate != first and candidate[:1] == first[:1]:
+                    break
+            else:
+                self.fail('No synthetic prefix collision found')
+            with patch.object(local_engine.shutil, 'copy2') as copier:
+                with self.assertRaises(LocalBrowserError):
+                    self.deploy()
+                copier.assert_not_called()
+            self.assertEqual((deployed.parent / 'manifest.json').read_bytes(), manifest)
+            self.assertEqual(self.store.validate(deployed, self.own_id, self.major), deployed)
+
+    def test_key_prefix_collision_refuses_before_creating_another_build(self):
+        deployed = self.deploy()
+        path = deployed.parent / 'manifest.json'
+        data = json.loads(path.read_text(encoding='utf-8'))
+        suffix = '0' if self.own_id[-1] != '0' else '1'
+        data['local_trust']['key_id'] = self.own_id[:-1] + suffix
+        path.write_text(json.dumps(data), encoding='utf-8')
+        manifest = path.read_bytes()
+        self.resource.write_bytes(b'another valid source tree')
+        with patch.object(local_engine.shutil, 'copy2') as copier:
+            with self.assertRaises(LocalBrowserError):
+                self.deploy()
+            copier.assert_not_called()
+        self.assertEqual(path.read_bytes(), manifest)
+        self.assertEqual(len(list(deployed.parent.parent.iterdir())), 1)
+
+    def test_failed_compaction_retains_current_legacy_tree(self):
+        self.delayed_resource()
+        legacy = self.legacy_layout(self.store.ensure_current(self.deploy(), self.own_id, self.major))
+        before = local_engine._inventory(legacy.parent)
+        with patch.object(local_engine.shutil, 'copy2', side_effect=OSError('synthetic copy failure')):
+            with self.assertRaises(LocalBrowserError):
+                self.store.ensure_current(legacy, self.own_id, self.major)
+        self.assertEqual(self.store.validate(legacy, self.own_id, self.major), legacy)
+        self.assertEqual(local_engine._inventory(legacy.parent), before)
+        data = json.loads((legacy.parent / 'manifest.json').read_text(encoding='utf-8'))
+        compact = self.store.root / self.own_id[:16] / (self.major + '-' + data['local_trust']['source_tree_digest'][:16] + '-r2')
+        self.assertFalse(compact.exists())
+        self.assert_no_staging()
+
+    def test_existing_current_engine_is_not_blocked_by_unrelated_staging(self):
+        self.delayed_resource()
+        current = self.store.ensure_current(self.deploy(), self.own_id, self.major)
+        (current.parent.parent / '.install-synthetic-interrupted').mkdir()
+        with patch.object(local_engine.shutil, 'copy2', side_effect=AssertionError('Unexpected copy')):
+            self.assertEqual(self.store.ensure_current(current, self.own_id, self.major), current)
+
+    def assert_interrupted_staging_preserved(self, *, wrong_key):
+        self.delayed_resource()
+        staging = self.store.root / self.own_id[:16] / '.install-0123456789ab'
+        staging.mkdir(parents=True)
+        marker = staging / 'partial-copy.dat'
+        marker.write_bytes(b'unpublished data must be retained')
+        if wrong_key:
+            (staging / 'manifest.json').write_text(
+                json.dumps({'local_trust':{'key_id':'0' * 64}}), encoding='utf-8')
+        before = {path.name:path.read_bytes() for path in staging.iterdir()}
+        deployed = self.deploy()
+        current = self.store.ensure_current(deployed, self.own_id, self.major)
+        legacy = self.legacy_layout(current)
+        legacy_tree = local_engine._inventory(legacy.parent)
+        compact = self.store.ensure_current(legacy, self.own_id, self.major)
+        self.assertNotEqual(compact, legacy)
+        self.assertEqual(self.store.validate(compact, self.own_id, self.major), compact)
+        self.assertEqual(local_engine._inventory(legacy.parent), legacy_tree)
+        self.assertEqual({path.name:path.read_bytes() for path in staging.iterdir()}, before)
+        self.assertEqual(list(staging.parent.glob('.install-*')), [staging])
+
+    def test_staging_without_manifest_preserved_during_deploy_and_legacy_compaction(self):
+        self.assert_interrupted_staging_preserved(wrong_key=False)
+
+    def test_staging_with_wrong_unpublished_key_preserved_during_deploy_and_legacy_compaction(self):
+        self.assert_interrupted_staging_preserved(wrong_key=True)
+
+    def test_staging_reparse_refused_before_deployment_or_legacy_compaction(self):
+        self.delayed_resource()
+        legacy = self.legacy_layout(self.store.ensure_current(self.deploy(), self.own_id, self.major))
+        staging = self.store.root / self.own_id[:16] / '.install-0123456789ab'
+        staging.mkdir()
+        original_lstat = Path.lstat
+
+        def staging_is_reparse(path):
+            result = original_lstat(path)
+            if path == staging:
+                return SimpleNamespace(st_mode=result.st_mode, st_file_attributes=0x400)
+            return result
+
+        with patch.object(Path, 'lstat', autospec=True, side_effect=staging_is_reparse), \
+                patch.object(local_engine.shutil, 'copy2') as copier:
+            for action in (self.deploy, lambda:self.store.ensure_current(legacy, self.own_id, self.major)):
+                with self.assertRaises(LocalBrowserError):
+                    action()
+            copier.assert_not_called()
+        self.assertTrue(staging.is_dir())
+        self.assertEqual(self.store.validate(legacy, self.own_id, self.major), legacy)
+
+    def test_unknown_sibling_directory_refused_even_with_matching_key(self):
+        deployed = self.deploy()
+        unknown = deployed.parent.parent / 'unknown-unpublished-directory'
+        shutil.copytree(deployed.parent, unknown)
+        with patch.object(local_engine.shutil, 'copy2') as copier:
+            with self.assertRaises(LocalBrowserError):
+                self.deploy()
+            copier.assert_not_called()
+        self.assertTrue(unknown.is_dir())
+        self.assertEqual(self.store.validate(deployed, self.own_id, self.major), deployed)
+
+    def test_compaction_prefix_collision_refuses_a_different_valid_source(self):
+        self.delayed_resource()
+        with patch.object(local_engine, '_SHORT_ID_LENGTH', 1):
+            current = self.store.ensure_current(self.deploy(), self.own_id, self.major)
+            manifest = (current.parent / 'manifest.json').read_bytes()
+            first = json.loads(manifest)['local_trust']['source_tree_digest']
+            for number in range(1024):
+                self.resource.write_bytes(('synthetic compact collision ' + str(number)).encode())
+                files, directories = local_engine._inventory(self.source)
+                candidate = local_engine._tree_digest(files, directories)
+                if candidate != first and candidate[:1] == first[:1]:
+                    break
+            else:
+                self.fail('No synthetic compaction collision found')
+            other_store = local_engine.LocalEngineStore(self.root / 'other-deployed')
+            other = other_store.ensure(self.major, self.executable, self.own)
+            legacy = self.legacy_layout(other_store.ensure_current(other, self.own_id, self.major))
+            self.assertEqual(self.store.validate(legacy, self.own_id, self.major), legacy)
+            with patch.object(local_engine.shutil, 'copy2') as copier:
+                with self.assertRaises(LocalBrowserError):
+                    self.store.ensure_current(legacy, self.own_id, self.major)
+                copier.assert_not_called()
+            self.assertTrue(legacy.exists())
+            self.assertEqual((current.parent / 'manifest.json').read_bytes(), manifest)
+            self.assertEqual(self.store.validate(current, self.own_id, self.major), current)
+
+    def test_incomplete_legacy_tree_is_refused_without_publishing(self):
+        self.delayed_resource()
+        legacy = self.legacy_layout(self.deploy())
+        (legacy.parent / 'version/resource.dat').unlink()
+        with patch.object(local_engine.shutil, 'copy2') as copier:
+            with self.assertRaises(LocalBrowserError):
+                self.store.ensure_current(legacy, self.own_id, self.major)
+            copier.assert_not_called()
+        self.assertTrue(legacy.exists())
         self.assert_no_staging()
 
     def test_delayed_resource_tampering_cannot_be_hidden_in_manifest(self):

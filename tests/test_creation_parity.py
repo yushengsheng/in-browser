@@ -168,6 +168,305 @@ class CreationResolutionTests(unittest.TestCase):
                 finally:creator.lease.release()
 
 
+class CreationRandomFontTests(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('creation_font_queue_fixture',ROOT/'tests/test_window_creation.py')
+        fixture_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture_module)
+        self.fixture=fixture_module.CreationTests();self.fixture.setUp();self.addCleanup(self.fixture.doCleanups)
+        self.creator=self.fixture.creator;self.configuration=self.fixture.service.configuration
+        self.names=['Synthetic Font '+str(index) for index in range(40)]
+        self.configuration._font_config=Mock(side_effect=lambda fp:{'BasePath':'synthetic',
+            'Names':str(fp.get('font') or '').split(',') if fp.get('font') else list(self.names),
+            'BlockFallbackList':[],'Files':[]})
+
+    def queued(self):
+        with self.creator.store.connect() as con:
+            return [self.creator.store.unpack(row[0]) for row in con.execute(
+                'SELECT data FROM creation_items WHERE data IS NOT NULL ORDER BY ordinal')]
+
+    def request(self,count=1,**changes):
+        request=self.fixture.request(count,**changes)
+        request['profile']['fingerprint'].update(fontType='2',font='')
+        return request
+
+    def test_default_single_window_keeps_system_fonts_without_font_lookup(self):
+        request=self.fixture.request()
+        self.creator.start(request);self.creator._run(request['request_id'])
+        self.configuration._font_config.assert_not_called()
+        record=self.fixture.service.store.all()[0]
+        self.assertEqual(record['fingerprint']['fontType'],'0')
+        self.assertEqual(record['fingerprint']['font'],'')
+
+    def test_same_fingerprint_batch_freezes_one_selection_before_launch(self):
+        request=self.request(3)
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=self.names[:30]
+            self.creator.start(request)
+            queued=self.queued()
+            self.assertEqual(len({p['fingerprint']['font'] for p in queued}),1)
+            self.assertTrue(queued[0]['fingerprint']['font'])
+            self.creator._run(request['request_id'])
+        rng.return_value.sample.assert_called_once_with(self.names,30)
+        self.assertEqual([p['fingerprint']['font'] for p in self.fixture.service.store.all()],
+            [p['fingerprint']['font'] for p in queued])
+
+    def test_independent_batch_freezes_each_selection_before_launch(self):
+        request=self.request(3,random_each=True)
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.side_effect=[self.names[index:index+30] for index in range(3)]
+            self.creator.start(request)
+            queued=self.queued()
+            self.assertEqual(len({p['fingerprint']['font'] for p in queued}),3)
+            self.creator._run(request['request_id'])
+        self.assertEqual(rng.return_value.sample.call_count,3)
+        self.assertEqual([p['fingerprint']['font'] for p in self.fixture.service.store.all()],
+            [p['fingerprint']['font'] for p in queued])
+
+    def test_failed_creation_retry_preserves_registered_selection(self):
+        request=self.request()
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=self.names[:30]
+            self.creator.start(request);before=self.queued()[0]['fingerprint']['font']
+            with patch.object(self.creator,'_create',side_effect=LocalBrowserError('合成创建失败')):
+                self.creator._run(request['request_id'])
+            self.assertEqual(self.creator.status(request['request_id'])['state'],'failed')
+            self.assertEqual(self.queued()[0]['fingerprint']['font'],before)
+            self.creator.resume(request['request_id']);self.creator._run(request['request_id'])
+        self.assertEqual(rng.return_value.sample.call_count,1)
+        self.assertEqual(self.fixture.service.store.all()[0]['fingerprint']['font'],before)
+
+    def test_random_candidates_exclude_names_that_cannot_round_trip_the_comma_field(self):
+        good=['Synthetic Normal A','Synthetic Normal B','Synthetic Normal C']
+        self.names=['Synthetic,Comma Font',' Synthetic Leading Font','Synthetic Trailing Font ','']+good
+        request=self.request(2)
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=good
+            self.creator.start(request)
+            self.assertTrue(all(p['fingerprint']['font']==','.join(good) for p in self.queued()))
+            self.creator._run(request['request_id'])
+        rng.return_value.sample.assert_called_once_with(good,len(good))
+        self.assertEqual(self.creator.status(request['request_id'])['state'],'completed')
+
+    def test_no_round_trip_random_candidates_fail_before_drawing_or_mutating_selection(self):
+        from creation_fingerprint import freeze_random_font
+        self.names=['Synthetic,Comma Font',' Synthetic Leading Font','Synthetic Trailing Font ','']
+        fp={'fontType':'2','font':''}
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            for _ in range(2):
+                with self.assertRaises(LocalBrowserError):freeze_random_font(self.configuration,fp)
+        rng.assert_not_called()
+        self.assertEqual(fp,{'fontType':'2','font':''})
+
+    def test_large_random_selection_fits_probe_and_stays_fixed_across_creation_retry(self):
+        from fingerprint_continuity import _font_names
+        self.names=['Synthetic Font '+str(index).zfill(3) for index in range(220)]
+        request=self.request(2)
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=self.names[:165]
+            self.creator.start(request)
+            selections=[p['fingerprint']['font'] for p in self.queued()]
+            self.assertEqual(len(set(selections)),1)
+            selected=selections[0].split(',');self.assertTrue(selected)
+            probed=_font_names({'_native':{'FontConfig':{'Names':selected}}})
+            self.assertLessEqual(len(probed),128)
+            self.assertTrue(set(selected)<=set(probed))
+            with patch.object(self.creator,'_create',side_effect=LocalBrowserError('synthetic creation failure')):
+                self.creator._run(request['request_id'])
+            self.assertEqual([p['fingerprint']['font'] for p in self.queued()],selections)
+            self.creator.resume(request['request_id']);self.creator._run(request['request_id'])
+        rng.return_value.sample.assert_called_once_with(self.names,165)
+        self.assertEqual([p['fingerprint']['font'] for p in self.fixture.service.store.all()],selections)
+
+    def test_random_probe_budget_counts_semicolon_alias_families(self):
+        from creation_fingerprint import freeze_random_font
+        from fingerprint_continuity import _font_names
+        self.names=['Synthetic Family '+str(index).zfill(3)+';Synthetic Alias '+str(index).zfill(3) for index in range(220)]
+        fp={'fontType':'2','font':''}
+        draw=self.names[:165][::-1]
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=draw
+            self.assertTrue(freeze_random_font(self.configuration,fp))
+        rng.return_value.sample.assert_called_once_with(self.names,165)
+        selected=fp['font'].split(',');self.assertTrue(selected)
+        probed=_font_names({'_native':{'FontConfig':{'Names':selected}}})
+        self.assertLessEqual(len(probed),128)
+        self.assertLess(len(selected),128-len(_font_names({})))
+        self.assertEqual(selected,sorted(draw[:(128-len(_font_names({})))//2]))
+        self.assertTrue(all(alias.strip() in probed for name in selected for alias in name.split(';')))
+
+    def test_random_probe_budget_deduplicates_overlap_with_fixed_probe_families(self):
+        from creation_fingerprint import freeze_random_font
+        from fingerprint_continuity import _font_names
+        self.names=['Arial','Times New Roman']+['Arial;Synthetic Alias '+str(index).zfill(3) for index in range(220)]
+        fp={'fontType':'2','font':''}
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=self.names[:166]
+            self.assertTrue(freeze_random_font(self.configuration,fp))
+        rng.return_value.sample.assert_called_once_with(self.names,166)
+        selected=fp['font'].split(',');probed=_font_names({'_native':{'FontConfig':{'Names':selected}}})
+        self.assertEqual(len(probed),128)
+        self.assertEqual(len(selected),128-len(_font_names({}))+2)
+        self.assertTrue(all(alias.strip() in probed for name in selected for alias in name.split(';')))
+
+    def test_unprobeable_name_lengths_do_not_trigger_replacement_draws_or_mutate_on_failure(self):
+        from creation_fingerprint import freeze_random_font
+        from fingerprint_continuity import _font_names
+        long_name='Synthetic '+('x'*201)
+        for names in ([long_name,'Synthetic Valid'],[long_name,long_name+'y']):
+            with self.subTest(has_valid='Synthetic Valid' in names):
+                self.names=names;fp={'fontType':'2','font':''}
+                with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+                    rng.return_value.sample.return_value=names
+                    if 'Synthetic Valid' in names:
+                        self.assertTrue(freeze_random_font(self.configuration,fp))
+                        self.assertEqual(fp['font'],'Synthetic Valid')
+                        self.assertLessEqual(len(_font_names({'_native':{'FontConfig':{'Names':[fp['font']]}}})),128)
+                    else:
+                        with self.assertRaises(LocalBrowserError):freeze_random_font(self.configuration,fp)
+                        self.assertEqual(fp,{'fontType':'2','font':''})
+                rng.return_value.sample.assert_called_once_with(names,len(names))
+
+    def test_legacy_queue_persists_missing_selection_before_attempt_and_retry(self):
+        request=self.fixture.request();self.creator.start(request)
+        legacy=self.queued()[0];legacy['fingerprint'].update(fontType='2',font='')
+        with self.creator.store.connect() as con:
+            con.execute('UPDATE creation_items SET data=?',(self.creator.store.pack(legacy),))
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=self.names[:30]
+            with patch.object(self.creator,'_create',side_effect=LocalBrowserError('合成创建失败')):
+                self.creator._run(request['request_id'])
+            frozen=self.queued()[0]['fingerprint']['font'];self.assertTrue(frozen)
+            self.creator.resume(request['request_id']);self.creator._run(request['request_id'])
+        self.assertEqual(rng.return_value.sample.call_count,1)
+        self.assertEqual(self.fixture.service.store.all()[0]['fingerprint']['font'],frozen)
+
+    def test_explicit_fonts_stay_unchanged_for_both_batch_modes(self):
+        selected=','.join(self.names[:2])
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            for random_each in (False,True):
+                request=self.request(2,random_each=random_each,request_id=('e' if random_each else 'f')*32)
+                request['profile']['fingerprint']['font']=selected
+                self.creator.start(request)
+                self.assertTrue(all(p['fingerprint']['font']==selected for p in self.queued()))
+                self.creator._run(request['request_id'])
+        rng.assert_not_called();self.configuration._font_config.assert_not_called()
+        self.assertTrue(all(p['fingerprint']['font']==selected for p in self.fixture.service.store.all()))
+
+    def test_native_compiler_uses_registered_fonts_without_drawing_again(self):
+        from configuration import Configuration
+        request=self.request()
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            rng.return_value.sample.return_value=self.names[:30]
+            self.creator.start(request);profile=self.queued()[0];profile.update(id='synthetic',seq=1)
+            configuration=SimpleNamespace(resources=ROOT/'app/resources',_config_command=Configuration._config_command,
+                _display=lambda:{'size':{'width':1920,'height':1080},'workAreaSize':{'width':1920,'height':1040},'scaleFactor':1},
+                _font_config=self.configuration._font_config,sign=lambda *a,**k:b'synthetic')
+            with patch('creation_fingerprint.creation_variations',return_value={'Seed':'synthetic','Sign':'synthetic'}):
+                native,_=build_native(configuration,profile)
+        self.assertEqual(rng.return_value.sample.call_count,1)
+        self.assertEqual(native['FontConfig']['Names'],profile['fingerprint']['font'].split(','))
+
+
+class CreationPortableFontTests(unittest.TestCase):
+    def setUp(self):
+        from configuration import Configuration
+        self.names=['Synthetic Frozen Font','Synthetic Fallback Font']
+        self.fonts=Mock(side_effect=lambda fp:{'BasePath':'synthetic-portable-filter',
+            'Names':[name.strip() for name in fp['font'].split(',')] if fp.get('font') else list(self.names),
+            'BlockFallbackList':[],'Files':[]})
+        self.configuration=SimpleNamespace(resources=ROOT/'app/resources',_config_command=Configuration._config_command,
+            _display=lambda:{'size':{'width':1920,'height':1080},'workAreaSize':{'width':1920,'height':1040},'scaleFactor':1},
+            _font_config=self.fonts,sign=lambda *a,**k:b'synthetic')
+
+    def original(self,kind='1',selected=True):
+        profile=creation_defaults();profile.update(id='synthetic',seq=1)
+        profile['fingerprint'].update(fontType=kind,font=','.join(self.names) if selected else '')
+        with patch('creation_fingerprint.creation_variations',return_value={'Seed':'synthetic','Sign':'synthetic'}):
+            native,_=build_native(self.configuration,profile)
+        self.fonts.reset_mock()
+        return profile,native
+
+    def test_ip_and_noise_recompile_keeps_frozen_fonts_when_target_fonts_are_missing(self):
+        for kind in ('1','2'):
+            with self.subTest(kind=kind):
+                profile,previous=self.original(kind)
+                profile['fingerprint'].update(webRTC='0',canvasValue=54321)
+                profile['_creation_geo']={'ip':'192.0.2.17'}
+                self.fonts.side_effect=LocalBrowserError('synthetic target font missing')
+                with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+                    native,_=build_native(self.configuration,profile,previous)
+                self.fonts.assert_not_called();rng.assert_not_called()
+                self.assertEqual(native['FontConfig'],previous['FontConfig'])
+                self.assertEqual(native['DataProtect'],previous['DataProtect'])
+                self.assertEqual(native['WebRTC']['PublicIP'],'192.0.2.17')
+                self.assertEqual(native['canvasContext']['canvasContextNoiseValue'],54321)
+                self.fonts.side_effect=lambda fp:{'BasePath':'synthetic-portable-filter',
+                    'Names':self.names,'BlockFallbackList':[],'Files':[]}
+
+    def test_legacy_random_empty_field_recovers_the_signed_selection_without_redrawing(self):
+        profile,previous=self.original('2')
+        profile['fingerprint']['font']=''
+        self.fonts.side_effect=LocalBrowserError('synthetic target font missing')
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            first,_=build_native(self.configuration,profile,previous)
+            second,_=build_native(self.configuration,profile,first)
+        self.fonts.assert_not_called();rng.assert_not_called()
+        self.assertEqual(profile['fingerprint']['font'],','.join(self.names))
+        self.assertEqual(first['FontConfig'],previous['FontConfig'])
+        self.assertEqual(second['FontConfig'],previous['FontConfig'])
+
+    def test_custom_empty_field_keeps_original_installed_font_filter(self):
+        profile,previous=self.original(selected=False)
+        self.fonts.side_effect=LocalBrowserError('synthetic target font missing')
+        native,_=build_native(self.configuration,profile,previous)
+        self.fonts.assert_not_called()
+        self.assertEqual(profile['fingerprint']['font'],'')
+        self.assertEqual(native['FontConfig'],previous['FontConfig'])
+
+    def test_legacy_random_comma_names_reuse_twice_without_ambiguous_field_serialization(self):
+        profile,previous=self.original('2')
+        profile['fingerprint']['font']=''
+        previous['FontConfig']['Names']=['Synthetic,Comma Font']
+        self.fonts.side_effect=LocalBrowserError('synthetic target font missing')
+        with patch('creation_fingerprint.secrets.SystemRandom') as rng:
+            first,_=build_native(self.configuration,profile,previous)
+            second,_=build_native(self.configuration,profile,first)
+        self.fonts.assert_not_called();rng.assert_not_called()
+        self.assertEqual(profile['fingerprint']['font'],'')
+        self.assertEqual(first['FontConfig'],previous['FontConfig'])
+        self.assertEqual(second['FontConfig'],previous['FontConfig'])
+
+    def test_signed_font_selection_does_not_gain_new_count_or_name_length_limits(self):
+        self.names=['Synthetic Font '+str(index) for index in range(513)]+['Synthetic '+('x'*300)]
+        profile,previous=self.original()
+        self.fonts.side_effect=LocalBrowserError('synthetic target font missing')
+        native,_=build_native(self.configuration,profile,previous)
+        self.fonts.assert_not_called()
+        self.assertEqual(native['FontConfig'],previous['FontConfig'])
+
+    def test_explicit_changed_fonts_and_new_windows_still_use_current_font_validation(self):
+        profile,previous=self.original()
+        profile['fingerprint']['font']='Synthetic New Font'
+        native,_=build_native(self.configuration,profile,previous)
+        self.fonts.assert_called_once()
+        self.assertEqual(native['FontConfig']['Names'],['Synthetic New Font'])
+        self.fonts.reset_mock();self.fonts.side_effect=LocalBrowserError('synthetic target font missing')
+        with self.assertRaises(LocalBrowserError):build_native(self.configuration,profile)
+        self.fonts.assert_called_once()
+
+    def test_external_font_files_or_invalid_names_cannot_bypass_current_font_validation(self):
+        profile,previous=self.original()
+        for changes in ({'Files':['synthetic-font-file']},{'Names':[]},{'Names':[None]}):
+            with self.subTest(fields=list(changes)):
+                altered=copy.deepcopy(previous);altered['FontConfig'].update(changes)
+                self.fonts.reset_mock()
+                native,_=build_native(self.configuration,profile,altered)
+                self.fonts.assert_called_once()
+                self.assertEqual(native['FontConfig']['Names'],self.names)
+                self.assertEqual(native['FontConfig']['Files'],[])
+
+
 class CreationWebRtcTests(unittest.TestCase):
     def record(self):
         return {'id':'synthetic','created_locally':True,'fingerprint':{**creation_defaults()['fingerprint'],'webRTC':'0'},

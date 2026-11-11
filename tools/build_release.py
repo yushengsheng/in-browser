@@ -17,8 +17,9 @@ ROOT=Path(__file__).resolve().parents[1]
 FIXTURES=('portable-vault-tests.py','portable-browser-tests.py','portable-state-tests.py',
     'signature-guard-tests.py','local-engine-tests.py','local-signer-tests.py','sync-source-tests.py',
     'fingerprint-continuity-tests.py','conservative-policy-tests.py','proxy-runtime-protocol-tests.py')
-TOP=('README.md','AGENTS.md','本地浏览器说明.md','开发说明.md','启动本地浏览器.cmd','VERSION',
+TOP=('README.md','AGENTS.md','本地浏览器说明.md','开发说明.md','启动本地浏览器.cmd','完整迁移到新目录.cmd','VERSION',
      'requirements.txt','THIRD_PARTY_NOTICES.md','.gitignore')
+RUNTIME_EXECUTABLES=('python/python.exe','python/pythonw.exe','node/node.exe','webview2/msedgewebview2.exe')
 
 
 def ordinary(path):
@@ -31,7 +32,7 @@ def source_files(root=ROOT):
     files=[root/name for name in TOP]
     files.extend(p for p in (root/'app').iterdir() if p.suffix in ('.py','.pyw','.js') and p.is_file())
     files.extend(root/'app/ui'/name for name in ('app.js','index.html','style.css','README.md'))
-    files.extend(root/'app/resources'/name for name in ('electron-main.js','crypto.worker.js','defaults.json','signature-verification-public.der','creation-catalog.json'))
+    files.extend(root/'app/resources'/name for name in ('electron-main.js','crypto.worker.js','defaults.json','signature-verification-public.der','creation-catalog.json','pythonnet.config'))
     for directory in ('docs','tests','tools','.github'):
         for path in (root/directory).rglob('*'):
             if path.is_file() and '__pycache__' not in path.parts and path.suffix in ('.py','.pyw','.js','.json','.md','.html','.css','.yml','.yaml','.sha256','.svg','.png','.ico'):
@@ -77,17 +78,28 @@ def main():
         if target==ROOT or ROOT.is_relative_to(target):raise ValueError('Invalid output')
         for parent in target.parents:
             if parent.exists():ordinary(parent)
+        archive_path=target.parent/(target.name+'.zip')
+        if args.zip and (archive_path.exists() or archive_path.is_symlink()):raise ValueError('Archive must be new')
+        runtime=args.runtime_from.resolve() if args.runtime_from else None
+        if runtime:
+            if not runtime.is_dir() or any(not (runtime/name).is_file() for name in RUNTIME_EXECUTABLES):
+                raise ValueError('Runtime missing')
+            ordinary(runtime)
+            for name in RUNTIME_EXECUTABLES:
+                ordinary((runtime/name).parent);ordinary(runtime/name)
         target.mkdir(parents=True)
         for source in source_files():
             path=target/source.relative_to(ROOT);path.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,path)
-        if args.runtime_from:
-            runtime=args.runtime_from.resolve();ordinary(runtime)
-            if not (runtime/'python/python.exe').is_file():raise ValueError('Runtime missing')
-            copy_tree(runtime,target/'runtime');write_manifest(target/'runtime','manifest.sha256.json')
+        if runtime:
+            copy_tree(runtime,target/'runtime')
+            # The default CLR domain reads the executable's config before Python.NET loads.
+            for name in ('python.exe.config','pythonw.exe.config'):
+                shutil.copy2(ROOT/'app/resources/pythonnet.config',target/'runtime/python'/name)
+            write_manifest(target/'runtime','manifest.sha256.json')
             copy_tree(ROOT/'app/engines/148',target/'app/engines/148')
         count=write_manifest(target,'release-manifest.json')
         if args.zip:
-            with zipfile.ZipFile(target.with_suffix('.zip'),'x',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+            with zipfile.ZipFile(archive_path,'x',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
                 for path in sorted(target.rglob('*')):
                     ordinary(path)
                     archive.write(path,path.relative_to(target).as_posix())

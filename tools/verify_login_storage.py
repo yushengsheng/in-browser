@@ -266,7 +266,8 @@ def main(argv=None):
         def verify(*values, **kwargs):
             _require(kwargs.get('allow_device_variance') is True)
             result = original_verify(*values, **kwargs)
-            _require(result.get('passed') is True and result.get('verification_policy') == 'vendor-compatible-148')
+            _require(result.get('passed') is True and result.get('verification_policy')
+                     in ('strict', 'vendor-compatible-' + fixture.CORE))
             report['continuity_rounds'].append({key: result[key] for key in (
                 'verification_policy', 'device_variance_fields', 'environment_args')})
             return result

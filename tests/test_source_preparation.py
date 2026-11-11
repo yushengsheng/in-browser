@@ -134,6 +134,75 @@ class SourcePreparationTests(unittest.TestCase):
         config.prepare_source=lambda identity,core:prepared.setdefault(identity,full(identity))
         return BitSource(config)
 
+    def test_sibling_portable_packages_both_discover_shared_vendor_without_writing_it(self):
+        before={p.relative_to(self.base).as_posix():hashlib.sha256(p.read_bytes()).hexdigest()
+                for folder in (self.vendor,self.profiles) for p in folder.rglob('*') if p.is_file()}
+        providers=[]
+        for package in ('A','B'):
+            root=self.base/package/'app/data';root.mkdir(parents=True)
+            (root/'portable-mode.bin').write_bytes(b'synthetic portable marker')
+            config=SimpleNamespace(root=root,vendor_data=self.vendor,independent=True,
+                source_detail=lambda identity:full(identity),source_archive=lambda:{'items':{}})
+            providers.append(BitSource(config))
+        processes=SimpleNamespace(uncertain=lambda _:False,occupied=lambda _:False)
+        with patch('bit_source.ProfileProcessSnapshot',return_value=processes):
+            found=[provider.discover() for provider in providers]
+        self.assertEqual([[row['source_id'] for row in rows] for rows in found],[[A,B],[A,B]])
+        self.assertTrue(all(row['status']=='ready' for rows in found for row in rows))
+        self.assertEqual(providers[0].vendor_data,providers[1].vendor_data)
+        self.assertNotEqual(providers[0].configuration.root,providers[1].configuration.root)
+        after={p.relative_to(self.base).as_posix():hashlib.sha256(p.read_bytes()).hexdigest()
+               for folder in (self.vendor,self.profiles) for p in folder.rglob('*') if p.is_file()}
+        self.assertEqual(before,after)
+        for provider in providers:
+            self.assertEqual([p.name for p in provider.configuration.root.iterdir()],['portable-mode.bin'])
+
+    def test_same_provider_discovers_vendor_installed_after_first_preview(self):
+        provider=self.provider()
+        (self.root/'portable-mode.bin').write_bytes(b'synthetic portable marker')
+        saved=self.vendor/'database-not-installed'
+        self.database.rename(saved)
+        processes=SimpleNamespace(uncertain=lambda _:False,occupied=lambda _:False)
+        with patch('bit_source.ProfileProcessSnapshot',return_value=processes):
+            self.assertEqual(provider.discover(),[])
+            saved.rename(self.database)
+            found=provider.discover()
+            self.assertEqual([row['source_id'] for row in found],[A,B])
+            self.assertTrue(all(row['status']=='ready' for row in found))
+            self.database.rename(saved)
+            self.assertEqual(provider.discover(),[])
+        self.assertFalse((self.root/'windows.sqlite').exists())
+
+    def test_same_provider_refreshes_vendor_cache_directory_from_wal(self):
+        provider=self.provider()
+        processes=SimpleNamespace(uncertain=lambda _:False,occupied=lambda _:False)
+        moved=self.base/'new vendor cache';shutil.copytree(self.profiles,moved)
+        con=sqlite3.connect(self.database)
+        try:
+            con.execute('PRAGMA journal_mode=WAL')
+            with patch('bit_source.ProfileProcessSnapshot',return_value=processes):
+                first=provider.discover()
+                con.execute('UPDATE global_configs SET config_value=? WHERE config_name=?',
+                    (str(moved),'browser_cache_dir'));con.commit()
+                second=provider.discover()
+        finally:con.close()
+        self.assertEqual([row['source_key'] for row in first],[row['source_key'] for row in second])
+        self.assertTrue(all(row['profile_path'].parent==moved for row in second))
+        with self.assertRaises(LocalBrowserError):provider.revalidate(first[0])
+
+    def test_missing_vendor_returns_only_unavailable_archived_sources(self):
+        provider=self.provider()
+        (self.root/'portable-mode.bin').write_bytes(b'synthetic portable marker')
+        provider.configuration.source_archive=lambda:{'items':{A:{'detail':full(A)}}}
+        self.database.rename(self.vendor/'database-not-installed')
+        with patch('bit_source.ProfileProcessSnapshot') as processes:
+            rows=provider.discover()
+        processes.assert_not_called()
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['status'],'missing_data')
+        self.assertEqual(rows[0]['source_id'],A)
+        self.assertFalse((self.root/'windows.sqlite').exists())
+
     def test_source_change_after_preparation_forces_refresh_before_copy(self):
         from configuration import Configuration
         reader=self.reader()

@@ -164,8 +164,10 @@ class InstallationFixture(unittest.TestCase):
         self.assertTrue(calls)
         self.assertEqual(before, inspector.database_fingerprint(self.database, self.deadline()))
 
-    def test_all_three_browser_databases_connect_only_to_copies(self):
-        originals = [(self.profile / relative).as_uri() for relative, _, _ in inspector._DATABASES]
+    def test_all_browser_databases_connect_only_to_copies(self):
+        expected = ('Default/Network/Cookies', 'Default/Cookies',
+                    'Default/Login Data', 'Default/Login Data For Account')
+        originals = [(self.profile / relative).as_uri() for relative in expected]
         original_connect = sqlite3.connect
         calls = []
         def connect(path, *args, **kwargs):
@@ -177,7 +179,10 @@ class InstallationFixture(unittest.TestCase):
                 patch.object(inspector.sqlite3, 'connect', side_effect=connect):
             result = inspector.inspect_profile(self.profile, self.private, self.deadline())
         self.assertTrue(result.get('browser_ciphertext_authenticated'))
-        self.assertEqual(len(calls), 3)
+        self.assertCountEqual([path.split('/Default/', 1)[-1].split('?', 1)[0]
+                               for path in calls],
+                              [relative.removeprefix('Default/').replace(' ', '%20')
+                               for relative in expected])
         self.assertEqual(before, inspector.profile_digest(self.profile))
         self.assertEqual(processes.call_count, 2)
         self.assertTrue(all(call.kwargs.get('require_inspectable') is True for call in processes.call_args_list))

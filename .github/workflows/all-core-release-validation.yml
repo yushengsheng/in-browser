@@ -1,0 +1,146 @@
+name: All-core Windows 10 and 11 x64 source-device acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Draft release containing the exact candidate ZIP
+        type: string
+        required: true
+      asset_name:
+        description: Candidate ZIP asset name
+        type: string
+        required: true
+      archive_sha256:
+        description: Independently recorded SHA256 of the candidate ZIP
+        type: string
+        required: true
+
+# Reading the explicitly selected unpublished draft assets needs this permission.
+# This workflow only downloads and tests; it never publishes a release.
+permissions:
+  contents: write
+
+# Both manual acceptance workflows share fixed loopback fixtures.
+# Serialize complete runs and core jobs, including runners sharing one host.
+concurrency:
+  group: inbrowser-desktop-acceptance
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      fixtures: ${{ steps.plan.outputs.fixtures }}
+      fixture_release: ${{ steps.plan.outputs.fixture_release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: plan
+        name: Require a pinned synthetic source-device fixture for every supported core
+        run: python tools/unpack_core_fixture.py --plan --manifest .github/all-core-fixtures.json --github-output "$GITHUB_OUTPUT"
+
+  core:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [win10, win11]
+        fixture: ${{ fromJSON(needs.plan.outputs.fixtures) }}
+    runs-on: [self-hosted, Windows, X64, "${{ matrix.os }}"]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Optional manual entry; this configuration is not evidence of a desktop run.
+      # Register a dedicated x64 client runner in an unlocked user session, not as a service.
+      - name: Require the matching real Windows desktop and host tools
+        id: environment
+        env:
+          EXPECTED_DESKTOP: ${{ matrix.os }}
+        shell: pwsh
+        run: |
+          $jobRoot = Join-Path $env:RUNNER_TEMP ("ib-" + [Guid]::NewGuid().ToString('N').Substring(0, 12))
+          New-Item -ItemType Directory -Path $jobRoot -ErrorAction Stop | Out-Null
+          $reports = Join-Path $jobRoot 'reports'
+          New-Item -ItemType Directory -Path $reports -ErrorAction Stop | Out-Null
+          "IB_WORK=$jobRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "IB_PACKAGE=$(Join-Path $jobRoot 'package')" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "IB_REPORTS=$reports" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "reports=$reports" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            '{"format":1,"success":false,"checks":{"host_python":false}}' | Set-Content -LiteralPath (Join-Path $reports 'desktop-runner.json')
+            throw 'Desktop runner requires Python 3.10+ on PATH'
+          }
+          python -B tools/verify_desktop_runner.py --expected $env:EXPECTED_DESKTOP --report (Join-Path $reports 'desktop-runner.json') --work-dir (Join-Path $jobRoot 'live')
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop preflight failed: require matching Windows 10/11 client x64, unlocked interactive desktop, Python 3.10+, Git, GitHub CLI and PowerShell 7; configure a shorter RUNNER_TEMP if work_path_within_60_utf16 is false' }
+      - name: Authenticate the unchanged empty candidate
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        shell: pwsh
+        run: |
+          if ($env:CANDIDATE_TAG -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or $env:ASSET_NAME -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.zip$' -or $env:ARCHIVE_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid candidate identifiers' }
+          $package = $env:IB_PACKAGE
+          $reports = $env:IB_REPORTS
+          gh release download $env:CANDIDATE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --dir $env:IB_WORK 2>$null
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+          python tools/release_archive.py --archive (Join-Path $env:IB_WORK $env:ASSET_NAME) --sha256 $env:ARCHIVE_SHA256 --destination $package --source-root $env:GITHUB_WORKSPACE --report (Join-Path $reports 'archive.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate archive or source verification failed' }
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Authenticate and load this core's synthetic source-device fixture
+        id: fixture
+        if: ${{ !cancelled() && steps.package.outputs.ready == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FIXTURE_TAG: ${{ needs.plan.outputs.fixture_release }}
+          FIXTURE_ASSET: ${{ matrix.fixture.asset }}
+          CORE: ${{ matrix.fixture.core }}
+        shell: pwsh
+        run: |
+          gh release download $env:FIXTURE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:FIXTURE_ASSET --dir $env:IB_WORK 2>$null
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic core fixture download failed' }
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/unpack_core_fixture.py" --manifest "$env:GITHUB_WORKSPACE/.github/all-core-fixtures.json" --archive (Join-Path $env:IB_WORK $env:FIXTURE_ASSET) --core $env:CORE --package $env:IB_PACKAGE --report "$env:IB_REPORTS/fixture.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic core fixture verification failed' }
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Require production migration without replacing the source baseline
+        if: ${{ !cancelled() && steps.fixture.outputs.ready == 'true' }}
+        env:
+          CORE: ${{ matrix.fixture.core }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_all_core_device.py" --execute --core $env:CORE
+          $status = $LASTEXITCODE
+          foreach ($name in @('all-core-device.json', 'login-storage.json', 'portable-device.json')) {
+            $path = Join-Path "$env:IB_PACKAGE/analysis/reports" $name
+            if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination (Join-Path $env:IB_REPORTS $name) }
+          }
+          if ($status -ne 0) { throw 'Production source-device migration acceptance failed' }
+      - name: Compare unchanged stock and independent cores on this device
+        if: ${{ !cancelled() && steps.fixture.outputs.ready == 'true' }}
+        env:
+          CORE: ${{ matrix.fixture.core }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/compare_vendor_runtime.py" --execute --core $env:CORE
+          $status = $LASTEXITCODE
+          $path = "$env:IB_PACKAGE/analysis/reports/vendor-runtime-comparison.json"
+          if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination "$env:IB_REPORTS/vendor-runtime-comparison.json" }
+          if ($status -ne 0) { throw 'Stock and independent runtime comparison failed' }
+      - name: Preserve anonymous evidence even when a production gate rejects the core
+        if: ${{ always() && steps.environment.outputs.reports != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: all-core-${{ matrix.os }}-${{ matrix.fixture.core }}
+          path: ${{ steps.environment.outputs.reports }}/*.json
+          if-no-files-found: warn
+          retention-days: 14

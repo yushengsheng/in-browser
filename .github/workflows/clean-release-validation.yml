@@ -1,0 +1,123 @@
+name: Clean Windows 10 and 11 x64 desktop acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Draft release containing the exact candidate ZIP
+        type: string
+        required: true
+      asset_name:
+        description: Candidate ZIP asset name
+        type: string
+        required: true
+      archive_sha256:
+        description: Independently recorded SHA256 of the candidate ZIP
+        type: string
+        required: true
+
+# GitHub requires write access to read an unpublished draft release asset.
+# No step creates or publishes releases, tags, commits, or repository changes.
+permissions:
+  contents: write
+
+# Both manual acceptance workflows share fixed loopback fixtures.
+# Serialize complete runs and core jobs, including runners sharing one host.
+concurrency:
+  group: inbrowser-desktop-acceptance
+  cancel-in-progress: false
+
+jobs:
+  clean-windows:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [win10, win11]
+    runs-on: [self-hosted, Windows, X64, "${{ matrix.os }}"]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Optional manual entry; this configuration is not evidence of a desktop run.
+      # Register a dedicated x64 client runner in an unlocked user session, not as a service.
+      - name: Require the matching real Windows desktop and host tools
+        id: environment
+        env:
+          EXPECTED_DESKTOP: ${{ matrix.os }}
+        shell: pwsh
+        run: |
+          $jobRoot = Join-Path $env:RUNNER_TEMP ("ib-" + [Guid]::NewGuid().ToString('N').Substring(0, 12))
+          New-Item -ItemType Directory -Path $jobRoot -ErrorAction Stop | Out-Null
+          $reports = Join-Path $jobRoot 'reports'
+          New-Item -ItemType Directory -Path $reports -ErrorAction Stop | Out-Null
+          "IB_WORK=$jobRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "IB_PACKAGE=$(Join-Path $jobRoot 'package')" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "IB_REPORTS=$reports" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "reports=$reports" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            '{"format":1,"success":false,"checks":{"host_python":false}}' | Set-Content -LiteralPath (Join-Path $reports 'desktop-runner.json')
+            throw 'Desktop runner requires Python 3.10+ on PATH'
+          }
+          python -B tools/verify_desktop_runner.py --expected $env:EXPECTED_DESKTOP --report (Join-Path $reports 'desktop-runner.json') --work-dir (Join-Path $jobRoot 'live')
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop preflight failed: require matching Windows 10/11 client x64, unlocked interactive desktop, Python 3.10+, Git, GitHub CLI and PowerShell 7; configure a shorter RUNNER_TEMP if work_path_within_60_utf16 is false' }
+      - name: Download and authenticate the exact empty candidate
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        shell: pwsh
+        run: |
+          if ($env:CANDIDATE_TAG -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$' -or $env:ASSET_NAME -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.zip$' -or $env:ARCHIVE_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'Invalid candidate identifiers' }
+          $package = $env:IB_PACKAGE
+          $reports = $env:IB_REPORTS
+          gh release download $env:CANDIDATE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --dir $env:IB_WORK 2>$null
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
+          # Host Python only preflights/authenticates/extracts the ZIP using its standard library.
+          # Every application and test step below uses the bundled Python and Node.
+          python tools/release_archive.py --archive (Join-Path $env:IB_WORK $env:ASSET_NAME) --sha256 $env:ARCHIVE_SHA256 --destination $package --source-root $env:GITHUB_WORKSPACE --report (Join-Path $reports 'archive.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate archive or source verification failed' }
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Check all source contracts and frontend states using bundled runtimes
+        if: ${{ !cancelled() && steps.package.outputs.ready == 'true' }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/check_project.py" --report "$env:IB_REPORTS/source-check.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Source checks failed' }
+          $result = Get-Content -LiteralPath "$env:IB_REPORTS/source-check.json" -Raw | ConvertFrom-Json
+          if (-not $result.success -or $result.counts.failed -ne 0 -or $result.counts.skipped -ne 0 -or @($result.checks | Where-Object { $_.name -eq 'frontend-state' -and $_.status -eq 'passed' }).Count -ne 1) { throw 'A required source or frontend check did not pass' }
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tests/test_release_archive.py"
+          if ($LASTEXITCODE -ne 0) { throw 'Archive safety tests failed' }
+      - name: Show and close a fresh empty manager
+        if: ${{ !cancelled() && steps.package.outputs.ready == 'true' }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_clean_start.py" --execute | Out-File -FilePath "$env:IB_REPORTS/clean-start.json" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh manager acceptance failed' }
+      - name: Create import isolate and migrate synthetic login storage
+        if: ${{ !cancelled() && steps.package.outputs.ready == 'true' }}
+        shell: pwsh
+        run: |
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_release_workflow.py" --execute --package "$env:IB_PACKAGE" --work-dir "$env:IB_WORK/live" --report "$env:IB_REPORTS/workflow.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic creation and migration acceptance failed' }
+      - name: Create reopen batch and delete using the bundled core without BitBrowser
+        if: ${{ !cancelled() && steps.package.outputs.ready == 'true' }}
+        shell: pwsh
+        run: |
+          '{"format":1,"purpose":"isolated-local-creation"}' | Set-Content -LiteralPath "$env:IB_PACKAGE/local-creation-test.json" -Encoding utf8NoBOM
+          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_local_creation.py" --execute --cores 148 --batch 2
+          $status = $LASTEXITCODE
+          $report = "$env:IB_PACKAGE/analysis/reports/local-creation-live.json"
+          if (Test-Path -LiteralPath $report) { Copy-Item -LiteralPath $report -Destination "$env:IB_REPORTS/local-creation.json" }
+          if ($status -ne 0) { throw 'Bundled core creation acceptance failed' }
+      - name: Keep anonymous reports only
+        if: ${{ always() && steps.environment.outputs.reports != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clean-windows-${{ matrix.os }}
+          path: ${{ steps.environment.outputs.reports }}/*.json
+          if-no-files-found: warn
+          retention-days: 14

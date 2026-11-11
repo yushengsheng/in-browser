@@ -105,14 +105,19 @@
               </button>
             </div>
             <div class="filter-row">
+              <div class="profile-search">
               <label class="search-input"
                 ><span data-icon="search"></span
-                ><input
+                ><textarea
                   id="search-input"
-                  type="search"
-                  placeholder="搜索名称、序号、备注或代理 IP"
-                  aria-label="搜索窗口" /></label
-              ><select id="group-filter" aria-label="按分组筛选">
+                  rows="1"
+                  placeholder="名称、序号、备注或 IP（最多10项）"
+                  title="支持换行、逗号或分号分隔，最多10项，匹配任意一项"
+                  aria-label="搜索窗口，最多10项"
+                  aria-describedby="search-feedback"></textarea></label>
+              <p id="search-feedback" class="search-feedback" role="status" hidden></p>
+              </div>
+              <select id="group-filter" aria-label="按分组筛选">
                 <option value="">全部分组</option></select
               ><select id="tag-filter" aria-label="按标签筛选">
                 <option value="">全部标签</option></select
@@ -363,7 +368,7 @@
         <section id="sync-preview" aria-label="选择同步窗口">
           <div class="sync-toolbar">
             <label class="search-input"><span data-icon="search"></span><input id="sync-search" type="search" placeholder="搜索窗口名称或序号" aria-label="搜索待同步窗口"></label>
-            <button id="sync-reload" class="button small"><span data-icon="refresh"></span>重新预览</button>
+            <button id="sync-reload" class="button small"><span data-icon="refresh"></span>重新检测</button>
           </div>
           <p id="sync-preview-summary" class="sync-summary" role="status">正在读取本机窗口…</p>
           <div class="sync-table-scroll">
@@ -380,7 +385,7 @@
           <div id="sync-result-list" class="sync-result-list" role="log" aria-live="polite"></div>
         </section>
       </div>
-      <footer class="sync-footer"><span id="sync-footer-note" class="muted">其他云端窗口不在本次同步范围内</span><div class="footer-buttons"><button id="sync-cancel-job" class="button danger-text" hidden>取消剩余同步</button><button id="sync-retry-status" class="button" hidden>继续读取进度</button><button id="sync-dismiss" class="button">关闭</button><button id="sync-start" class="button primary" disabled>同步所选窗口</button></div></footer>
+      <footer class="sync-footer"><span id="sync-footer-note" class="muted">检测不复制资料；点击开始同步后才正式复制</span><div class="footer-buttons"><button id="sync-cancel-job" class="button danger-text" hidden>取消剩余同步</button><button id="sync-retry-status" class="button" hidden>继续读取进度</button><button id="sync-dismiss" class="button">关闭</button><button id="sync-start" class="button primary" disabled>开始同步</button></div></footer>
     </dialog>
     <div id="row-menu" class="row-menu" role="menu" hidden></div>
     <dialog id="creation-dialog" class="sync-dialog" aria-labelledby="creation-title">

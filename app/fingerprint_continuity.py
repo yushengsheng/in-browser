@@ -23,7 +23,8 @@ import uuid
 
 from browser_core import APP_ROOT, BrowserController, CDP, sha256
 from browser_processes import profile_processes
-from environment_compatibility import compatibility_candidate, validated_environment_args, vendor_device_differences
+from environment_compatibility import (compatibility_candidate, validated_environment_args,
+                                       vendor_compatibility_policy, vendor_device_differences)
 from local_state import LocalBrowserError
 
 
@@ -718,7 +719,7 @@ def create_baseline(record, root, *, progress=None):
 
 
 def verify_continuity(record, root, *, allow_device_variance=False):
-    """Keep strict enrollment; normal opens may accept stock-verified variations."""
+    """Keep strict enrollment; normal opens may accept bounded device variations."""
     baseline = record.get('_continuity')
     if not isinstance(baseline, dict) or baseline.get('format') != FORMAT or baseline.get('probe_version') != PROBE_VERSION:
         raise _blocked(['baseline'])
@@ -776,6 +777,5 @@ def verify_continuity(record, root, *, allow_device_variance=False):
             'unavailable_fields': list(baseline.get('unavailable') or []),
             'environment_args': environment_args,
             'device_variance_fields': accepted,
-            'verification_policy': ('vendor-compatible-148' if allow_device_variance is True
-                                    and record['_runtime'].get('signature_provider') == 'local-v1'
-                                    and str(record['_runtime'].get('core_major')) == '148' else 'strict')}
+             'verification_policy': (vendor_compatibility_policy(record['_runtime'])
+                                     if allow_device_variance is True else 'strict')}

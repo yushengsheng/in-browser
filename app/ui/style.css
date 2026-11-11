@@ -443,6 +443,31 @@ a {
   font-size: 11px;
   background: #fcfdff;
 }
+.profile-search {
+  width: 360px;
+  max-width: 44%;
+}
+.profile-search .search-input {
+  width: 100%;
+  max-width: none;
+}
+.profile-search textarea {
+  min-height: 33px;
+  padding: 8px 11px 8px 34px;
+  font-size: 11px;
+  line-height: 17px;
+  background: #fcfdff;
+  resize: none;
+}
+.search-feedback {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.search-feedback.error {
+  color: #b84c48;
+}
 .search-input svg {
   width: 15px;
   height: 15px;
@@ -468,7 +493,7 @@ a {
 .table-scroll {
   overflow: auto;
   flex: 1;
-  min-height: 300px;
+  min-height: 0;
   position: relative;
 }
 .profile-table {
@@ -484,6 +509,11 @@ a {
   color: #8794a7;
 }
 .profile-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f8fafd;
+  box-shadow: 0 1px 0 var(--border);
   height: 42px;
   padding: 0 12px;
   font-weight: 400;
@@ -1474,6 +1504,12 @@ a {
     flex-wrap: wrap;
   }
   .search-input {
+    width: 270px;
+    max-width: 100%;
+    flex: 1;
+    min-width: 180px;
+  }
+  .profile-search {
     width: 270px;
     max-width: 100%;
     flex: 1;

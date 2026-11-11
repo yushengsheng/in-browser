@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -17,6 +18,36 @@ class Bridge:
     def __init__(self,service): self._service=service
     def request(self,action,payload=None): return self._service.request(action,payload)
 
+def _focus_existing_manager():
+    import psutil
+    user=ctypes.WinDLL('user32')
+    user.FindWindowExW.argtypes=[wintypes.HWND,wintypes.HWND,wintypes.LPCWSTR,wintypes.LPCWSTR]
+    user.FindWindowExW.restype=wintypes.HWND
+    user.GetWindowThreadProcessId.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.DWORD)]
+    user.ShowWindow.argtypes=[wintypes.HWND,ctypes.c_int]
+    user.SetForegroundWindow.argtypes=[wintypes.HWND]
+    entry=os.path.normcase(str(APP_ROOT/'local_browser.pyw'))
+    runtime=Path(sys.executable).resolve().parent
+    window=None
+    for _ in range(1024):
+        window=user.FindWindowExW(None,window,None,TITLE)
+        if not window:return False
+        owner=wintypes.DWORD();user.GetWindowThreadProcessId(window,ctypes.byref(owner))
+        try:
+            process=psutil.Process(owner.value)
+            with process.oneshot():
+                created=process.create_time();executable=Path(process.exe()).resolve()
+                arguments=process.cmdline()
+            if executable.parent!=runtime or executable.name.casefold() not in ('python.exe','pythonw.exe'):continue
+            if not any(os.path.normcase(str(Path(value).resolve()))==entry for value in arguments[1:]
+                       if isinstance(value,str) and Path(value).suffix.casefold()=='.pyw'):continue
+            current=wintypes.DWORD();user.GetWindowThreadProcessId(window,ctypes.byref(current))
+            if current.value!=owner.value or abs(psutil.Process(owner.value).create_time()-created)>=.01:continue
+            user.ShowWindow(window,9);user.SetForegroundWindow(window)
+            return True
+        except (psutil.Error,OSError,ValueError):continue
+    return False
+
 def main():
     if '--self-check' in sys.argv:
         initialize_installation()
@@ -26,16 +57,21 @@ def main():
         return
     kernel=ctypes.WinDLL('kernel32',use_last_error=True)
     kernel.CreateMutexW.argtypes=[ctypes.c_void_p,wintypes.BOOL,wintypes.LPCWSTR]; kernel.CreateMutexW.restype=wintypes.HANDLE
-    handle=kernel.CreateMutexW(None,False,'LocalBrowser-'+hashlib.sha256(str(APP_ROOT).encode()).hexdigest()[:24])
+    handle=kernel.CreateMutexW(None,False,'LocalBrowser-'+hashlib.sha256(os.path.normcase(str(APP_ROOT)).encode()).hexdigest()[:24])
     try:
         if ctypes.get_last_error()==183:
-            user=ctypes.WinDLL('user32'); user.FindWindowW.argtypes=[wintypes.LPCWSTR,wintypes.LPCWSTR]; user.FindWindowW.restype=wintypes.HWND
-            window=user.FindWindowW(None,TITLE)
-            if window: user.ShowWindow(window,9); user.SetForegroundWindow(window)
+            _focus_existing_manager()
             return
-        import webview
         bundled_webview=APP_ROOT.parent/'runtime/webview2'
-        if (bundled_webview/'msedgewebview2.exe').is_file():webview.settings['WEBVIEW2_RUNTIME_PATH']=str(bundled_webview)
+        if not (bundled_webview/'msedgewebview2.exe').is_file():
+            raise RuntimeError('随包WebView2运行环境缺失，请恢复完整便携目录；不会改用系统环境。')
+        os.environ['WEBVIEW2_BROWSER_EXECUTABLE_FOLDER']=str(bundled_webview)
+        os.environ['WEBVIEW2_USER_DATA_FOLDER']=str(DATA_ROOT/'manager-webview')
+        for name in ('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS','WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER',
+                     'WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER'):
+            os.environ.pop(name,None)
+        import webview
+        webview.settings['WEBVIEW2_RUNTIME_PATH']=str(bundled_webview)
         initialize_installation()
         service=ManagerService()
         window=webview.create_window(TITLE,str(APP_ROOT/'ui/index.html'),js_api=Bridge(service),width=1460,height=920,min_size=(900,600),background_color='#f5f7fa',text_select=True)

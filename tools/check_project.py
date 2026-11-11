@@ -285,6 +285,13 @@ def main(argv=None):
             creation = ROOT / 'tests/test_window_creation.py'
             entries.append(run_command('window-creation', [python, '-B', str(creation)], 'unittest', env))
             entries.append(run_command('creation-parity', [python, '-B', str(ROOT/'tests/test_creation_parity.py')], 'unittest', env))
+            entries.append(run_command('bundled-core-creation', [python, '-B', str(ROOT/'tests/test_bundled_core_creation.py')], 'unittest', env))
+            entries.append(run_command('portable-transfer', [python, '-B', str(ROOT/'tests/test_portable_transfer.py')], 'unittest', env))
+            entries.append(run_command('direct-portable-launch', [python, '-B', str(ROOT/'tests/test_direct_portable_launch.py')], 'unittest', env))
+            entries.append(run_command('release-builder', [python, '-B', str(ROOT/'tests/test_release_builder.py')], 'unittest', env))
+            entries.append(run_command('release-archive', [python, '-B', str(ROOT/'tests/test_release_archive.py')], 'unittest', env))
+            entries.append(run_command('desktop-runner', [python, '-B', str(ROOT/'tests/test_desktop_runner.py')], 'unittest', env))
+            entries.append(run_command('extension-portability', [python, '-B', str(ROOT/'tests/test_extension_portability.py')], 'unittest', env))
             ssh = ROOT / 'tests/test_ssh_proxy.py'
             entries.append(run_command('ssh-proxy', [python, '-B', str(ssh)], 'unittest', env))
             dynamic = ROOT / 'tests/test_dynamic_proxy.py'
@@ -295,6 +302,7 @@ def main(argv=None):
             entries.append(run_command('private-session-verifier', [python, '-B', str(ROOT/'tests/test_private_session_verifier.py')], 'unittest', env))
             entries.append(run_command('vendor-runtime-restore', [python, '-B', str(ROOT/'tests/test_vendor_runtime_restore.py')], 'unittest', env))
             entries.append(run_command('fixture-runtime-guard', [python, '-B', str(ROOT/'tests/test_fixture_runtime_guard.py')], 'unittest', env))
+            entries.append(run_command('all-core-fixture-ownership', [python, '-B', str(ROOT/'tests/test_all_core_fixture_ownership.py')], 'unittest', env))
             entries.append(run_command('private-network-diagnostic', [python, '-B', str(ROOT/'tests/test_private_network_diagnostic.py')], 'unittest', env))
             for name, style in FIXTURES:
                 path = ROOT / 'analysis' / name
