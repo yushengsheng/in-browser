@@ -10,6 +10,9 @@ import stat
 import sys
 import zipfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from overlay_layout import PACKAGE_DIRECTORY, MARKER, LAUNCHER, BOOTSTRAP, RETIRED_LAUNCHERS, launcher_bytes
+
 MAX_FILES = 40000
 MAX_BYTES = 4 * 1024 ** 3
 MAX_MANIFEST = 16 * 1024 ** 2
@@ -18,6 +21,9 @@ REQUIRED = ('VERSION', 'release-manifest.json', 'runtime/manifest.sha256.json',
             'runtime/node/node.exe', 'runtime/webview2/msedgewebview2.exe',
             'app/engines/148/BitBrowser.exe', 'app/engines/148/manifest.json',
             'app/resources/pythonnet.config', 'tools/check_project.py')
+OVERLAY_REQUIRED = REQUIRED + (MARKER, LAUNCHER, BOOTSTRAP, 'app/local_browser.pyw',
+                               'app/update_guard.py', 'tools/inplace_update.py',
+                               'tools/overlay_layout.py', 'update-policy.json')
 
 
 def require(condition):
@@ -60,6 +66,8 @@ def manifest(raw):
     folded = set()
     for name, entry in files.items():
         relative_name(name)
+        first = name.split('/')[0].casefold()
+        require(first != PACKAGE_DIRECTORY and not first.startswith('.program-update-backup-'))
         require(name.casefold() not in folded)
         folded.add(name.casefold())
         require(isinstance(entry, dict) and type(entry.get('bytes')) is int
@@ -75,6 +83,28 @@ def digest(path):
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             value.update(block)
     return value.hexdigest()
+
+
+def package_layout(names, read_small):
+    """Return the program prefix after authenticating generated overlay fields."""
+    overlay_names = {name for name in names if name.split('/')[0].casefold() == PACKAGE_DIRECTORY}
+    if not overlay_names:
+        return '', None
+    require(all(name.startswith(PACKAGE_DIRECTORY + '/') for name in overlay_names))
+    identities = {PurePosixPath(name).parts[1] for name in overlay_names}
+    require(len(identities) == 1)
+    package_id = next(iter(identities))
+    require(re.fullmatch('[0-9a-f]{32}', package_id) is not None)
+    prefix = PACKAGE_DIRECTORY + '/' + package_id + '/'
+    require(all(name.startswith(prefix) or name == LAUNCHER for name in names))
+    require({LAUNCHER, prefix + LAUNCHER, prefix + MARKER, prefix + BOOTSTRAP} <= set(names))
+    marker = json.loads(read_small(prefix + MARKER), object_pairs_hook=no_duplicates)
+    require(isinstance(marker, dict) and set(marker) == {'format', 'package_id'}
+            and type(marker['format']) is int and marker['format'] == 1
+            and marker['package_id'] == package_id)
+    launcher = launcher_bytes(package_id)
+    require(read_small(LAUNCHER) == launcher and read_small(prefix + LAUNCHER) == launcher)
+    return prefix, package_id
 
 
 def extract(archive_path, expected, destination):
@@ -101,30 +131,49 @@ def extract(archive_path, expected, destination):
                 directories.add(name)
             else:
                 files[name] = entry
-        # The builder emits a flat ZIP. Also accept a single ordinary wrapper folder.
+        # Both layouts also accept one ordinary, user-visible wrapper folder.
         prefix = ''
-        if 'release-manifest.json' not in files:
+        if 'release-manifest.json' not in files and LAUNCHER not in files:
             wrappers = {PurePosixPath(name).parts[0] for name in files}
             require(len(wrappers) == 1)
             prefix = next(iter(wrappers)) + '/'
-            require(prefix + 'release-manifest.json' in files)
         normalized = {name[len(prefix):]: entry for name, entry in files.items()}
         require(all(name.startswith(prefix) for name in files))
-        require(all(name in normalized for name in REQUIRED))
+        require(all(name == prefix.rstrip('/') or name.startswith(prefix) for name in directories))
+        normalized_directories = {name[len(prefix):] for name in directories if name != prefix.rstrip('/')}
+        def read_small(name):
+            require(normalized[name].file_size <= 8192)
+            return archive.read(normalized[name])
+        program_prefix, package_id = package_layout(normalized, read_small)
+        program_files = {name[len(program_prefix):]: entry for name, entry in normalized.items()
+                         if name.startswith(program_prefix)}
+        require(all(name in program_files for name in (OVERLAY_REQUIRED if package_id else REQUIRED)))
+        if package_id:
+            require(not {name.casefold() for name in RETIRED_LAUNCHERS}.intersection(
+                name.casefold() for name in program_files))
+            version = read_small(program_prefix + 'VERSION').decode('utf-8-sig').strip()
+            require(re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version) is not None)
+            require(all(name in (PACKAGE_DIRECTORY, program_prefix.rstrip('/'))
+                        or name.startswith(program_prefix) for name in normalized_directories))
+        else:
+            require(not any(name.split('/')[0].casefold() == PACKAGE_DIRECTORY for name in normalized_directories))
         forbidden = ('app/data', 'app/local-engines', '.git')
-        for name in (*files, *directories):
-            relative = name[len(prefix):].casefold()
+        for name in (*program_files, *(name[len(program_prefix):] for name in normalized_directories
+                                       if name.startswith(program_prefix))):
+            relative = name.casefold()
             require(not any(relative == item or relative.startswith(item + '/') for item in forbidden))
+            first = relative.split('/')[0]
+            require(first != PACKAGE_DIRECTORY and not first.startswith('.program-update-backup-'))
         # A file cannot also be an ancestor directory, including Windows case aliases.
         file_names = {name.casefold() for name in files}
         require(all(not any(parent.as_posix().casefold() in file_names
                             for parent in PurePosixPath(name).parents if str(parent) != '.')
                     for name in (*files, *directories)))
-        require(normalized['release-manifest.json'].file_size <= MAX_MANIFEST
-                and normalized['runtime/manifest.sha256.json'].file_size <= MAX_MANIFEST)
-        release = manifest(archive.read(normalized['release-manifest.json']))
-        require(set(release) == set(normalized) - {'release-manifest.json'})
-        runtime = manifest(archive.read(normalized['runtime/manifest.sha256.json']))
+        require(program_files['release-manifest.json'].file_size <= MAX_MANIFEST
+                and program_files['runtime/manifest.sha256.json'].file_size <= MAX_MANIFEST)
+        release = manifest(archive.read(program_files['release-manifest.json']))
+        require(set(release) == set(program_files) - {'release-manifest.json'})
+        runtime = manifest(archive.read(program_files['runtime/manifest.sha256.json']))
         expected_runtime = {name[len('runtime/'):]: value for name, value in release.items()
                             if name.startswith('runtime/') and name != 'runtime/manifest.sha256.json'}
         require(runtime == expected_runtime)
@@ -147,27 +196,51 @@ def extract(archive_path, expected, destination):
                     output.write(block)
                     hashed.update(block)
             require(size == entry.file_size)
-            if name in release:
-                require({'bytes': size, 'sha256': hashed.hexdigest()} == release[name])
-        return {'success': True, 'files': len(normalized), 'bytes': total,
+            relative = name[len(program_prefix):] if name.startswith(program_prefix) else None
+            if relative in release:
+                require({'bytes': size, 'sha256': hashed.hexdigest()} == release[relative])
+        report = {'success': True, 'files': len(normalized), 'bytes': total,
                 'archive_digest_verified': True, 'complete_manifest_verified': True,
-                'runtime_manifest_verified': True, 'contains_user_data': False}
+                'runtime_manifest_verified': True, 'contains_user_data': False,
+                'layout': 'overlay' if package_id else 'flat',
+                'program_root': str(destination.joinpath(*PurePosixPath(program_prefix).parts))}
+        if package_id:
+            report['package_id'] = package_id
+        return report
 
 
 def verify_source(source_root, destination):
     source_root = Path(source_root).resolve()
     destination = Path(destination).resolve()
     sys.path.insert(0, str(source_root / 'tools'))
-    from build_release import source_files
+    from build_release import source_files,UPDATE_POLICY
     files = source_files(source_root)
     expected = {source.relative_to(source_root).as_posix() for source in files}
     actual = {path.relative_to(destination).as_posix() for path in destination.rglob('*') if path.is_file()}
+    def read_small(name):
+        path = destination / name
+        ordinary(path)
+        require(path.stat().st_size <= 8192)
+        return path.read_bytes()
+    program_prefix, package_id = package_layout(actual, read_small)
+    if package_id:
+        destination = destination.joinpath(*PurePosixPath(program_prefix).parts)
+        actual = {name[len(program_prefix):] for name in actual if name.startswith(program_prefix)}
+        require(MARKER in actual and LAUNCHER in expected)
     require({name for name in actual if not name.startswith(('runtime/', 'app/engines/'))
-             and name != 'release-manifest.json'} == expected)
+             and name not in ('release-manifest.json','update-policy.json')
+             and not (package_id and name == MARKER)} == expected)
+    policy=destination/'update-policy.json'
+    if policy.is_file():
+        ordinary(policy)
+        require(json.loads(policy.read_text('utf-8'))==UPDATE_POLICY)
     for source in files:
         target = destination / source.relative_to(source_root)
         ordinary(target)
-        require(digest(source) == digest(target))
+        if package_id and source.relative_to(source_root).as_posix() == LAUNCHER:
+            require(target.read_bytes() == launcher_bytes(package_id))
+        else:
+            require(digest(source) == digest(target))
     return len(files)
 
 

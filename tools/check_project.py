@@ -277,10 +277,13 @@ def main(argv=None):
             removed_test = ROOT / 'tests/test_removed_features.py'
             entries.append(run_command('removed-features', [python, '-B', str(removed_test)], 'unittest', env))
             entries.append(run_command('window-layout', [python, '-B', str(ROOT/'tests/test_window_layout.py')], 'unittest', env))
-            for filename in ('test_status_projection.py', 'test_signature_status.py'):
+            for filename in ('test_batch_parallel.py','test_engine_validation.py','test_profile_process_scan.py','test_sync_parallel.py','test_engine_portability.py','test_source_sessions.py','test_source_identity.py','test_status_purge_race.py'):
+                entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
+            for filename in ('test_status_projection.py', 'test_signature_status.py', 'test_group_operations.py'):
                 entries.append(run_command(filename, [python, '-B', str(ROOT/'tests'/filename)], 'unittest', env))
             for filename in ('test_sync_reliability.py','test_source_preparation.py','test_import_progress.py','test_profile_copy.py','test_batch_status.py','test_profile_delete.py','test_delete_integration.py','test_background_probe.py','test_legacy_sources.py','test_core_compatibility.py','test_ip_info_page.py','test_proxy_runtime_stability.py','test_clean_install.py','test_launch_paths.py','test_release_boundary.py','test_process_path_aliases.py','test_environment_compatibility.py'):
                 entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
+            entries.append(run_command('profile-launch-path',[python,'-B',str(ROOT/'tests/test_profile_launch_path.py')],'json',env))
             installation = ROOT / 'tests/test_installation_inspector.py'
             entries.append(run_command('installation-inspector', [python, '-B', str(installation)], 'unittest', env))
             recovery = ROOT / 'tests/test_local_runtime_recovery.py'
@@ -291,8 +294,10 @@ def main(argv=None):
             entries.append(run_command('creation-runtime', [python, '-B', str(ROOT/'tests/test_creation_runtime.py')], 'unittest', env))
             entries.append(run_command('creation-audit', [python, '-B', str(ROOT/'tests/test_creation_audit.py')], 'unittest', env))
             entries.append(run_command('bundled-core-creation', [python, '-B', str(ROOT/'tests/test_bundled_core_creation.py')], 'unittest', env))
-            entries.append(run_command('portable-transfer', [python, '-B', str(ROOT/'tests/test_portable_transfer.py')], 'unittest', env))
+            for filename in ('test_update_guard.py','test_inplace_update.py','test_overlay_update.py','test_portable_bootstrap.py'):
+                entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
             entries.append(run_command('direct-portable-launch', [python, '-B', str(ROOT/'tests/test_direct_portable_launch.py')], 'unittest', env))
+            entries.append(run_command('manager-webview-close', [python, '-B', str(ROOT/'tests/test_manager_webview_close.py')], 'unittest', env))
             entries.append(run_command('release-builder', [python, '-B', str(ROOT/'tests/test_release_builder.py')], 'unittest', env))
             entries.append(run_command('release-archive', [python, '-B', str(ROOT/'tests/test_release_archive.py')], 'unittest', env))
             entries.append(run_command('desktop-runner', [python, '-B', str(ROOT/'tests/test_desktop_runner.py')], 'unittest', env))
@@ -316,6 +321,12 @@ def main(argv=None):
                     continue
                 command = [python, '-B', str(path)] if style == 'unittest' else [python, '-B', str(Path(__file__)), '--_fixture', name]
                 entries.append(run_command(name, command, style, env))
+            probe_budget = ROOT / 'tests/test_probe_budget.cjs'
+            if not probe_budget.is_file():
+                entries.append({'name': 'probe-budget', 'status': 'failed', 'reason': 'fixture_missing'})
+            else:
+                entries.append(run_command('probe-budget', [node, str(probe_budget)], 'json', env) if node else
+                               {'name': 'probe-budget', 'status': 'skipped', 'reason': 'node_unavailable'})
             frontend = ROOT / 'tests/frontend-state.test.js'
             if not frontend.is_file():
                 entries.append({'name': 'frontend-state', 'status': 'failed', 'reason': 'fixture_missing'})

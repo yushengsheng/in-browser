@@ -79,6 +79,18 @@ class CreationVariationsTests(unittest.TestCase):
             build_native(self.configuration,p)
         sign.assert_not_called();self.assertFalse(self.path.exists())
 
+    def test_download_diagnostics_preserve_only_fixed_public_failure_codes(self):
+        for code in ('source_seed_input','source_seed_download','source_seed_verification',
+                     'source_seed_budget','synthetic-private-diagnostic'):
+            with self.subTest(code=code):
+                error=LocalBrowserError('synthetic source failure');error.code=code
+                with patch('local_source.public_variations',side_effect=error),self.assertRaises(LocalBrowserError) as caught:
+                    creation_variations(self.configuration,self.native,'148')
+                expected=code if code.startswith('source_seed_') else None
+                self.assertEqual(getattr(caught.exception,'code',None),expected)
+                self.assertNotIn('synthetic',str(caught.exception))
+                self.assertFalse(self.path.exists())
+
     def test_existing_native_preserves_present_or_absent_seed_without_cache_or_network(self):
         p=creation_defaults();p.update(id='synthetic',seq=1)
         with patch('creation_fingerprint.creation_variations',return_value=self.variations):

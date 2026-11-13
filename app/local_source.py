@@ -2,19 +2,24 @@
 import base64
 import copy
 from contextlib import contextmanager
+import errno
 import hashlib
+from http.client import IncompleteRead,RemoteDisconnected
 import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
 import sqlite3
+import ssl
 import stat
 import struct
 import threading
 import time
 from urllib.request import Request,build_opener,ProxyHandler,HTTPRedirectHandler
+from urllib.error import HTTPError,URLError
 import zlib
 
 from local_state import LocalBrowserError,protect,read_encrypted,write_encrypted
@@ -28,6 +33,15 @@ PUBLIC_SEED_IMPORT_NOTE='原厂未保留历史运行种子，使用对应版本�
 _VARIATIONS_LIMIT=2*1024*1024
 _VARIATIONS_CACHE={}
 _VARIATIONS_LOCK=threading.Lock()
+_PROFILE_METADATA_BYTES=16*1024*1024
+_PROFILE_DATABASE_BYTES=512*1024*1024
+_PROFILE_SESSION_BYTES=128*1024*1024
+_PROFILE_SESSION_FILE_BYTES=64*1024*1024
+_PROFILE_SESSION_ENTRIES=1024
+_PROFILE_IDENTITY_FILES=1044
+_PROFILE_IDENTITY_SECONDS=20
+_PROFILE_DATABASES=('Default/Network/Cookies','Default/Cookies',
+    'Default/Login Data','Default/Login Data For Account')
 # Chromium components/variations/variations_seed_store.cc, kPublicKey (BSD).
 _VARIATIONS_PUBLIC_DER=bytes.fromhex('3059301306072a8648ce3d020106082a8648ce3d03010703420004'
     '517c314b5042dd59da0bfa4344337c5fa10bd582f6ac0419726c40d43e56e2a080'
@@ -53,8 +67,19 @@ def _verify_variations(compressed,signature):
     _variations_key().verify(base64.b64decode(signature,validate=True),seed,ec.ECDSA(hashes.SHA256()))
 
 
+def _retry_seed_download(error):
+    if isinstance(error,HTTPError):return error.code in (408,500,502,503,504)
+    if isinstance(error,URLError):error=error.reason
+    if isinstance(error,ssl.SSLError):return False
+    if isinstance(error,(TimeoutError,ConnectionResetError,ConnectionAbortedError,BrokenPipeError,
+                         RemoteDisconnected,IncompleteRead)):return True
+    if isinstance(error,socket.gaierror):return error.errno==socket.EAI_AGAIN
+    return isinstance(error,OSError) and error.errno in (errno.ETIMEDOUT,errno.ECONNRESET,errno.ECONNABORTED,errno.EPIPE)
+
+
 def public_variations(native):
     """Use Ho's public, UA-milestone seed protocol; never guess a different version."""
+    code='source_seed_input'
     try:
         version=native.get('userAgentVersion')
         if not isinstance(version,str) or not re.fullmatch(r'[0-9]{2,3}(?:\.[0-9]+){0,3}',version):raise ValueError()
@@ -64,29 +89,50 @@ def public_variations(native):
             if cached and now<cached[0]:return copy.deepcopy(cached[1])
         request=Request('https://clientservices.googleapis.com/chrome-variations/seed?channel=stable&milestone='+major,
             headers={'A-IM':'gzip'})
-        deadline=now+5
-        with build_opener(ProxyHandler({}),_NoSeedRedirect()).open(request,timeout=5) as response:
-            if response.status!=200:raise ValueError()
-            signature=response.headers.get('x-seed-signature')
-            length=response.headers.get('Content-Length')
-            if length is not None and (not str(length).isdigit() or int(length)>_VARIATIONS_LIMIT):raise ValueError()
-            chunks=[];size=0
-            while True:
-                if time.monotonic()>deadline:raise TimeoutError()
-                block=response.read1(min(64*1024,_VARIATIONS_LIMIT+1-size))
-                if not block:break
-                chunks.append(block);size+=len(block)
-                if size>_VARIATIONS_LIMIT:raise ValueError()
-        compressed=b''.join(chunks);_verify_variations(compressed,signature)
+        # A first socket timeout must leave room for the single retry. DNS and
+        # socket operations still are not a hard wall-clock cap.
+        deadline=now+15;code='source_seed_download';opener=build_opener(ProxyHandler({}),_NoSeedRedirect())
+        for attempt in range(2):
+            remaining=deadline-time.monotonic()
+            if remaining<=0:code='source_seed_budget';raise TimeoutError()
+            code='source_seed_download'
+            try:
+                with opener.open(request,timeout=min(5 if attempt==0 else 10,remaining)) as response:
+                    if response.status!=200:
+                        if attempt==0 and response.status in (408,500,502,503,504):continue
+                        raise ValueError()
+                    signature=response.headers.get('x-seed-signature')
+                    length=response.headers.get('Content-Length')
+                    code='source_seed_verification'
+                    if length is not None and (not str(length).isdigit() or int(length)>_VARIATIONS_LIMIT):raise ValueError()
+                    chunks=[];size=0;code='source_seed_download'
+                    while True:
+                        if time.monotonic()>=deadline:code='source_seed_budget';raise TimeoutError()
+                        block=response.read1(min(64*1024,_VARIATIONS_LIMIT+1-size))
+                        if not block:break
+                        chunks.append(block);size+=len(block)
+                        if size>_VARIATIONS_LIMIT:code='source_seed_verification';raise ValueError()
+                compressed=b''.join(chunks);code='source_seed_verification'
+                _verify_variations(compressed,signature)
+                if time.monotonic()>=deadline:code='source_seed_budget';raise TimeoutError()
+                break
+            except Exception as error:
+                retry=code=='source_seed_download' and _retry_seed_download(error)
+                if isinstance(error,HTTPError):error.close()
+                if code=='source_seed_download' and time.monotonic()>=deadline:code='source_seed_budget';raise
+                if attempt or not retry:raise
         value={'Seed':base64.b64encode(compressed).decode('ascii'),'Sign':signature}
         with _VARIATIONS_LOCK:
+            if time.monotonic()>=deadline:code='source_seed_budget';raise TimeoutError()
             for key in list(_VARIATIONS_CACHE):
                 if time.monotonic()>=_VARIATIONS_CACHE[key][0]:_VARIATIONS_CACHE.pop(key)
             if len(_VARIATIONS_CACHE)>=32:_VARIATIONS_CACHE.pop(next(iter(_VARIATIONS_CACHE)))
             _VARIATIONS_CACHE[major]=(time.monotonic()+3600,copy.deepcopy(value))
         return value
     except Exception:
-        raise LocalBrowserError('来源未保留历史运行种子，且对应版本公开种子暂时无法取得或签名校验失败；未使用其他版本种子，请稍后重新同步。') from None
+        error=LocalBrowserError('来源未保留历史运行种子，且对应版本公开种子暂时无法取得或签名校验失败；未使用其他版本种子，请稍后重新同步。')
+        error.code=code
+        raise error from None
 
 
 def _source_cache_present(configuration,identity):
@@ -261,29 +307,95 @@ def profile_root(configuration):
     return root.absolute()
 
 
+def _profile_stamp(info):
+    return [info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns]
+
+
+def _profile_inventory(root,folder,deadline):
+    """Inspect fixed preparation inputs and one bounded native session directory."""
+    def inspect(path,kind,optional=False):
+        if time.monotonic()>=deadline:raise ValueError()
+        try:info=path.lstat()
+        except FileNotFoundError:
+            if optional:return None
+            raise
+        if stat.S_ISLNK(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400:raise ValueError()
+        if not (stat.S_ISDIR(info.st_mode) if kind=='directory' else stat.S_ISREG(info.st_mode)):raise ValueError()
+        if not path.resolve().is_relative_to(root.resolve()):raise ValueError()
+        return _profile_stamp(info)
+
+    # Reject redirected ancestors even when an optional child is absent.
+    for parent in (root,*root.parents):
+        info=parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400:raise ValueError()
+    legacy={relative:inspect(folder/relative,'directory' if relative in ('','Default') else 'file')
+            for relative in ('','Default','Local State','Default/Preferences','Last Version')}
+    directories={relative:inspect(folder/relative,'directory',True)
+                 for relative in ('Default/Network','Default/Sessions')}
+    critical={};groups={'metadata':0,'database':0,'session':0};files={}
+    def add(relative,group,limit,optional=True):
+        value=legacy[relative] if relative in legacy else inspect(folder/relative,'file',optional)
+        if value is not None:
+            if value[2]>limit:raise ValueError()
+            groups[group]+=value[2];files[relative]=value
+        if relative not in legacy:critical[relative]=value
+    for relative in ('Local State','Default/Preferences','Last Version'):
+        add(relative,'metadata',_PROFILE_METADATA_BYTES,False)
+    for database in _PROFILE_DATABASES:
+        for suffix in ('','-wal','-shm','-journal'):
+            add(database+suffix,'database',_PROFILE_DATABASE_BYTES)
+    add('Default/~TabGroups','session',_PROFILE_METADATA_BYTES)
+    if directories['Default/Sessions'] is not None:
+        with os.scandir(folder/'Default/Sessions') as entries:
+            for index,entry in enumerate(entries):
+                if index>=_PROFILE_SESSION_ENTRIES or time.monotonic()>=deadline:raise ValueError()
+                if entry.name.startswith(('Session_','Tabs_')):
+                    add('Default/Sessions/'+entry.name,'session',_PROFILE_SESSION_FILE_BYTES,False)
+    if (groups['database']>_PROFILE_DATABASE_BYTES or groups['session']>_PROFILE_SESSION_BYTES or
+            len(files)>_PROFILE_IDENTITY_FILES):raise ValueError()
+    return {'legacy':legacy,'directories':directories,'critical':critical,'files':files}
+
+
+def _profile_digest(path,expected,deadline):
+    digest=hashlib.sha256();size=0
+    if _profile_stamp(path.lstat())!=expected:raise ValueError()
+    with path.open('rb') as stream:
+        opened=_profile_stamp(os.fstat(stream.fileno()))
+        # Windows path and descriptor ctime differ; each API is compared to
+        # itself, while shared identity/length/mtime must agree across APIs.
+        if opened[:4]!=expected[:4] or not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):raise ValueError()
+        while True:
+            if time.monotonic()>=deadline:raise ValueError()
+            block=stream.read(min(1024*1024,expected[2]+1-size))
+            if not block:break
+            size+=len(block)
+            if size>expected[2]:raise ValueError()
+            digest.update(block)
+        if size!=expected[2] or _profile_stamp(os.fstat(stream.fileno()))!=opened:raise ValueError()
+    if _profile_stamp(path.lstat())!=expected:raise ValueError()
+    return digest.hexdigest()
+
+
 def profile_identity(configuration,identity):
-    """Bind preparation to the exact closed source state, not just its GUID."""
-    identity=_identity(identity);root=profile_root(configuration);folder=root/identity
-    if root.is_symlink() or getattr(root.lstat(),'st_file_attributes',0)&0x400:
-        raise LocalBrowserError('来源资料根目录含特殊链接，未准备或读取其他位置。')
-    output=[]
-    for relative in ('','Default','Local State','Default/Preferences','Last Version'):
-        path=folder/relative
-        try:
-            before=path.lstat()
-            if path.is_symlink() or getattr(before,'st_file_attributes',0)&0x400 or not path.resolve().is_relative_to(root.resolve()):raise ValueError()
-            item=[before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns]
-            if path.is_file():
-                if before.st_size>16*1024*1024:raise ValueError()
-                with path.open('rb') as stream:content=stream.read(16*1024*1024+1)
-                if len(content)>16*1024*1024:raise ValueError()
-                after=path.stat()
-                if (before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns):raise ValueError()
-                item.append(hashlib.sha256(content).hexdigest())
-            output.append(item)
-        except (OSError,ValueError):
-            raise LocalBrowserError('来源关键资料正在变化或不能安全读取，请正常关闭后重新准备。') from None
-    return {'path':os.path.normcase(str(folder.absolute())),'files':output}
+    """Bind preparation to bounded, twice-read closed-source configuration inputs."""
+    identity=_identity(identity);deadline=time.monotonic()+_PROFILE_IDENTITY_SECONDS
+    try:
+        root=profile_root(configuration);folder=root/identity
+        before=_profile_inventory(root,folder,deadline);hashes=None
+        for _ in range(2):
+            observed={relative:_profile_digest(folder/relative,value,deadline)
+                      for relative,value in sorted(before['files'].items())}
+            if hashes is not None and hashes!=observed:raise ValueError()
+            if _profile_inventory(root,folder,deadline)!=before:raise ValueError()
+            hashes=observed
+        output=[value+([hashes[relative]] if relative in hashes else [])
+                for relative,value in before['legacy'].items()]
+        critical={relative:None if value is None else {'file':value,'sha256':hashes[relative]}
+                  for relative,value in before['critical'].items()}
+        return {'path':os.path.normcase(str(folder.absolute())),'files':output,
+                'critical':{'format':1,'directories':before['directories'],'files':critical}}
+    except (OSError,ValueError,TypeError):
+        raise LocalBrowserError('来源关键资料正在变化、超出安全检查范围或不能安全读取，请正常关闭后重新准备。') from None
 
 
 class PreparedSources:

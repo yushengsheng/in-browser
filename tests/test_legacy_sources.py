@@ -167,7 +167,7 @@ class LegacySourceTests(unittest.TestCase):
         store=Mock();store.ensure.return_value=deployed;store.ensure_current.return_value=deployed;store.validate.return_value=deployed
         with patch('local_engine.LocalEngineStore',return_value=store),patch.object(BitSource,'_core_path',return_value=source):
             self.assertEqual(self.configuration.local_core('124'),deployed)
-        store.ensure.assert_called_once_with('124',source,self.signer.public_der)
+        store.ensure.assert_called_once_with('124',source,self.signer.public_der,current=True)
         value=self.configuration.source_archive()
         self.assertEqual(value['engines'],{'148':str(self.root/'old-engine.exe'),'124':str(deployed)})
         self.assertEqual(value['fixture'],{'keep':True})
@@ -341,7 +341,8 @@ class PublicVariationsTests(unittest.TestCase):
             again=local_source.public_variations({'userAgentVersion':'118.0.0.0'})
         request=opener.open.call_args.args[0]
         self.assertTrue(request.full_url.endswith('milestone=118'))
-        self.assertEqual(opener.open.call_args.kwargs,{'timeout':5})
+        self.assertGreater(opener.open.call_args.kwargs['timeout'],0)
+        self.assertLessEqual(opener.open.call_args.kwargs['timeout'],5)
         self.assertEqual(request.get_header('A-im'),'gzip')
         self.assertIsNone(request.get_header('Authorization'));self.assertIsNone(request.get_header('Cookie'))
         self.assertEqual(value,{'Seed':base64.b64encode(self.compressed).decode(),'Sign':self.signature})
@@ -353,23 +354,163 @@ class PublicVariationsTests(unittest.TestCase):
                 self.response(body=b'invalid gzip payload'),self.response(**{'Content-Length':str(local_source._VARIATIONS_LIMIT+1)})):
             with self.subTest(reply=reply):
                 opener=Mock();opener.open.return_value=reply
-                with patch.object(local_source,'build_opener',return_value=opener),self.assertRaises(LocalBrowserError):
+                with patch.object(local_source,'build_opener',return_value=opener),self.assertRaises(LocalBrowserError) as caught:
                     local_source.public_variations({'userAgentVersion':'130.0.0.0'})
+                self.assertEqual(caught.exception.code,'source_seed_verification')
                 self.assertEqual(local_source._VARIATIONS_CACHE,{})
+                self.assertEqual(opener.open.call_count,1)
                 reply.__exit__.assert_called_once()
 
     def test_public_seed_timeout_offline_and_invalid_version_never_use_other_milestone(self):
         opener=Mock();reply=self.response();opener.open.return_value=reply
         with patch.object(local_source,'build_opener',return_value=opener),\
-                patch.object(local_source.time,'monotonic',side_effect=[0,6]),self.assertRaises(LocalBrowserError):
+                patch.object(local_source.time,'monotonic',side_effect=[0,16]),self.assertRaises(LocalBrowserError) as caught:
             local_source.public_variations({'userAgentVersion':'130.0.0.0'})
-        reply.__exit__.assert_called_once()
+        self.assertEqual(caught.exception.code,'source_seed_budget');opener.open.assert_not_called()
         opener.open.side_effect=OSError('synthetic offline')
         with patch.object(local_source,'build_opener',return_value=opener),self.assertRaises(LocalBrowserError):
             local_source.public_variations({'userAgentVersion':'130.0.0.0'})
         with patch.object(local_source,'build_opener') as network,self.assertRaises(LocalBrowserError):
             local_source.public_variations({'userAgentVersion':'synthetic invalid version'})
         network.assert_not_called();self.assertEqual(local_source._VARIATIONS_CACHE,{})
+
+    def test_transient_download_retries_once_with_only_the_original_budget_remaining(self):
+        clock=[0];reply=self.response();opener=Mock()
+        def opening(*_args,**_kwargs):
+            if opener.open.call_count==1:
+                clock[0]=1.25
+                raise local_source.URLError(ConnectionResetError(local_source.errno.ECONNRESET,'synthetic reset'))
+            return reply
+        opener.open.side_effect=opening
+        with patch.object(local_source,'build_opener',return_value=opener),\
+                patch.object(local_source.time,'monotonic',side_effect=lambda:clock[0]):
+            value=local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+        self.assertEqual([call.kwargs['timeout'] for call in opener.open.call_args_list],[5,10])
+        self.assertTrue(all(call.args[0].full_url.endswith('milestone=118') for call in opener.open.call_args_list))
+        self.assertEqual(value['Seed'],base64.b64encode(self.compressed).decode())
+        reply.__exit__.assert_called_once()
+
+    def test_first_socket_timeout_leaves_remaining_budget_for_same_signed_milestone(self):
+        clock=[0];reply=self.response();opener=Mock()
+        def opening(*_args,**_kwargs):
+            if opener.open.call_count==1:
+                clock[0]=5.25
+                raise local_source.URLError(TimeoutError('synthetic first socket timeout'))
+            return reply
+        opener.open.side_effect=opening
+        with patch.object(local_source,'build_opener',return_value=opener),\
+                patch.object(local_source.time,'monotonic',side_effect=lambda:clock[0]),\
+                patch.object(local_source,'_verify_variations',wraps=local_source._verify_variations) as verified:
+            value=local_source.public_variations({'userAgentVersion':'128.0.0.0'})
+        self.assertEqual([call.kwargs['timeout'] for call in opener.open.call_args_list],[5,9.75])
+        self.assertTrue(all(call.args[0].full_url.endswith('milestone=128') for call in opener.open.call_args_list))
+        verified.assert_called_once_with(self.compressed,self.signature)
+        self.assertEqual(value,{'Seed':base64.b64encode(self.compressed).decode(),'Sign':self.signature})
+        self.assertEqual(local_source._VARIATIONS_CACHE['128'][1],value)
+        reply.__exit__.assert_called_once()
+
+    def test_second_timeout_exhausting_global_budget_never_caches_or_tries_a_third_time(self):
+        clock=[0];opener=Mock()
+        def opening(*_args,**_kwargs):
+            clock[0]=5 if opener.open.call_count==1 else 15
+            raise local_source.URLError(TimeoutError('synthetic socket timeout'))
+        opener.open.side_effect=opening
+        with patch.object(local_source,'build_opener',return_value=opener),\
+                patch.object(local_source.time,'monotonic',side_effect=lambda:clock[0]),\
+                self.assertRaises(LocalBrowserError) as caught:
+            local_source.public_variations({'userAgentVersion':'128.0.0.0'})
+        self.assertEqual([call.kwargs['timeout'] for call in opener.open.call_args_list],[5,10])
+        self.assertEqual(caught.exception.code,'source_seed_budget')
+        self.assertEqual(local_source._VARIATIONS_CACHE,{})
+
+    def test_response_body_keeps_global_budget_without_a_new_five_second_deadline(self):
+        clock=[0];reply=self.response();opener=Mock();opener.open.return_value=reply
+        read=reply.read1
+        def slow_body(size):
+            clock[0]=6
+            return read(size)
+        reply.read1=slow_body
+        with patch.object(local_source,'build_opener',return_value=opener),\
+                patch.object(local_source.time,'monotonic',side_effect=lambda:clock[0]):
+            value=local_source.public_variations({'userAgentVersion':'128.0.0.0'})
+        self.assertEqual(opener.open.call_count,1)
+        self.assertEqual(opener.open.call_args.kwargs['timeout'],5)
+        self.assertEqual(value['Sign'],self.signature)
+        self.assertEqual(local_source._VARIATIONS_CACHE['128'][1],value)
+
+    def test_transient_http_and_short_read_retry_and_close_failed_responses(self):
+        failures=[local_source.HTTPError('https://synthetic.invalid',status,'synthetic',{},io.BytesIO())
+                  for status in (408,500,502,503,504)]
+        failures.extend((local_source.RemoteDisconnected('synthetic reset'),
+            local_source.IncompleteRead(b'synthetic partial',1),
+            local_source.URLError(local_source.socket.gaierror(local_source.socket.EAI_AGAIN,'synthetic DNS retry'))))
+        for failure in failures:
+            with self.subTest(kind=type(failure).__name__,status=getattr(failure,'code',None)):
+                local_source._VARIATIONS_CACHE.clear();reply=self.response();opener=Mock()
+                opener.open.side_effect=[failure,reply]
+                with patch.object(local_source,'build_opener',return_value=opener):
+                    local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+                self.assertEqual(opener.open.call_count,2);reply.__exit__.assert_called_once()
+                if isinstance(failure,local_source.HTTPError):self.assertTrue(failure.closed)
+        local_source._VARIATIONS_CACHE.clear();failed=self.response();reply=self.response();opener=Mock()
+        failed.read1=Mock(side_effect=ConnectionResetError('synthetic reset'));opener.open.side_effect=[failed,reply]
+        with patch.object(local_source,'build_opener',return_value=opener):
+            value=local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+        self.assertEqual(value['Seed'],base64.b64encode(self.compressed).decode())
+        failed.__exit__.assert_called_once();reply.__exit__.assert_called_once()
+
+    def test_certificate_permanent_http_and_nontransient_errors_are_not_retried(self):
+        certificate=local_source.ssl.SSLCertVerificationError('synthetic certificate failure')
+        failures=[certificate,local_source.URLError(certificate),OSError('synthetic unknown failure')]
+        failures.extend(local_source.HTTPError('https://synthetic.invalid',status,'synthetic',{},io.BytesIO())
+                        for status in (302,400,401,403,404,429))
+        for failure in failures:
+            with self.subTest(kind=type(failure).__name__,status=getattr(failure,'code',None)):
+                opener=Mock();opener.open.side_effect=failure
+                with patch.object(local_source,'build_opener',return_value=opener),self.assertRaises(LocalBrowserError) as caught:
+                    local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+                self.assertEqual(opener.open.call_count,1);self.assertEqual(caught.exception.code,'source_seed_download')
+                self.assertEqual(local_source._VARIATIONS_CACHE,{})
+                if isinstance(failure,local_source.HTTPError):self.assertTrue(failure.closed)
+
+    def test_exhausted_budget_and_two_failed_attempts_never_cache(self):
+        for exhausted in (False,True):
+            with self.subTest(exhausted=exhausted):
+                clock=[0];opener=Mock()
+                def failing(*_args,**_kwargs):
+                    clock[0]=15 if exhausted else clock[0]+1
+                    raise ConnectionResetError('synthetic reset')
+                opener.open.side_effect=failing
+                with patch.object(local_source,'build_opener',return_value=opener),\
+                        patch.object(local_source.time,'monotonic',side_effect=lambda:clock[0]),self.assertRaises(LocalBrowserError) as caught:
+                    local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+                self.assertEqual(opener.open.call_count,1 if exhausted else 2)
+                self.assertEqual(caught.exception.code,'source_seed_budget' if exhausted else 'source_seed_download')
+                self.assertEqual(local_source._VARIATIONS_CACHE,{})
+
+    def test_late_valid_response_is_rejected_after_verification(self):
+        clock=[0];reply=self.response();opener=Mock();opener.open.return_value=reply
+        verify=local_source._verify_variations
+        def late_verification(*args):
+            verify(*args);clock[0]=15
+        with patch.object(local_source,'build_opener',return_value=opener),\
+                patch.object(local_source.time,'monotonic',side_effect=lambda:clock[0]),\
+                patch.object(local_source,'_verify_variations',side_effect=late_verification),self.assertRaises(LocalBrowserError) as caught:
+            local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+        self.assertEqual(caught.exception.code,'source_seed_budget');self.assertEqual(opener.open.call_count,1)
+        reply.__exit__.assert_called_once();self.assertEqual(local_source._VARIATIONS_CACHE,{})
+
+    def test_fixed_safe_error_codes_do_not_include_underlying_details(self):
+        sentinel='synthetic_private_failure_details'
+        opener=Mock();opener.open.side_effect=OSError(sentinel)
+        with patch.object(local_source,'build_opener',return_value=opener),self.assertRaises(LocalBrowserError) as caught:
+            local_source.public_variations({'userAgentVersion':'118.0.0.0'})
+        self.assertEqual(caught.exception.code,'source_seed_download')
+        self.assertNotIn(sentinel,str(caught.exception));self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        with patch.object(local_source,'build_opener') as network,self.assertRaises(LocalBrowserError) as caught:
+            local_source.public_variations({'userAgentVersion':'synthetic invalid'})
+        network.assert_not_called();self.assertEqual(caught.exception.code,'source_seed_input')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

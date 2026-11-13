@@ -66,7 +66,9 @@ def verify_proxy_extensions(profile,managed_extension=None):
                 raw=entry.get('path')
                 if isinstance(raw,str) and raw:
                     folder=Path(raw)
-                    if not folder.is_absolute():folder=Path(profile)/'Default'/folder
+                    if not folder.is_absolute():
+                        if folder.drive or folder.root or '..' in folder.parts:raise ValueError()
+                        folder=Path(profile)/'Default/Extensions'/folder
                     manifests.append(folder/'manifest.json')
         if managed_extension:manifests.append(Path(managed_extension)/'manifest.json')
         for manifest in manifests:

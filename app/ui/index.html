@@ -411,9 +411,10 @@
         <div id="sync-error" class="inline-error" role="alert" hidden></div>
         <section id="sync-preview" aria-label="选择同步窗口">
           <div class="sync-toolbar">
-            <label class="search-input"><span data-icon="search"></span><input id="sync-search" type="search" placeholder="搜索名称、备注或来源序号" aria-label="搜索待同步窗口的名称、备注或来源序号"></label>
+            <label class="search-input profile-search"><span data-icon="search"></span><textarea id="sync-search" rows="1" placeholder="名称、备注或来源序号（最多10项）" title="支持换行、逗号或分号分隔，最多10项，匹配任意一项" aria-label="搜索待同步窗口的名称、备注或来源序号，最多10项" aria-describedby="sync-search-feedback"></textarea></label>
             <button id="sync-reload" class="button small"><span data-icon="refresh"></span>重新检测</button>
           </div>
+          <p id="sync-search-feedback" class="search-feedback" role="status" hidden></p>
           <p id="sync-preview-summary" class="sync-summary" role="status">正在读取本机窗口…</p>
           <div class="sync-table-scroll">
             <table class="sync-table"><thead><tr><th class="select-cell"><input id="sync-select-all" type="checkbox" aria-label="选择本次预览全部可导入窗口"></th><th>来源窗口</th><th>环境</th><th>同步状态</th></tr></thead><tbody id="sync-preview-rows"></tbody></table>

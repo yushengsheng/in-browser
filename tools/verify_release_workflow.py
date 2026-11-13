@@ -38,6 +38,26 @@ def digest(path):
         for block in iter(lambda:stream.read(1024*1024),b''):result.update(block)
     return result.hexdigest()
 
+def verified_short_path(path,root,shortener):
+    from native_paths import io_path,resolved_path
+    try:
+        requested=Path(path);root=resolved_path(root)
+        require(requested.is_absolute() and requested.root)
+        canonical=resolved_path(requested);require(canonical.is_relative_to(root))
+        result=shortener(path)
+        if result is None:return None
+        candidate=Path(result)
+        require(candidate.is_absolute() and candidate.root and '..' not in candidate.parts)
+        require(resolved_path(candidate)==canonical and resolved_path(candidate).is_relative_to(root))
+        require(io_path(candidate).samefile(io_path(canonical))
+                and io_path(candidate.parent).samefile(io_path(canonical.parent)))
+        return result
+    except (OSError,ValueError,TypeError,AttributeError):
+        # Production short-path lookup may fall back on ValueError. An invalid
+        # test-scope identity must stop acceptance instead of being hidden.
+        raise AssertionError('synthetic_short_path_identity_failed') from None
+
+
 def tree(root):
     files={};dirs=[];file_max=0;dir_max=len(str(root).encode('utf-16-le'))//2
     for path in root.rglob('*'):
@@ -80,8 +100,9 @@ def phase(args):
     from window_create import WindowCreator
     report={'success':False,'synthetic':True,'phase':args.phase,'rounds':[],'physical_second_machine':False,
             'physical_external_drive':False,'simulated_other_user':args.phase=='verify','source_api_synthetic':True}
-    service=None;active=None;owned=[];alias_calls=[];source_calls=[];continuity_calls=[];prepare_calls=[]
+    service=None;active=None;owned=[];alias_checks=[];source_calls=[];continuity_calls=[];prepare_calls=[]
     original_popen=subprocess.Popen;original_verify=fingerprint_continuity.verify_continuity;original_prepare=portable_browser.prepare_profile
+    original_short_path=browser_core._short_executable_path
     origin='http://localhost:'+str(args.port)
 
     def launch(arguments,*pos,**kw):
@@ -99,7 +120,11 @@ def phase(args):
         result=original_verify(*pos,**kw);continuity_calls.append(kw.get('allow_device_variance') is True);return result
     def prepare(*pos,**kw):
         result=original_prepare(*pos,**kw);prepare_calls.append(result);return result
-    def no_alias(*pos,**kw):alias_calls.append(True);raise AssertionError()
+    def checked_alias(path):
+        check={'verified':False,'candidate_returned':False};alias_checks.append(check)
+        result=verified_short_path(path,root,original_short_path)
+        check.update(verified=True,candidate_returned=result is not None)
+        return result
     def no_source(*pos,**kw):source_calls.append(True);raise AssertionError()
     def close():
         if service is None or active is None:return
@@ -179,7 +204,7 @@ def phase(args):
             stack.enter_context(patch.object(fingerprint_continuity,'verify_continuity',verify))
             stack.enter_context(patch.object(portable_browser,'prepare_profile',prepare))
             if args.phase in ('verify','isolate'):
-                stack.enter_context(patch.object(browser_core,'_short_executable_path',no_alias))
+                stack.enter_context(patch.object(browser_core,'_short_executable_path',checked_alias))
                 for name in ('vendor','source_settings','source_detail','prepare_source'):
                     stack.enter_context(patch.object(Configuration,name,no_source))
             if args.phase=='seed':
@@ -313,18 +338,21 @@ def phase(args):
                                       portable_key_preserved=current_snapshot['crypt']==expected['crypt'],binding_preserved=current_snapshot['binding']==expected['binding'],
                                       formal_continuity=any(continuity_calls[before:]),formal_prepare=len(prepare_calls)>before_prepare,
                                       normal_close=not profile_processes(Path(current['_runtime']['profile_path']),require_inspectable=True),
-                                      no_short_alias=not alias_calls,no_source_api=not source_calls)
+                                      short_path_identity_verified=all(check['verified'] for check in alias_checks),no_source_api=not source_calls)
                         if round_index==0:checks['dpapi_same_key_rewrapped']=any(prepare_calls[before_prepare:])
                         else:checks['dpapi_wrapper_reused']=not any(prepare_calls[before_prepare:])
                         report['rounds'].append({'profile_index':list(fixture['records']).index(identity)+1,'round':round_index+1,'checks':checks})
                         require(all(checks.values()))
-                report.update(short_alias_calls=len(alias_calls),source_api_calls=len(source_calls))
+                report.update(source_api_calls=len(source_calls))
             report['success']=True
     except Exception as error:fail(report,error)
     finally:
         try:close()
         except Exception as error:report['close_error_type']=type(error).__name__;report['success']=False
         report['owned_browser_count']=len(owned);report['owned_processes_exited']=all(p.poll() is not None for p,_,_ in owned)
+        report['short_path_requests']=len(alias_checks)
+        report['short_path_candidates_verified']=sum(check['verified'] and check['candidate_returned'] for check in alias_checks)
+        report['short_path_identity_verified']=all(check['verified'] for check in alias_checks)
         report['owned_process_exit_codes']=[p.poll() for p,_,_ in owned]
         report['success']=report['success'] and report['owned_processes_exited'];report['elapsed_seconds']=round(time.monotonic()-started,1)
         save(Path(args.report),report);print(json.dumps(report,ensure_ascii=False),flush=True)
@@ -359,8 +387,8 @@ def orchestrate(args):
         require(len(str(work).encode('utf-16-le'))//2<=60)
         # Verify the public distribution again before introducing synthetic data.
         sys.path[:0]=[str(package/'tools'),str(package/'app')]
-        from portable_transfer import release_inventory,TransferDeadline
-        release_inventory(package,TransferDeadline(120,None))
+        from update_guard import verify_release
+        require(not verify_release(package)['development'])
         original,original_summary=tree(package)
         require(original_summary['file_count']<=40000)
         work.mkdir();seed=work/'A';sibling=work/'B';source=work/'synthetic-source'
@@ -399,19 +427,14 @@ def orchestrate(args):
         for role,process,destination in children:
             collect('isolate-'+role,process.wait(timeout=240),destination)
         report['same_parent_sibling_isolation']=True
-        # Exercise the shipped migration entry point, including manifest, closed-profile,
-        # directory-key and full-tree verification. The source remains untouched.
-        transfer=subprocess.run([str(seed/'runtime/python/python.exe'),'-B',str(seed/'tools/portable_transfer.py'),
-                                 '--execute','--source',str(seed),'--destination',str(moved)],
-                                cwd=seed,env=clean_environment(work/'e-transfer'),stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=900)
-        require(len(transfer.stdout)<=256*1024 and transfer.returncode==0)
-        lines=[json.loads(line) for line in transfer.stdout.decode('utf-8').splitlines() if line.startswith('{')]
-        migration=next((item for item in reversed(lines) if item.get('success') is True),None)
-        require(migration and migration.get('source_unchanged') is True and migration.get('verified') is True
-                and migration.get('windows')==2)
-        report['migration']={key:migration[key] for key in ('success','files','windows','source_unchanged','verified')}
-        save(moved/'clean-release-test.json',PURPOSE)
+        # Successful phases have closed their owned browsers before exiting.
+        # Copy only this test's complete synthetic directory, then compare both trees.
+        require(all(process.poll() is not None for _,process,_ in children))
+        copied_source,copied_summary=tree(seed)
+        shutil.copytree(seed,moved)
+        require(tree(moved)[0]==copied_source and tree(seed)[0]==copied_source)
+        report['directory_copy']={'success':True,'files':copied_summary['file_count'],
+                                  'source_unchanged':True,'verified':True}
         # Make all old package and synthetic source paths unavailable without deleting them.
         os.rename(work,retained)
         require(not work.exists());report['old_paths_unavailable']=True

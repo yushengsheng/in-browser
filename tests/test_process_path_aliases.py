@@ -50,7 +50,8 @@ class ProcessPathAliases(unittest.TestCase):
         candidate = process(self.alias)
         self.assertNotEqual(os.path.normcase(os.path.abspath(self.alias)),
                             os.path.normcase(str(self.profile)))
-        with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])) as scan:
+        with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])) as scan, \
+                patch.object(processes.psutil, 'Process', return_value=candidate):
             self.assertEqual(processes.profile_processes(self.profile, require_inspectable=True), [candidate])
         scan.assert_called_once()
 
@@ -106,7 +107,8 @@ class ProcessPathAliases(unittest.TestCase):
         # Volumes can disable 8.3 names. The junction test still exercises a
         # distinct literal spelling there, without silently skipping the check.
         candidate = process(short)
-        with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])):
+        with patch.object(processes.psutil, 'process_iter', return_value=iter([candidate])), \
+                patch.object(processes.psutil, 'Process', return_value=candidate):
             self.assertEqual(processes.profile_processes(self.profile), [candidate])
         self.assert_fingerprint_identity(short)
 

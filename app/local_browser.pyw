@@ -8,7 +8,24 @@ from pathlib import Path
 import re
 import sys
 
+sys.dont_write_bytecode=True
+# Do not read historical application bytecode after replacing source files.
+# This random, uncreated path also prevents direct pythonw launches using it.
+sys.pycache_prefix=str(Path(__file__).resolve().parents[1]/('.program-no-cache-'+os.urandom(16).hex()))
 sys.path.insert(0,str(Path(__file__).resolve().parent))
+try:
+    from update_guard import require_complete_installation
+    require_complete_installation(Path(__file__).resolve().parents[1])
+except Exception:
+    if '--self-check' in sys.argv:
+        print(json.dumps({'success':False,'error':'program_update_incomplete_or_corrupt'}))
+    else:
+        try:
+            ctypes.windll.user32.MessageBoxW(None,'程序更新尚未完成或公共程序文件校验失败。请保留当前目录与资料，使用更新工具恢复后再启动。','无法启动',0x10)
+        except (AttributeError,OSError):
+            pass
+    raise SystemExit(1)
+
 from browser_core import APP_ROOT,DATA_ROOT
 from manager_service import ManagerService
 from installation import initialize_installation
@@ -65,6 +82,18 @@ def _focus_existing_manager():
         except (psutil.Error,OSError,ValueError):continue
     return False
 
+def _guard_initial_webview_cleanup(window):
+    browser=window.native.browser
+    original_cleanup=browser.clear_user_data
+    def cleanup():
+        # pywebview 6.1 reads BrowserProcessId before disposing its control.
+        # Early close has no CoreWebView2 yet; retain potentially busy cache.
+        if browser.webview.CoreWebView2 is None:
+            browser.webview.Dispose()
+            return
+        return original_cleanup()
+    browser.clear_user_data=cleanup
+
 def main():
     if '--self-check' in sys.argv:
         initialize_installation()
@@ -106,8 +135,10 @@ def main():
                         except Exception: errors+=1
                     if errors:
                         ctypes.windll.user32.MessageBoxW(None,'部分浏览器仍在保存，请稍候再退出；未强制结束进程。','尚未退出',0x40); return False
+                service.shutdown_batches()
             finally: service.operations.release()
         window.events.closing+=closing
+        window.events.before_show+=_guard_initial_webview_cleanup
         webview.start(gui='edgechromium',private_mode=True,storage_path=str(DATA_ROOT/'manager-webview'))
     except Exception:
         ctypes.windll.user32.MessageBoxW(None,'无法启动本地管理器。请保留完整程序目录、目录密钥及运行环境；便携模式不要求原Windows用户。','无法启动',0x10)

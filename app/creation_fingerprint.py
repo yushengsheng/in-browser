@@ -56,8 +56,12 @@ def creation_variations(configuration,native,core):
                 entries.pop(next(iter(entries)))
             write_encrypted(path,cache,root=root)
             return copy.deepcopy(value)
-    except Exception:
-        raise LocalBrowserError('新窗口的对应版本公开运行种子无法取得、缓存无效或签名校验失败；请检查网络及完整程序目录后重试，尚未创建窗口。') from None
+    except Exception as error:
+        failure=LocalBrowserError('新窗口的对应版本公开运行种子无法取得、缓存无效或签名校验失败；请检查网络及完整程序目录后重试，尚未创建窗口。')
+        if getattr(error,'code',None) in {'source_seed_input','source_seed_download',
+                'source_seed_verification','source_seed_budget'}:
+            failure.code=error.code
+        raise failure from None
 
 
 @lru_cache(maxsize=1)

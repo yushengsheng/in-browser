@@ -10,14 +10,11 @@ import base64
 import copy
 from datetime import datetime, timezone
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import socket
 import tempfile
-import threading
 import time
 import uuid
 
@@ -26,6 +23,7 @@ from browser_processes import profile_processes
 from environment_compatibility import (compatibility_candidate, validated_environment_args,
                                        vendor_compatibility_policy, vendor_device_differences)
 from local_state import LocalBrowserError
+from native_paths import io_path, resolved_path
 
 
 FORMAT = 1
@@ -60,191 +58,171 @@ _READY_EXPRESSION = '({ready:document.readyState,secure:isSecureContext,url:loca
 _INTERNAL_PROBE_TARGETS=frozenset({'chrome://omnibox-popup.top-chrome/','chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html'})
 
 
-class _ProbePageHandler(BaseHTTPRequestHandler):
-    """Only one owned URL is served; requests cannot supply content or paths."""
-    protocol_version = 'HTTP/1.0'
-
-    def log_message(self, *_):
-        pass
-
-    def version_string(self):
-        return 'LocalProbe'
-
-    def send_error(self, code, message=None, explain=None):
-        # BaseHTTPRequestHandler's default error page reflects request input.
-        self._reply(code)
-
-    def _reply(self, status, body=b'', *, head=False):
-        self.close_connection = True
-        self.send_response(status)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.send_header('Connection', 'close')
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-        self.end_headers()
-        if not head and body:
-            self.wfile.write(body)
-
-    def _serve(self, *, head=False):
-        hosts = self.headers.get_all('Host') or []
-        expected = 'localhost:' + str(self.server.server_port)
-        if len(hosts) != 1 or hosts[0].casefold() != expected:
-            self._reply(400)
-        elif self.headers.get('Transfer-Encoding') is not None or self.headers.get('Content-Length') not in (None, '0'):
-            self._reply(400)
-        elif self.path != self.server.probe_path:
-            self._reply(404)
-        else:
-            self._reply(200, _STATIC_PAGE, head=head)
-
-    def do_GET(self):
-        self._serve()
-
-    def do_HEAD(self):
-        self._serve(head=True)
-
-    def _reject(self):
-        self._reply(405)
-
-    do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_CONNECT = do_TRACE = _reject
+_FETCH_EVENTS = frozenset((
+    'Page.frameStartedLoading', 'Page.frameStoppedLoading', 'Page.frameNavigated',
+    'Page.domContentEventFired', 'Page.loadEventFired', 'Page.lifecycleEvent',
+    'Runtime.executionContextCreated', 'Runtime.executionContextDestroyed',
+    'Runtime.executionContextsCleared', 'Target.attachedToTarget', 'Target.targetInfoChanged'))
 
 
-class _ProbeHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    block_on_close = False
-    request_queue_size = 4
+def _fetch_failure(reason):
+    error = _blocked(['probe.navigation'])
+    error.code = 'continuity_fetch_' + reason
+    return error
 
-    def __init__(self, address, handler):
-        self._slots = threading.BoundedSemaphore(4)
-        self._workers_lock = threading.Lock()
-        self._workers = {}
-        super().__init__(address, handler)
 
-    def get_request(self):
-        request, address = super().get_request()
-        request.settimeout(1)
-        return request, address
+def _probe_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _fetch_failure('budget')
+    return remaining
 
-    def handle_error(self, *_):
-        pass
 
-    def process_request(self, request, address):
-        if not self._slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
-        worker = threading.Thread(target=self._process_owned_request, args=(request, address),
-                                  name='continuity-http-request', daemon=True)
-        with self._workers_lock:
-            self._workers[worker] = request
-        try:
-            worker.start()
-        except Exception:
-            with self._workers_lock:
-                self._workers.pop(worker, None)
-            self._slots.release()
-            self.shutdown_request(request)
-            raise
+def _fulfill_probe_document(connection, session, frame_id, url, deadline):
+    """Route only the owned document while retaining both command replies."""
+    wire = connection.connection
+    pending, requests = {}, set()
+    navigation = None
+    result = None
+    fulfilled = acknowledged = 0
+    rejected = False
 
-    def _process_owned_request(self, request, address):
-        try:
-            super().process_request_thread(request, address)
-        finally:
-            with self._workers_lock:
-                self._workers.pop(threading.current_thread(), None)
-            self._slots.release()
+    def send(method, params):
+        wire.settimeout(min(8, _probe_remaining(deadline)))
+        connection.next_id += 1
+        identifier = connection.next_id
+        wire.send(json.dumps({'id': identifier, 'method': method, 'params': params, 'sessionId': session}))
+        pending[identifier] = method
+        return identifier
 
-    def close_workers(self):
-        with self._workers_lock:
-            owned = list(self._workers.items())
-        # Interrupt only sockets accepted by this short-lived server. Socket
-        # timeouts and a bounded join also cover clients that send slowly.
-        for _, request in owned:
+    try:
+        navigation = send('Page.navigate', {'url': url})
+        for _ in range(128):
+            wire.settimeout(min(8, _probe_remaining(deadline)))
+            raw = wire.recv()
+            if not isinstance(raw, (str, bytes)):
+                raise _fetch_failure('message')
             try:
-                request.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                request.close()
-            except OSError:
-                pass
-        deadline = time.monotonic() + 1
-        for worker, _ in owned:
-            worker.join(timeout=max(0, deadline - time.monotonic()))
-        return not any(worker.is_alive() for worker, _ in owned)
-
-
-class _LoopbackPage:
-    def __init__(self):
-        self.server = None
-        self.thread = None
-        self.started = False
-
-    def start(self):
-        try:
-            if self.server is not None:
-                raise _blocked(['probe.server'])
-            self.server = _ProbeHTTPServer(('127.0.0.1', 0), _ProbePageHandler)
-            self.server.probe_path = '/' + uuid.uuid4().hex
-            self.thread = threading.Thread(target=self.server.serve_forever,
-                                           kwargs={'poll_interval': .05},
-                                           name='continuity-http', daemon=True)
-            self.thread.start()
-            self.started = True
-            return 'http://localhost:' + str(self.server.server_port) + self.server.probe_path
-        except Exception:
-            self.close()
-            raise _blocked(['probe.server']) from None
-
-    def close(self):
-        if self.server is None:
-            return
-        okay = True
-        try:
-            if self.started and self.thread.is_alive():
-                self.server.shutdown()
-        except Exception:
-            okay = False
-        try:
-            self.server.server_close()
-        except Exception:
-            okay = False
-        if self.started:
-            self.thread.join(timeout=1)
-            if self.thread.is_alive():
-                okay = False
-        if not self.server.close_workers():
-            okay = False
-        if not okay:
-            raise _blocked(['probe.server'])
-        self.server = self.thread = None
-        self.started = False
+                if len(raw if isinstance(raw, bytes) else raw.encode('utf-8')) > 1_000_000:
+                    raise _fetch_failure('message')
+                message = json.loads(raw)
+            except (ValueError, TypeError):
+                raise _fetch_failure('message') from None
+            if not isinstance(message, dict):
+                raise _fetch_failure('message')
+            if message.get('method') == 'Fetch.requestPaused':
+                params = message.get('params')
+                if not isinstance(params, dict):
+                    raise _fetch_failure('request')
+                request = params.get('request')
+                request_id = params.get('requestId')
+                if message.get('sessionId') != session:
+                    raise _fetch_failure('session')
+                if not isinstance(request_id, str) or not request_id or request_id in requests:
+                    raise _fetch_failure('request_id')
+                requests.add(request_id)
+                valid = (isinstance(request, dict) and request.get('url') == url
+                         and request.get('method') == 'GET' and params.get('frameId') == frame_id
+                         and params.get('resourceType') == 'Document' and not params.get('redirectedRequestId')
+                         and 'responseStatusCode' not in params and 'responseErrorReason' not in params
+                         and fulfilled < 2)
+                if not valid:
+                    send('Fetch.failRequest', {'requestId': request_id, 'errorReason': 'BlockedByClient'})
+                    rejected = True
+                    continue
+                send('Fetch.fulfillRequest', {'requestId': request_id, 'responseCode': 200,
+                    'responseHeaders': [
+                        {'name': 'Content-Type', 'value': 'text/html; charset=utf-8'},
+                        {'name': 'Content-Length', 'value': str(len(_STATIC_PAGE))},
+                        {'name': 'Connection', 'value': 'close'},
+                        {'name': 'Cache-Control', 'value': 'no-store'},
+                        {'name': 'X-Content-Type-Options', 'value': 'nosniff'},
+                        {'name': 'Referrer-Policy', 'value': 'no-referrer'},
+                        {'name': 'Content-Security-Policy', 'value': "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"}],
+                    'body': base64.b64encode(_STATIC_PAGE).decode('ascii')})
+                fulfilled += 1
+            elif 'id' in message:
+                identifier = message['id']
+                if (type(identifier) is not int or identifier not in pending
+                        or message.get('sessionId', session) != session):
+                    raise _fetch_failure('reply_id')
+                method = pending.pop(identifier)
+                if 'error' in message:
+                    raise _fetch_failure('protocol')
+                reply = message.get('result', {})
+                if not isinstance(reply, dict):
+                    raise _fetch_failure('reply')
+                if identifier == navigation:
+                    if rejected:
+                        continue
+                    if reply.get('errorText') or reply.get('isDownload'):
+                        raise _fetch_failure('navigation')
+                    if (reply.get('frameId') != frame_id or not isinstance(reply.get('loaderId'), str)
+                            or not reply['loaderId']):
+                        raise _fetch_failure('document')
+                    result = reply
+                elif method == 'Fetch.fulfillRequest':
+                    acknowledged += 1
+                elif method == 'Fetch.failRequest':
+                    raise _fetch_failure('request')
+                else:
+                    raise _fetch_failure('reply_id')
+            elif (message.get('method') not in _FETCH_EVENTS
+                    or message.get('sessionId', session) != session):
+                raise _fetch_failure('event')
+            if result is not None and fulfilled == acknowledged and fulfilled and not pending:
+                _probe_remaining(deadline)
+                return result
+        raise _fetch_failure('event_limit')
+    except LocalBrowserError:
+        raise
+    except Exception:
+        raise _fetch_failure('transport') from None
 
 
 def _navigate_local_page(connection, session, url):
-    """No fallback to an insecure or error page, even when APIs are absent."""
+    """Fulfill a fixed secure document; never fall back to real HTTP content."""
     deadline = time.monotonic() + 5
     original_timeout = connection.timeout
+
+    def call(method, params=None):
+        connection.timeout = min(original_timeout, _probe_remaining(deadline))
+        connection.connection.settimeout(min(8, connection.timeout))
+        return connection.call(method, params, session=session)
+
+    def main_frame(reply):
+        branch = reply.get('frameTree') if isinstance(reply, dict) else None
+        frame = branch.get('frame') if isinstance(branch, dict) else None
+        if not isinstance(frame, dict):
+            raise _fetch_failure('document')
+        return frame
+
     try:
-        connection.timeout = 5
-        reply = connection.call('Page.navigate', {'url': url}, session=session)
-        if reply.get('errorText'):
-            raise _blocked(['probe.navigation'])
+        if not isinstance(url, str) or not re.fullmatch(r'https://probe\.invalid/[0-9a-f]{32}', url):
+            raise _fetch_failure('document')
+        frame = main_frame(call('Page.getFrameTree'))
+        if (frame.get('url') != 'about:blank' or frame.get('unreachableUrl')
+                or not isinstance(frame.get('id'), str) or not frame['id']):
+            raise _fetch_failure('document')
+        call('Fetch.enable', {'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}]})
+        result = _fulfill_probe_document(connection, session, frame['id'], url, deadline)
+        # Disable only after fulfillment and navigation acknowledgements. On
+        # failure the original empty-profile shutdown runs without sampling.
+        call('Fetch.disable')
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _blocked(['probe.secureContext'])
-            connection.timeout = min(original_timeout, remaining)
-            reply = connection.call('Runtime.evaluate', {'expression': _READY_EXPRESSION,
-                                    'returnByValue': True}, session=session)
-            if reply.get('exceptionDetails'):
-                raise _blocked(['probe.secureContext'])
+            reply = call('Runtime.evaluate', {'expression': _READY_EXPRESSION, 'returnByValue': True})
+            if not isinstance(reply, dict) or reply.get('exceptionDetails'):
+                raise _fetch_failure('document')
             ready = reply.get('result', {}).get('value')
-            if isinstance(ready, dict) and ready.get('url') == url and ready.get('ready') == 'complete' and ready.get('secure') is True:
+            if (isinstance(ready, dict) and ready.get('url') == url
+                    and ready.get('ready') == 'complete' and ready.get('secure') is True):
+                current = main_frame(call('Page.getFrameTree'))
+                if (current.get('id') != frame['id'] or current.get('loaderId') != result['loaderId']
+                        or current.get('url') != url or current.get('unreachableUrl')):
+                    raise _fetch_failure('document')
+                _probe_remaining(deadline)
                 return
-            time.sleep(min(.05, max(0, deadline - time.monotonic())))
+            time.sleep(min(.05, _probe_remaining(deadline)))
     finally:
         connection.timeout = original_timeout
 
@@ -325,14 +303,14 @@ def native_digest(native, root=None):
 
 
 def _engine_binding(runtime):
-    executable = Path(runtime['core_path']).resolve()
+    executable = resolved_path(runtime['core_path'])
     actual = sha256(executable)
     if actual != runtime.get('core_sha256'):
         raise _blocked(['core'])
     manifest = executable.parent / 'manifest.json'
-    if not manifest.is_file() or manifest.stat().st_size > _MAX_MANIFEST_BYTES:
+    if not io_path(manifest).is_file() or io_path(manifest).stat().st_size > _MAX_MANIFEST_BYTES:
         raise _blocked(['core.manifest'])
-    data = json.loads(manifest.read_text(encoding='utf-8'))
+    data = json.loads(io_path(manifest).read_text(encoding='utf-8'))
     files = data.get('files')
     if (not isinstance(files, dict) or not files or data.get('format') != 1
             or str(data.get('core_major')) != str(runtime.get('core_major'))
@@ -344,7 +322,7 @@ def _engine_binding(runtime):
     relative = PurePosixPath(names[0].replace('\\', '/'))
     if relative.is_absolute() or '..' in relative.parts or any(':' in part for part in relative.parts):
         raise _blocked(['core.manifest'])
-    chrome = executable.parent.joinpath(*relative.parts).resolve()
+    chrome = resolved_path(executable.parent.joinpath(*relative.parts))
     if not chrome.is_relative_to(executable.parent):
         raise _blocked(['core.manifest'])
     from engine_validation import digest_file
@@ -404,8 +382,10 @@ _EXPRESSION = r"""(async () => {
   const bounded = async (key, fn, limit=1000) => {
     let timer;
     try {
-      const value = await Promise.race([Promise.resolve().then(fn),
-        new Promise((_, reject) => { timer=setTimeout(() => reject(new Error()), limit); })]);
+      const value = await Promise.resolve().then(() => {
+        const deadline = new Promise((_, reject) => { timer=setTimeout(() => reject(new Error()), limit); });
+        return Promise.race([fn(), deadline]);
+      });
       put(key, value);
     } catch (_) { errors.push(key); }
     finally { clearTimeout(timer); }
@@ -538,7 +518,7 @@ _EXPRESSION = r"""(async () => {
         return kinds;
       }
       catch (_) { unavailable.push('devices'); return {status:'unavailable'}; }
-    }));
+    },3000));
   }
   else { put('devices.supported',false); unavailable.push('devices'); }
   await Promise.all(jobs);
@@ -605,11 +585,10 @@ def _merge_samples(first, second):
 
 
 def probe_snapshot(record, root):
-    """Two reads on one owned localhost page; never copy account profile data."""
+    """Two reads on one owned secure page; never copy account profile data."""
     temporary = None
     controller = None
     profile = None
-    local_page = None
     desktop = None
     result = None
     try:
@@ -632,8 +611,7 @@ def probe_snapshot(record, root):
         # Keep all state in the temporary directory. Only signature verification
         # needs the actual encryption/signing root, which is never copied.
         controller.root = root
-        local_page = _LoopbackPage()
-        local_url = local_page.start()
+        local_url = 'https://probe.invalid/' + uuid.uuid4().hex
         presentation={}
         if str(runtime.get('core_major'))=='104':
             from probe_display import ProbeDesktop
@@ -653,18 +631,14 @@ def probe_snapshot(record, root):
                 samples.append(_normalize_sample(reply.get('result', {}).get('value')))
             result = _merge_samples(*samples)
     except LocalBrowserError as exc:
-        if str(exc).startswith('环境连续性检查') or getattr(exc,'code',None)=='engine_path_too_long':
+        if str(exc).startswith('环境连续性检查') or getattr(exc,'code',None) in {
+                'engine_path_too_long','profile_path_too_long','profile_path_invalid','profile_path_changed','profile_tree_limit'}:
             raise
         raise LocalBrowserError(_FAILURE) from None
     except Exception:
         raise LocalBrowserError(_FAILURE) from None
     finally:
         cleanup_ok = True
-        if local_page is not None:
-            try:
-                local_page.close()
-            except Exception:
-                cleanup_ok = False
         if controller is not None:
             try:
                 controller.close(next(iter(controller.profiles)))
@@ -685,7 +659,7 @@ def probe_snapshot(record, root):
                         or temporary.is_symlink() or temporary.resolve() != temporary):
                     cleanup_ok = False
                 else:
-                    shutil.rmtree(temporary)
+                    shutil.rmtree(io_path(temporary))
             except OSError:
                 cleanup_ok = False
         if not cleanup_ok:

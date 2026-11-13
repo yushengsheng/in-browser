@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -350,6 +351,20 @@ class SourcePreparationTests(unittest.TestCase):
         with patch.object(local_source,'_reader',return_value=reader),self.assertRaises(LocalBrowserError):
             local_source.prepare(self.configuration,A,'148')
         self.assertEqual(self.cache.ids(),set())
+
+    def test_cookie_or_session_change_during_preparation_never_persists_old_configuration(self):
+        for relative in ('Default/Network/Cookies','Default/Sessions/Session_1','Default/~TabGroups'):
+            with self.subTest(relative=relative):
+                path=self.profiles/A/relative;path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_bytes(b'old bytes');reader=self.reader()
+                def changed(*args,**kwargs):
+                    previous=path.stat();path.write_bytes(b'new bytes')
+                    os.utime(path,ns=(previous.st_atime_ns,previous.st_mtime_ns))
+                    return {'DataProtect':full()['browserFingerPrint']['extendOptions']['DataProtect']},None
+                reader.build_source.side_effect=changed
+                with patch.object(local_source,'_reader',return_value=reader),self.assertRaises(LocalBrowserError):
+                    local_source.prepare(self.configuration,A,'148')
+                self.assertEqual(self.cache.ids(),set())
 
     def test_prepared_source_becomes_stale_when_only_actual_launch_signature_changes(self):
         from configuration import Configuration

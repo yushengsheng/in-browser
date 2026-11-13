@@ -75,6 +75,7 @@ class SyncState:
     def __init__(self, store):
         self.store = store
         with store.lock, store.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
             con.execute('CREATE TABLE IF NOT EXISTS sync_jobs ('
                         'job_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,state TEXT NOT NULL,'
                         'phase TEXT NOT NULL,current INTEGER NOT NULL,total INTEGER NOT NULL,'
@@ -87,6 +88,17 @@ class SyncState:
                         'message TEXT,PRIMARY KEY(job_id,ordinal),UNIQUE(job_id,source_key))')
             con.execute('CREATE INDEX IF NOT EXISTS sync_items_pending ON sync_items(job_id,state,ordinal)')
             con.execute("CREATE INDEX IF NOT EXISTS sync_items_results ON sync_items(job_id,ordinal) WHERE state IN ('completed','skipped','failed')")
+            # Completion order differs from source order with parallel items.
+            # A durable result cursor prevents a late lower ordinal being lost
+            # when callers incrementally read a batch's results.
+            if 'result_cursor' not in {row[1] for row in con.execute('PRAGMA table_info(sync_jobs)')}:
+                con.execute('ALTER TABLE sync_jobs ADD COLUMN result_cursor INTEGER NOT NULL DEFAULT 0')
+            if 'result_cursor' not in {row[1] for row in con.execute('PRAGMA table_info(sync_items)')}:
+                con.execute('ALTER TABLE sync_items ADD COLUMN result_cursor INTEGER')
+                con.execute("UPDATE sync_items SET result_cursor=ordinal WHERE state IN ('completed','skipped','failed')")
+            con.execute('UPDATE sync_jobs SET result_cursor=MAX(result_cursor,COALESCE('
+                        '(SELECT MAX(result_cursor) FROM sync_items WHERE sync_items.job_id=sync_jobs.job_id),0))')
+            con.execute("CREATE INDEX IF NOT EXISTS sync_items_result_cursor ON sync_items(job_id,result_cursor) WHERE state IN ('completed','skipped','failed')")
             con.execute('CREATE TABLE IF NOT EXISTS import_intents ('
                         'intent_id TEXT PRIMARY KEY,source_key TEXT NOT NULL,profile_id TEXT NOT NULL UNIQUE,'
                         'work_id TEXT NOT NULL,state TEXT NOT NULL,data BLOB,job_id TEXT,ordinal INTEGER)')
@@ -128,17 +140,17 @@ class SyncState:
             result = dict(row)
             terminal = "state IN ('completed','skipped','failed')"
             if after is None:
-                rows = con.execute('SELECT ordinal,source_key,name,state,message FROM sync_items WHERE job_id=? AND '
-                                   + terminal + ' ORDER BY ordinal DESC LIMIT ?', (identity, limit)).fetchall()[::-1]
+                rows = con.execute('SELECT ordinal,source_key,name,state,message,result_cursor FROM sync_items WHERE job_id=? AND '
+                                   + terminal + ' ORDER BY result_cursor DESC LIMIT ?', (identity, limit)).fetchall()[::-1]
             else:
-                rows = con.execute('SELECT ordinal,source_key,name,state,message FROM sync_items WHERE job_id=? AND '
-                                   + terminal + ' AND ordinal>? ORDER BY ordinal LIMIT ?',
+                rows = con.execute('SELECT ordinal,source_key,name,state,message,result_cursor FROM sync_items WHERE job_id=? AND '
+                                   + terminal + ' AND result_cursor>? ORDER BY result_cursor LIMIT ?',
                                    (identity, max(0, int(after)), limit)).fetchall()
         result['cancel_requested'] = bool(result['cancel_requested'])
         result['items_total'] = result['completed'] + result['skipped'] + result['failed']
         result['items'] = [{'index': item['ordinal'], 'source_key': item['source_key'], 'name': self.store.unpack(item['name']),
                             'status': item['state'], 'message': item['message']} for item in rows]
-        result['next_cursor'] = rows[-1]['ordinal'] if rows else max(0, int(after or 0))
+        result['next_cursor'] = rows[-1]['result_cursor'] if rows else max(0, int(after or 0))
         return result
 
     def update(self, identity, **values):
@@ -191,10 +203,15 @@ class SyncState:
     def begin_item(self, identity, ordinal):
         with self.store.lock, self.store.connect() as con:
             con.execute('BEGIN IMMEDIATE')
-            con.execute("UPDATE sync_items SET state='running' WHERE job_id=? AND ordinal=? AND state='pending'", (identity, ordinal))
+            changed=con.execute("UPDATE sync_items SET state='running' WHERE job_id=? AND ordinal=? AND state='pending' "
+                                "AND EXISTS(SELECT 1 FROM sync_jobs WHERE job_id=? AND state='running' AND cancel_requested=0)",
+                                (identity, ordinal, identity)).rowcount
+            if changed!=1:return None
             # Permanent deletion can remove historical items without renumbering
             # authenticated intents or result cursors for the remaining items.
-            con.execute("UPDATE sync_jobs SET current=(SELECT count(*) FROM sync_items WHERE job_id=? AND ordinal<=?),phase='checking' WHERE job_id=?", (identity, ordinal, identity))
+            position=con.execute('SELECT count(*) FROM sync_items WHERE job_id=? AND ordinal<=?',(identity,ordinal)).fetchone()[0]
+            con.execute("UPDATE sync_jobs SET current=MAX(current,?),phase='checking' WHERE job_id=?", (position,identity))
+            return position
 
     @staticmethod
     def complete_item(con, identity, ordinal, status, message):
@@ -203,7 +220,9 @@ class SyncState:
         row = con.execute('SELECT state FROM sync_items WHERE job_id=? AND ordinal=?', (identity, ordinal)).fetchone()
         previous = row[0] if row else None
         if previous in ('pending', 'running') or (previous == 'failed' and status == 'completed'):
-            con.execute('UPDATE sync_items SET state=?,message=? WHERE job_id=? AND ordinal=?', (status, message, identity, ordinal))
+            con.execute('UPDATE sync_jobs SET result_cursor=result_cursor+1 WHERE job_id=?',(identity,))
+            con.execute('UPDATE sync_items SET state=?,message=?,result_cursor=(SELECT result_cursor FROM sync_jobs WHERE job_id=?) WHERE job_id=? AND ordinal=?',
+                        (status, message, identity, identity, ordinal))
             if previous == 'failed':
                 con.execute('UPDATE sync_jobs SET failed=failed-1 WHERE job_id=?', (identity,))
             con.execute('UPDATE sync_jobs SET ' + status + '=' + status + '+1 WHERE job_id=?', (identity,))

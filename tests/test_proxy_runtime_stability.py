@@ -7,8 +7,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
@@ -218,6 +219,113 @@ class ProxyRuntimeStabilityTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
         await self.assert_released(worker)
+
+
+class WorkerBrowserIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='proxy-identity-synthetic-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.profile = self.root / 'long-profile-directory-for-browser-identity'
+        self.profile.mkdir()
+        self.core = self.root / 'bitbrowser.exe'
+        self.fingerprint = self.root / 'fingerprint.bin'
+        self.arguments = [str(self.core), '--user-data-dir=' + str(self.profile),
+            '--fingerprint-config=' + str(self.fingerprint),
+            '--proxy-server=http://127.0.0.1:12345', '--proxy-bypass-list=<-loopback>',
+            '--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+            '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1']
+        self.process = Mock(pid=101, cmdline=lambda: list(self.arguments),
+                            exe=Mock(return_value=str(self.core)), create_time=Mock(return_value=100))
+        self.worker = proxy_runtime.Worker(self.root, {
+            'profile': str(self.profile), 'core': str(self.core), 'fingerprint': str(self.fingerprint),
+            'token': 'synthetic-control', 'proxy': {'type': 'noproxy'}})
+        self.worker.state = {'port': 12345, 'instance': 'synthetic-instance', 'digest': 'synthetic-digest'}
+        self.addCleanup(self.worker.browser_checks.shutdown, wait=True, cancel_futures=True)
+
+    def short_profile(self):
+        if os.name != 'nt':
+            self.skipTest('Windows directory aliases are required')
+        from browser_core import _short_executable_path
+        alias = _short_executable_path(self.profile)
+        if alias is None or os.path.normcase(str(alias)) == os.path.normcase(str(self.profile)):
+            self.skipTest('The test volume does not provide an alternate 8.3 spelling')
+        self.assertTrue(alias.samefile(self.profile))
+        return alias
+
+    async def test_real_short_profile_alias_matches_and_prevents_live_worker_stop(self):
+        alias = self.short_profile()
+        self.worker.browser = (self.process.pid, 100)
+        with patch.object(proxy_runtime, '_profile_browsers', return_value=[self.process]), \
+                patch.object(proxy_runtime.psutil, 'Process', return_value=self.process):
+            for spelling in (str(self.profile), str(alias), '"' + str(alias) + '"'):
+                with self.subTest(spelling='canonical' if spelling == str(self.profile) else 'alias'):
+                    self.arguments[1] = '--user-data-dir=' + spelling
+                    self.assertTrue(self.worker.matches_browser(self.process))
+                    self.assertEqual(self.worker.matching_browsers(), [self.process])
+                    self.assertTrue(self.worker.bound_browser_alive())
+            reader = asyncio.StreamReader()
+            reader.feed_data(('POST ' + proxy_runtime.CONTROL + 'stop HTTP/1.1\r\n'
+                              'X-Local-Token: synthetic-control\r\n\r\n').encode())
+            writer = Mock(drain=AsyncMock(), wait_closed=AsyncMock())
+            await self.worker.handle(reader, writer)
+        self.assertTrue(writer.write.call_args.args[0].startswith(b'HTTP/1.1 409 '))
+        self.assertFalse(self.worker.stop.is_set())
+        self.assertEqual(self.worker.active, 0)
+        self.assertFalse(self.worker.connections)
+
+    async def test_profile_alias_watch_survives_startup_deadline_and_stops_after_exit(self):
+        self.arguments[1] = '--user-data-dir=' + str(self.short_profile())
+        clock = [0.0]
+        sleeps = [0]
+        live = [True]
+        async def check(operation):
+            return operation()
+        async def sleep(_delay):
+            sleeps[0] += 1
+            if sleeps[0] <= 2:
+                self.assertEqual(self.worker.browser, (self.process.pid, 100))
+                self.assertFalse(self.worker.stop.is_set())
+            if sleeps[0] == 1:
+                clock[0] = 61.0
+            elif sleeps[0] == 2:
+                live[0] = False
+                clock[0] = 64.0
+            else:
+                clock[0] += 3.0
+            if sleeps[0] > 5:
+                self.fail('Worker did not stop after the confirmed browser exit')
+        def current(_pid):
+            if not live[0]:
+                raise proxy_runtime.psutil.NoSuchProcess(self.process.pid)
+            return self.process
+        with patch.object(proxy_runtime, '_profile_browsers', return_value=[self.process]), \
+                patch.object(proxy_runtime.psutil, 'Process', side_effect=current), \
+                patch.object(proxy_runtime, 'time', SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(proxy_runtime.asyncio, 'sleep', new=sleep), \
+                patch.object(self.worker, 'check_browser', new=check):
+            await self.worker.watch()
+        self.assertTrue(self.worker.stop.is_set())
+        self.assertEqual(sleeps[0], 4)
+
+    async def test_identity_mismatches_remain_rejected(self):
+        original = list(self.arguments)
+        for index, argument in ((1, '--user-data-dir=' + str(self.root / 'other-profile')),
+                                (2, '--fingerprint-config=' + str(self.root / 'other.bin')),
+                                (3, '--proxy-server=http://127.0.0.1:12346')):
+            with self.subTest(index=index):
+                self.arguments = list(original)
+                self.arguments[index] = argument
+                self.assertFalse(self.worker.matches_browser(self.process))
+        self.arguments = [*original, '--type=renderer']
+        self.assertFalse(self.worker.matches_browser(self.process))
+        self.arguments = original
+        self.process.exe.return_value = str(self.root / 'other-core.exe')
+        self.assertFalse(self.worker.matches_browser(self.process))
+        self.process.exe.return_value = str(self.core)
+        self.worker.browser = (self.process.pid, 99)
+        with patch.object(proxy_runtime.psutil, 'Process', return_value=self.process):
+            self.assertFalse(self.worker.bound_browser_alive())
 
 
 class WorkerShutdownProcessTests(unittest.IsolatedAsyncioTestCase):

@@ -122,7 +122,9 @@ def _purge_runtime(service,plan):
             for path in runtime.paths(identity):remove(path,root)
         if controller is not None:
             lock=getattr(controller,'lock',None)
-            with lock if lock is not None else nullcontext():
+            windows=getattr(controller,'_windows',None)
+            window=windows.hold(identity) if windows is not None else nullcontext()
+            with window,lock if lock is not None else nullcontext():
                 for field in ('profiles','state','_status_cache','_windowless_since'):
                     value=getattr(controller,field,None)
                     if isinstance(value,dict):value.pop(identity,None)

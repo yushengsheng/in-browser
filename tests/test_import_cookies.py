@@ -53,8 +53,33 @@ class ImportCookieTests(unittest.TestCase):
             with self.subTest(kind=type(value).__name__),self.assertRaises((ValueError,TypeError)):
                 source_cookies({'cookie':value})
 
+    def test_normalized_cookie_duplicates_merge_only_equivalent_records(self):
+        first=self.cookie(hostOnly=True)
+        equivalent={**first,'domain':'example.invalid'}
+        self.assertEqual(len(source_cookies({'cookie':[first,equivalent]})),1)
+        host=self.cookie(name='__Host-fixture',path='/ignored')
+        self.assertEqual(len(source_cookies({'cookie':[host,{**host,'path':'/'}]})),1)
+        partition={'topLevelSite':'https://first.invalid'}
+        first=self.cookie(partitionKey=partition)
+        equivalent={**first,'partitionKey':{**partition,'hasCrossSiteAncestor':False}}
+        self.assertEqual(len(source_cookies({'cookie':[first,equivalent]})),1)
+        distinct={**first,'partitionKey':{**partition,'hasCrossSiteAncestor':True}}
+        self.assertEqual(len(source_cookies({'cookie':[first,distinct]})),2)
+
+    def test_conflicting_normalized_cookie_duplicates_are_rejected(self):
+        first=self.cookie(hostOnly=True)
+        for change in ({'value':'different'},{'expires':2000000000},{'secure':False},{'httpOnly':False}):
+            with self.subTest(field=next(iter(change))),self.assertRaises(ValueError):
+                source_cookies({'cookie':[first,{**first,'domain':'example.invalid',**change}]},now=1000)
+
+    @staticmethod
+    def metadata(con,version=24):
+        con.execute('CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)')
+        con.executemany('INSERT INTO meta VALUES(?,?)',[('version',str(version)),('last_compatible_version',str(version))])
+
     def database(self,path,rows):
         con=sqlite3.connect(path)
+        self.metadata(con)
         con.execute('CREATE TABLE cookies(host_key TEXT,name TEXT,path TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER,is_persistent INTEGER,UNIQUE(host_key,name,path))')
         con.executemany('INSERT INTO cookies VALUES(?,?,?,?,?,?,?)',rows);con.commit();con.close()
 
@@ -86,11 +111,44 @@ class ImportCookieTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):_merge_database(source,target,set(),1)
             con=sqlite3.connect(target);self.assertEqual(con.execute('SELECT encrypted_value FROM cookies').fetchone()[0],b'old');con.close()
 
+    def test_same_columns_with_incompatible_meta_or_indexes_are_rejected(self):
+        changes=("UPDATE meta SET value='23' WHERE key='version'",
+                 "UPDATE meta SET value='23' WHERE key='last_compatible_version'",
+                 "DELETE FROM meta WHERE key='version'",
+                 'CREATE UNIQUE INDEX different_identity ON cookies(host_key,name)',
+                 'CREATE UNIQUE INDEX different_collation ON cookies(host_key COLLATE NOCASE,name,path)')
+        for change in changes:
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory).resolve();source=root/'source';target=root/'target'
+                self.database(source,[('example.invalid','session','/',b'new',100,1,1)])
+                self.database(target,[('example.invalid','session','/',b'old',99,1,1)])
+                con=sqlite3.connect(target);con.execute(change);con.commit();con.close()
+                before=target.read_bytes()
+                with self.assertRaises(ValueError):_merge_database(source,target,set(),1)
+                self.assertEqual(target.read_bytes(),before)
+
+    def test_same_columns_with_incompatible_partition_uniqueness_never_drop_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();source=root/'source';target=root/'target'
+            for database in (source,target):
+                con=sqlite3.connect(database);self.metadata(con)
+                unique='host_key,name,path,top_frame_site_key' if database==source else 'host_key,name,path'
+                con.execute('CREATE TABLE cookies(host_key TEXT,name TEXT,path TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER,is_persistent INTEGER,top_frame_site_key TEXT,UNIQUE('+unique+'))')
+                if database==source:
+                    con.executemany('INSERT INTO cookies VALUES(?,?,?,?,?,?,?,?)',[
+                        ('example.invalid','session','/',b'first',100,1,1,'https://first.invalid'),
+                        ('example.invalid','session','/',b'second',200,1,1,'https://second.invalid')])
+                con.commit();con.close()
+            before=target.read_bytes()
+            with self.assertRaises(ValueError):_merge_database(source,target,set(),2)
+            self.assertEqual(target.read_bytes(),before)
+
     def test_partitioned_session_does_not_change_another_partition_expiry(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();source=root/'source';target=root/'target'
             for path in (source,target):
                 con=sqlite3.connect(path)
+                self.metadata(con)
                 con.execute('CREATE TABLE cookies(host_key TEXT,name TEXT,path TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER,is_persistent INTEGER,top_frame_site_key TEXT,has_cross_site_ancestor INTEGER,UNIQUE(host_key,name,path,top_frame_site_key,has_cross_site_ancestor))')
                 if path==source:con.executemany('INSERT INTO cookies VALUES(?,?,?,?,?,?,?,?,?)',[
                     ('example.invalid','session','/',b'one',100,1,1,'https://first.invalid',0),
@@ -109,6 +167,7 @@ class ImportCookieTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();source=root/'source';target=root/'target'
             con=sqlite3.connect(source)
+            self.metadata(con)
             con.execute('CREATE TABLE cookies(host_key TEXT,name TEXT,path TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER,is_persistent INTEGER,top_frame_site_key TEXT,has_cross_site_ancestor INTEGER,UNIQUE(host_key,name,path,top_frame_site_key,has_cross_site_ancestor))')
             con.execute('INSERT INTO cookies VALUES(?,?,?,?,?,?,?,?,?)',('example.invalid','session','/',b'native',100,1,1,'',1))
             con.commit();con.close()
@@ -366,6 +425,204 @@ class ExpiryRepairTests(unittest.TestCase):
         record=copy.deepcopy(self.record);record.pop('_startup_cookies');record['_source_info']['cookie']=[]
         self.assertTrue(materialize(self.service,record,self.profile))
         self.assertEqual(record['_startup_cookies'],{'format':1,'expiry_revision':2,'count':0})
+
+
+class PartitionConflictTests(unittest.TestCase):
+    def setUp(self):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from local_state import _dpapi_protect
+        temporary=tempfile.TemporaryDirectory(prefix='partition-conflict-');self.addCleanup(temporary.cleanup)
+        self.root=Path(temporary.name).resolve();self.profile=self.root/'profile'
+        self.database=self.profile/'Default/Network/Cookies';self.database.parent.mkdir(parents=True)
+        self.key=bytes(range(32));self.cipher=AESGCM(self.key);self.expiry=int(time.time())+7200
+        state={'os_crypt':{'encrypted_key':base64.b64encode(b'DPAPI'+_dpapi_protect(self.key)).decode()}}
+        (self.profile/'Local State').write_text(json.dumps(state),encoding='utf-8')
+        self.snapshots=[{'domain':'example.invalid','name':'session','path':'/','value':value,
+                         'secure':True,'httpOnly':True,'sameSite':'Lax','expires':self.expiry}
+                        for value in ('synthetic-first','synthetic-second')]
+        self.actual=[{**cookie,'session':False,'partitionKey':{'topLevelSite':site,'hasCrossSiteAncestor':bool(index)}}
+                     for index,(cookie,site) in enumerate(zip(self.snapshots,('https://first.invalid','https://second.invalid')))]
+        self.write_database(self.database,self.actual)
+        self.record={'_source_info':{'cookie':copy.deepcopy(self.snapshots)},
+                     '_runtime':{'alias':'synthetic','core_major':'148','profile_path':str(self.profile)},
+                     '_portable_crypt':{'format':1,'key':base64.b64encode(self.key).decode(),'key_id':hashlib.sha256(self.key).hexdigest()}}
+        self.service=SimpleNamespace(root=self.root);self.controllers=[];self.native_transform=lambda values:values
+        process=patch('import_cookies.profile_processes',return_value=[]);process.start();self.addCleanup(process.stop)
+        controller=patch('import_cookies.BrowserController',side_effect=self.controller);controller.start();self.addCleanup(controller.stop)
+        cdp=patch('import_cookies.CDP',side_effect=self.connection);cdp.start();self.addCleanup(cdp.stop)
+
+    def write_database(self,path,cookies):
+        path.parent.mkdir(parents=True,exist_ok=True)
+        con=sqlite3.connect(path)
+        try:
+            ImportCookieTests.metadata(con)
+            con.execute('CREATE TABLE cookies(host_key TEXT,name TEXT,path TEXT,top_frame_site_key TEXT,has_cross_site_ancestor INTEGER,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER,is_persistent INTEGER,is_secure INTEGER,is_httponly INTEGER,samesite INTEGER,UNIQUE(host_key,name,path,top_frame_site_key,has_cross_site_ancestor))')
+            for index,cookie in enumerate(cookies):
+                nonce=bytes([index+1])*12
+                encrypted=b'v10'+nonce+self.cipher.encrypt(nonce,hashlib.sha256(cookie['domain'].encode()).digest()+cookie['value'].encode(),None)
+                key=cookie.get('partitionKey') or {}
+                con.execute('INSERT INTO cookies VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (cookie['domain'],cookie['name'],cookie['path'],key.get('topLevelSite',''),int(key.get('hasCrossSiteAncestor',False)),encrypted,
+                     int(cookie['expires'])*1_000_000+_CHROME_EPOCH_US,1,1,int(cookie['secure']),int(cookie['httpOnly']),1))
+            con.commit()
+        finally:con.close()
+
+    def controller(self,root,*,settings):
+        runtime=settings['windows'][0]
+        controller=Mock();controller.profiles={runtime['alias']:runtime};controller.pending=[]
+        controller.endpoint.return_value='synthetic-endpoint'
+        def close(_):
+            if controller.pending:
+                self.write_database(Path(runtime['profile_path'])/'Default/Network/Cookies',controller.pending)
+                controller.pending=[]
+        controller.close.side_effect=close
+        self.controllers.append(controller);return controller
+
+    def connection(self,*args,**kwargs):
+        controller=self.controllers[-1];connection=Mock()
+        def call(method,params=None):
+            if method=='Storage.setCookies':controller.pending=copy.deepcopy(params['cookies']);return {}
+            values=controller.pending or self.actual
+            return {'cookies':self.native_transform(copy.deepcopy(values))}
+        connection.call.side_effect=call
+        context=Mock();context.__enter__=Mock(return_value=connection);context.__exit__=Mock(return_value=False)
+        return context
+
+    def rows(self):
+        con=sqlite3.connect(self.database)
+        try:return con.execute('SELECT rowid,* FROM cookies ORDER BY rowid').fetchall()
+        finally:con.close()
+
+    def update(self,sql):
+        con=sqlite3.connect(self.database)
+        try:con.execute(sql);con.commit()
+        finally:con.close()
+
+    def rejected(self):
+        before=self.rows()
+        with self.assertRaises(LocalBrowserError):materialize(self.service,self.record,self.profile)
+        self.assertEqual(self.rows(),before);self.assertNotIn('_startup_cookies',self.record)
+        self.assertFalse(list(self.root.glob('cookie-seed-*')))
+
+    def test_persistent_partition_conflict_preserves_original_rows_and_marks_proof(self):
+        before=self.database.read_bytes()
+        self.assertTrue(materialize(self.service,self.record,self.profile))
+        self.assertEqual(self.database.read_bytes(),before)
+        self.assertEqual(self.record['_startup_cookies']['preserved_partition_cookies'],2)
+        self.assertEqual(self.record['_startup_cookies']['count'],0)
+        self.assertEqual(len(self.controllers),1)
+        self.assertFalse(list(self.root.glob('cookie-seed-*')))
+        self.assertFalse(materialize(self.service,self.record,self.profile))
+        self.assertEqual(len(self.controllers),1)
+
+    def test_normal_cookie_merge_keeps_proven_partition_rows_unchanged(self):
+        before=self.rows()
+        ordinary={**self.snapshots[0],'name':'ordinary','value':'synthetic-extra'}
+        self.record['_source_info']['cookie'].append(ordinary)
+        self.assertTrue(materialize(self.service,self.record,self.profile))
+        self.assertEqual(self.rows()[:2],before)
+        self.assertEqual(len(self.rows()),3);self.assertEqual(len(self.controllers),2)
+        self.assertEqual(self.record['_startup_cookies']['count'],1)
+
+    def test_ordinary_snapshot_does_not_start_partition_proof(self):
+        self.record['_source_info']['cookie']=[{**self.snapshots[0],'name':'ordinary'}]
+        with patch('import_cookies._preserve_partition_conflicts') as proof:
+            self.assertTrue(materialize(self.service,self.record,self.profile))
+            proof.assert_not_called()
+        self.assertEqual(len(self.controllers),1)
+
+    def test_unsupported_or_overlapping_snapshot_conflicts_are_rejected(self):
+        original=copy.deepcopy(self.record)
+        for change in ({'session':True},{'partitionKey':{'topLevelSite':'https://first.invalid'}},
+                       {'partitionKeyOpaque':True},{'expires':-1}):
+            with self.subTest(field=next(iter(change))):
+                self.record=copy.deepcopy(original)
+                for cookie in self.record['_source_info']['cookie']:cookie.update(change)
+                self.rejected()
+        self.record=copy.deepcopy(original)
+        self.record['_source_info']['cookie'].append({**self.snapshots[0],
+            'partitionKey':{'topLevelSite':'https://first.invalid','hasCrossSiteAncestor':False}})
+        self.rejected()
+        self.assertEqual(len(self.controllers),0)
+
+    def test_missing_extra_unpartitioned_or_nonpersistent_native_rows_are_rejected(self):
+        original=self.database.read_bytes()
+        changes=("DELETE FROM cookies WHERE rowid=2",
+                 "UPDATE cookies SET top_frame_site_key='' WHERE rowid=2",
+                 "UPDATE cookies SET expires_utc=1 WHERE rowid=2",
+                 "UPDATE cookies SET is_persistent=0,has_expires=0,expires_utc=0 WHERE rowid=2",
+                 "INSERT INTO cookies SELECT host_key,name,path,'https://extra.invalid',has_cross_site_ancestor,encrypted_value,expires_utc,has_expires,is_persistent,is_secure,is_httponly,samesite FROM cookies WHERE rowid=1")
+        for sql in changes:
+            with self.subTest(case=sql.split()[0]):
+                self.database.write_bytes(original);self.update(sql);self.rejected()
+        self.assertEqual(len(self.controllers),0)
+
+    def test_native_value_flags_same_site_partition_or_missing_cookie_mismatch_rejects(self):
+        changes=({'value':'different'},{'secure':False},{'httpOnly':False},{'sameSite':'Strict'},
+                 {'partitionKeyOpaque':True},{'session':True},{'expires':float('nan')},
+                 {'partitionKey':{'topLevelSite':'https://first.invalid'}},
+                 {'partitionKey':{'topLevelSite':'https://other.invalid','hasCrossSiteAncestor':False}})
+        for change in changes:
+            with self.subTest(field=next(iter(change))):
+                self.native_transform=lambda values,change=change:[{**values[0],**change},values[1]]
+                self.rejected()
+        self.native_transform=lambda values:values[:1];self.rejected()
+
+    def test_duplicate_values_do_not_make_an_ambiguous_matching_proof(self):
+        cookies=self.record['_source_info']['cookie'];cookies[1]['value']=cookies[0]['value'];cookies[1]['httpOnly']=False
+        self.rejected();self.assertEqual(len(self.controllers),0)
+        many=[{**self.snapshots[0],'value':'synthetic-'+str(index)} for index in range(10000)]
+        conflicts=[];dumps=json.dumps
+        with patch('import_cookies.json.dumps',wraps=dumps) as signatures:
+            self.assertEqual(source_cookies({'cookie':many},_conflicts=conflicts),[])
+        self.assertEqual(signatures.call_count,len(many))
+        self.assertEqual(len(conflicts),1);self.assertEqual(len(conflicts[0]),len(many))
+
+    def test_wrong_key_or_unknown_cipher_never_reaches_native_probe(self):
+        original=self.database.read_bytes()
+        for encrypted in (b'v20'+b'x'*40,b'v10'+b'x'*40):
+            con=sqlite3.connect(self.database)
+            try:con.execute('UPDATE cookies SET encrypted_value=? WHERE rowid=2',(encrypted,));con.commit()
+            finally:con.close()
+            self.rejected();self.database.write_bytes(original)
+        wrong=bytes(reversed(self.key))
+        self.record['_portable_crypt']={'format':1,'key':base64.b64encode(wrong).decode(),'key_id':hashlib.sha256(wrong).hexdigest()}
+        self.rejected()
+        self.assertEqual(len(self.controllers),0)
+
+    def test_native_timeout_cleans_proof_and_never_marks_success(self):
+        def timeout(_):raise TimeoutError()
+        self.native_transform=timeout;self.rejected()
+
+    def test_row_change_during_native_proof_is_rejected(self):
+        def changed(values):
+            self.update('UPDATE cookies SET is_httponly=0 WHERE rowid=2')
+            return values
+        self.native_transform=changed
+        with self.assertRaises(LocalBrowserError):materialize(self.service,self.record,self.profile)
+        self.assertNotIn('_startup_cookies',self.record)
+        self.assertFalse(list(self.root.glob('cookie-seed-*')))
+
+    def test_corrupt_database_or_changed_state_never_marks_a_proof(self):
+        original=self.database.read_bytes();self.database.write_bytes(b'synthetic-invalid-sqlite')
+        with self.assertRaises(LocalBrowserError):materialize(self.service,self.record,self.profile)
+        self.assertEqual(self.database.read_bytes(),b'synthetic-invalid-sqlite')
+        self.assertNotIn('_startup_cookies',self.record);self.assertEqual(len(self.controllers),0)
+        self.database.write_bytes(original)
+        def changed(values):
+            state=self.profile/'Local State';state.write_bytes(state.read_bytes()+b' ')
+            return values
+        self.native_transform=changed
+        with self.assertRaises(LocalBrowserError):materialize(self.service,self.record,self.profile)
+        self.assertEqual(self.database.read_bytes(),original)
+        self.assertNotIn('_startup_cookies',self.record)
+        self.assertFalse(list(self.root.glob('cookie-seed-*')))
+
+    def test_merge_trigger_touching_preserved_rows_rolls_back_all_writes(self):
+        self.update("CREATE TRIGGER tamper AFTER INSERT ON cookies WHEN NEW.name='ordinary' BEGIN UPDATE cookies SET is_httponly=0 WHERE name='session'; END")
+        self.record['_source_info']['cookie'].append({**self.snapshots[0],'name':'ordinary','value':'synthetic-extra'})
+        self.rejected()
+        self.assertEqual(len(self.rows()),2);self.assertEqual(len(self.controllers),2)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -2,14 +2,12 @@
 import base64
 import copy
 import hashlib
-import io
 import json
 from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import Mock,patch
 
@@ -248,9 +246,6 @@ class ContinuityTests(unittest.TestCase):
                     return {'targetInfos': [{'targetId': 'synthetic', 'type': 'page', 'url': 'about:blank'}]}
                 if method == 'Target.attachToTarget':
                     return {'sessionId': 'synthetic-session'}
-                if method == 'Page.navigate':
-                    observed['navigation'] = params['url']
-                    return {}
                 if method == 'Runtime.evaluate':
                     if evaluate_error:
                         raise ValueError('private internal error')
@@ -261,15 +256,12 @@ class ContinuityTests(unittest.TestCase):
                         value['values']['context.secure'] = False
                     return {'result': {'value': value}}
                 raise AssertionError(method)
-        class Page:
-            def start(inner):
-                observed['server_started'] = True
-                return 'http://localhost:12345/synthetic-owned-page'
-            def close(inner):
-                observed['server_closed'] = True
+        def navigate(connection, session, url):
+            observed['navigation'] = url
+            observed['navigation_session'] = session
         return (observed, patch.object(fc, 'BrowserController', Controller), patch.object(fc, 'CDP', Connection),
                 patch.object(fc, 'profile_processes', return_value=[object()] if live else []),
-                patch.object(fc, '_LoopbackPage', Page))
+                patch.object(fc, '_navigate_local_page', navigate))
 
     def test_probe_uses_only_blank_empty_profile_and_cleans_owned_directory(self):
         (self.root / 'runtime.bin').write_bytes(b'unchanged synthetic runtime')
@@ -287,9 +279,8 @@ class ContinuityTests(unittest.TestCase):
         self.assertEqual(observed['signature_root'], self.root)
         self.assertEqual(observed['open'], {'offline_test': True, 'extra_urls': ['about:blank'], 'bootstrap_blank': True, 'background_probe': True})
         self.assertTrue(observed['closed'])
-        self.assertEqual(observed['navigation'], 'http://localhost:12345/synthetic-owned-page')
-        self.assertTrue(observed['server_started'])
-        self.assertTrue(observed['server_closed'])
+        self.assertRegex(observed['navigation'], r'^https://probe\.invalid/[0-9a-f]{32}$')
+        self.assertEqual(observed['navigation_session'], 'synthetic-session')
         self.assertFalse(observed['temporary_root'].exists())
         self.assertEqual(self.record, before)
         self.assertEqual((self.root / 'runtime.bin').read_bytes(), b'unchanged synthetic runtime')
@@ -301,7 +292,6 @@ class ContinuityTests(unittest.TestCase):
             with self.assertRaises(LocalBrowserError) as failure:
                 fc.probe_snapshot(self.record, self.root)
         self.assertTrue(observed['closed'])
-        self.assertTrue(observed['server_closed'])
         self.assertFalse(observed['temporary_root'].exists())
         self.assertNotIn('private internal error', str(failure.exception))
 
@@ -345,7 +335,6 @@ class ContinuityTests(unittest.TestCase):
         self.assertIn('后台环境验证', str(failure.exception))
         self.assertNotIn('正常关闭检查窗口', str(failure.exception))
         self.assertTrue(observed['closed'])
-        self.assertTrue(observed['server_closed'])
         self.assertTrue(observed['temporary_root'].exists())
 
     def test_insecure_sample_is_never_accepted_after_local_navigation(self):
@@ -353,144 +342,8 @@ class ContinuityTests(unittest.TestCase):
         with controller, cdp, processes, page:
             with self.assertRaises(LocalBrowserError):
                 fc.probe_snapshot(self.record, self.root)
-        self.assertTrue(observed['server_closed'])
         self.assertTrue(observed['closed'])
 
-    def test_local_navigation_refuses_insecure_or_wrong_document_within_five_seconds(self):
-        for secure, actual_url in [(False, 'http://localhost:12345/token'), (True, 'https://fixture.invalid/')]:
-            clock = [0.0]
-            class Connection:
-                timeout = 5
-                calls = 0
-                def call(inner, method, params=None, session=None):
-                    inner.calls += 1
-                    if method == 'Page.navigate':
-                        return {}
-                    return {'result': {'value': {'ready': 'complete', 'secure': secure, 'url': actual_url}}}
-            connection = Connection()
-            def advance(duration):
-                clock[0] += duration
-            with patch.object(fc.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(fc.time, 'sleep', side_effect=advance):
-                with self.assertRaises(LocalBrowserError):
-                    fc._navigate_local_page(connection, 'session', 'http://localhost:12345/token')
-            self.assertLessEqual(clock[0], 5.001)
-            self.assertLessEqual(connection.calls, 103)
-            self.assertEqual(connection.timeout, 5)
-
-    def test_local_page_server_binds_only_loopback_and_closes_bounded(self):
-        observed = {}
-        class Server:
-            server_port = 12345
-            def __init__(inner, address, handler):
-                observed['address'] = address
-                observed['handler'] = handler
-            def serve_forever(inner, **kwargs):
-                raise AssertionError('Mock must not open a network service')
-            def shutdown(inner):
-                observed['shutdown'] = True
-            def server_close(inner):
-                observed['server_close'] = True
-            def close_workers(inner):
-                observed['workers_closed'] = True
-                return True
-        class Thread:
-            alive = False
-            def __init__(inner, **kwargs):
-                observed['thread'] = kwargs
-            def start(inner):
-                inner.alive = True
-            def is_alive(inner):
-                return inner.alive
-            def join(inner, timeout=None):
-                observed['join_timeout'] = timeout
-                inner.alive = False
-        with patch.object(fc, '_ProbeHTTPServer', Server), patch.object(fc.threading, 'Thread', Thread):
-            page = fc._LoopbackPage()
-            url = page.start()
-            self.assertRegex(url, r'^http://localhost:12345/[0-9a-f]{32}$')
-            page.close()
-            page.close()
-        self.assertEqual(observed['address'], ('127.0.0.1', 0))
-        self.assertIs(observed['handler'], fc._ProbePageHandler)
-        self.assertTrue(observed['thread']['daemon'])
-        self.assertEqual(observed['thread']['kwargs'], {'poll_interval': .05})
-        self.assertTrue(observed['shutdown'])
-        self.assertTrue(observed['server_close'])
-        self.assertTrue(observed['workers_closed'])
-        self.assertEqual(observed['join_timeout'], 1)
-
-    def test_server_thread_start_failure_closes_listener_without_waiting_for_unstarted_thread(self):
-        observed = {}
-        class Server:
-            server_port = 12345
-            def __init__(inner, *args):
-                pass
-            def serve_forever(inner, **kwargs):
-                pass
-            def shutdown(inner):
-                raise AssertionError('An unstarted server must not wait in shutdown')
-            def server_close(inner):
-                observed['closed'] = True
-            def close_workers(inner):
-                observed['workers_closed'] = True
-                return True
-        class Thread:
-            def __init__(inner, **kwargs):
-                pass
-            def start(inner):
-                raise OSError('private start failure')
-        with patch.object(fc, '_ProbeHTTPServer', Server), patch.object(fc.threading, 'Thread', Thread):
-            with self.assertRaises(LocalBrowserError) as failure:
-                fc._LoopbackPage().start()
-        self.assertTrue(observed['closed'])
-        self.assertTrue(observed['workers_closed'])
-        self.assertNotIn('private start failure', str(failure.exception))
-
-    def test_server_close_failure_never_returns_success(self):
-        observed = {}
-        page = fc._LoopbackPage()
-        page.started = True
-        class Server:
-            def shutdown(inner):
-                observed['shutdown'] = True
-            def server_close(inner):
-                observed['closed'] = True
-            def close_workers(inner):
-                observed['workers_closed'] = True
-                return True
-        class Thread:
-            def is_alive(inner):
-                return True
-            def join(inner, timeout=None):
-                observed['timeout'] = timeout
-        page.server, page.thread = Server(), Thread()
-        with self.assertRaises(LocalBrowserError):
-            page.close()
-        self.assertTrue(observed['closed'])
-        self.assertTrue(observed['workers_closed'])
-        self.assertEqual(observed['timeout'], 1)
-
-    def test_worker_cleanup_interrupts_only_owned_sockets_and_joins_bounded(self):
-        observed = []
-        class Connection:
-            def shutdown(inner, mode):
-                observed.append(('shutdown', mode))
-            def close(inner):
-                observed.append(('close',))
-        class Worker:
-            alive = True
-            def join(inner, timeout=None):
-                self.assertGreaterEqual(timeout, 0)
-                self.assertLessEqual(timeout, 1)
-                observed.append(('join',))
-                inner.alive = False
-            def is_alive(inner):
-                return inner.alive
-        server = object.__new__(fc._ProbeHTTPServer)
-        server._workers_lock = fc.threading.Lock()
-        server._workers = {Worker(): Connection()}
-        self.assertTrue(server.close_workers())
-        self.assertEqual([event[0] for event in observed], ['shutdown', 'close', 'join'])
 
     def test_supported_ua_data_cannot_silently_omit_entropy_results(self):
         result = raw_sample()
@@ -498,51 +351,316 @@ class ContinuityTests(unittest.TestCase):
         with self.assertRaises(LocalBrowserError):
             fc._normalize_sample(result)
 
-    def handler_response(self, request):
-        class Request:
+
+    def fetch_connection(self, messages=(), calls=(), *, next_id=0):
+        outer = self
+        class Socket:
             def __init__(inner):
-                inner.output = io.BytesIO()
-            def makefile(inner, *_):
-                return io.BytesIO(request)
-            def sendall(inner, data):
-                inner.output.write(data)
-        connection = Request()
-        server = SimpleNamespace(server_port=12345, probe_path='/owned-token')
-        captured = io.StringIO()
-        with redirect_stdout(captured), redirect_stderr(captured):
-            fc._ProbePageHandler(connection, ('127.0.0.1', 1), server)
-        self.assertEqual(captured.getvalue(), '')
-        return connection.output.getvalue()
+                inner.messages = list(messages)
+                inner.sent = []
+                inner.timeouts = []
+            def settimeout(inner, timeout):
+                inner.timeouts.append(timeout)
+            def send(inner, value):
+                inner.sent.append(json.loads(value))
+            def recv(inner):
+                if not inner.messages:
+                    raise TimeoutError('synthetic-private-transport-detail')
+                value = inner.messages.pop(0)
+                if callable(value):
+                    value = value()
+                if isinstance(value, BaseException):
+                    raise value
+                return value if isinstance(value, (str, bytes)) else json.dumps(value)
+        class Connection:
+            timeout = 12
+            def __init__(inner):
+                inner.next_id = next_id
+                inner.connection = Socket()
+                inner.calls = []
+                inner.replies = list(calls)
+            def call(inner, method, params=None, session=None):
+                inner.calls.append((method, params, session, inner.timeout))
+                expected, result = inner.replies.pop(0)
+                outer.assertEqual(method, expected)
+                if callable(result):
+                    result = result()
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+        return Connection()
 
-    def test_handler_returns_only_small_static_page_without_script_or_redirect(self):
-        response = self.handler_response(b'GET /owned-token HTTP/1.1\r\nHost: localhost:12345\r\n\r\n')
-        headers, body = response.split(b'\r\n\r\n', 1)
-        self.assertIn(b' 200 ', headers)
-        self.assertIn(b"default-src 'none'", headers)
-        self.assertNotIn(b'Location:', headers)
-        self.assertEqual(body, fc._STATIC_PAGE)
-        self.assertLessEqual(len(body), 1024)
-        self.assertNotIn(b'<script', body.lower())
-        self.assertNotIn(b'http:', body.lower())
-        self.assertNotIn(b'https:', body.lower())
+    def fetch_url(self):
+        return 'https://probe.invalid/' + 'a' * 32
 
-    def test_handler_rejects_other_hosts_paths_bodies_and_methods_without_reflection(self):
-        requests = [
-            b'GET /private-request-input HTTP/1.1\r\nHost: localhost:12345\r\n\r\n',
-            b'GET /owned-token HTTP/1.1\r\nHost: private-request-input\r\n\r\n',
-            b'GET http://private-request-input/ HTTP/1.1\r\nHost: localhost:12345\r\n\r\n',
-            b'GET /owned-token HTTP/1.1\r\nHost: localhost:12345\r\nContent-Length: 5\r\n\r\ninput',
-            b'POST /owned-token HTTP/1.1\r\nHost: localhost:12345\r\n\r\n',
-            b'UNKNOWN /private-request-input HTTP/1.1\r\nHost: localhost:12345\r\n\r\n',
-        ]
-        for request in requests:
-            with self.subTest(request=request.split(b'\r\n')[0]):
-                response = self.handler_response(request)
-                headers, body = response.split(b'\r\n\r\n', 1)
-                self.assertNotIn(b' 200 ', headers)
-                self.assertNotIn(b'Location:', headers)
-                self.assertNotIn(b'private-request-input', response)
-                self.assertEqual(body, b'')
+    def paused_request(self, **changes):
+        event = {'method': 'Fetch.requestPaused', 'sessionId': 'owned-session', 'params': {
+            'requestId': 'request-one', 'frameId': 'owned-frame', 'resourceType': 'Document',
+            'request': {'url': self.fetch_url(), 'method': 'GET'}}}
+        for name, value in changes.items():
+            if name == 'sessionId':
+                event[name] = value
+            elif name == 'url':
+                event['params']['request']['url'] = value
+            elif name == 'request_method':
+                event['params']['request']['method'] = value
+            else:
+                event['params'][name] = value
+        return event
+
+    def navigation_reply(self, identifier=1, **changes):
+        result = {'frameId': 'owned-frame', 'loaderId': 'new-loader'}
+        result.update(changes)
+        return {'id': identifier, 'sessionId': 'owned-session', 'result': result}
+
+    def fetch_ack(self, identifier=2, **changes):
+        result = {'id': identifier, 'sessionId': 'owned-session', 'result': {}}
+        result.update(changes)
+        return result
+
+    def fulfill_document(self, connection, deadline=5):
+        return fc._fulfill_probe_document(connection, 'owned-session', 'owned-frame', self.fetch_url(), deadline)
+
+    def navigation_calls(self, *, ready=None, final=None):
+        return [('Page.getFrameTree', {'frameTree': {'frame': {'id': 'owned-frame', 'url': 'about:blank'}}}),
+                ('Fetch.enable', {}), ('Fetch.disable', {}),
+                ('Runtime.evaluate', ready or {'result': {'value': {
+                    'url': self.fetch_url(), 'ready': 'complete', 'secure': True}}}),
+                ('Page.getFrameTree', {'frameTree': {'frame': final or {
+                    'id': 'owned-frame', 'loaderId': 'new-loader', 'url': self.fetch_url()}}})]
+
+    def test_fetch_fixed_document_waits_for_both_ack_orders_without_losing_command_ids(self):
+        for base, ack_first in ((0, True), (31, False)):
+            with self.subTest(ack_first=ack_first):
+                nav, ack = self.navigation_reply(base + 1), self.fetch_ack(base + 2)
+                connection = self.fetch_connection([self.paused_request(), *( [ack, nav] if ack_first else [nav, ack])], next_id=base)
+                with patch.object(fc.time, 'monotonic', return_value=0):
+                    result = self.fulfill_document(connection)
+                self.assertEqual(result['loaderId'], 'new-loader')
+                sent = connection.connection.sent
+                self.assertEqual([item['method'] for item in sent], ['Page.navigate', 'Fetch.fulfillRequest'])
+                self.assertEqual([item['id'] for item in sent], [base + 1, base + 2])
+                self.assertTrue(all(item['sessionId'] == 'owned-session' for item in sent))
+                self.assertEqual(sent[0]['params'], {'url': self.fetch_url()})
+                payload = sent[1]['params']
+                self.assertEqual(payload['requestId'], 'request-one')
+                self.assertEqual(payload['responseCode'], 200)
+                body = base64.b64decode(payload['body'], validate=True)
+                self.assertEqual(body, fc._STATIC_PAGE)
+                self.assertLessEqual(len(body), 1024)
+                self.assertNotIn(b'<script', body.lower())
+                self.assertNotIn(b'http:', body.lower())
+                self.assertNotIn(b'https:', body.lower())
+                headers = {item['name'].lower(): item['value'] for item in payload['responseHeaders']}
+                self.assertEqual(headers['content-type'], 'text/html; charset=utf-8')
+                self.assertEqual(headers['content-length'], str(len(body)))
+                self.assertIn("default-src 'none'", headers['content-security-policy'])
+                self.assertNotIn('location', headers)
+                self.assertEqual(connection.connection.messages, [])
+
+    def test_fetch_unowned_or_non_document_requests_are_failed_without_fulfillment(self):
+        cases = ({'url': 'https://synthetic.invalid/private-input'}, {'frameId': 'other-frame'},
+                 {'request_method': 'POST'}, {'resourceType': 'Script'}, {'request': []},
+                 {'redirectedRequestId': 'previous'}, {'responseStatusCode': 200}, {'responseErrorReason': 'Failed'})
+        for number, changes in enumerate(cases):
+            with self.subTest(case=number):
+                connection = self.fetch_connection([self.paused_request(**changes), self.fetch_ack()])
+                with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+                    self.fulfill_document(connection)
+                self.assertEqual(caught.exception.code, 'continuity_fetch_request')
+                self.assertEqual([item['method'] for item in connection.connection.sent], ['Page.navigate', 'Fetch.failRequest'])
+                self.assertEqual(connection.connection.sent[-1]['params']['errorReason'], 'BlockedByClient')
+                self.assertNotIn('private-input', str(caught.exception))
+
+    def test_fetch_rejects_foreign_session_and_duplicate_request_identifiers(self):
+        for foreign in (True, False):
+            with self.subTest(foreign_session=foreign):
+                messages = ([self.paused_request(sessionId='foreign-session')] if foreign else
+                            [self.paused_request(), self.paused_request()])
+                connection = self.fetch_connection(messages)
+                with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+                    self.fulfill_document(connection)
+                self.assertEqual(caught.exception.code, 'continuity_fetch_session' if foreign else 'continuity_fetch_request_id')
+                self.assertEqual(sum(item['method'] == 'Fetch.fulfillRequest' for item in connection.connection.sent), 0 if foreign else 1)
+                self.assertFalse(any(item['method'] == 'Fetch.continueRequest' for item in connection.connection.sent))
+
+    def test_fetch_internal_restart_is_bounded_and_preserves_the_same_body(self):
+        messages = [self.paused_request(), self.paused_request(requestId='request-two'),
+                    self.fetch_ack(3), self.navigation_reply(), self.fetch_ack(2)]
+        connection = self.fetch_connection(messages)
+        with patch.object(fc.time, 'monotonic', return_value=0):
+            self.fulfill_document(connection)
+        payloads = [item['params']['body'] for item in connection.connection.sent if item['method'] == 'Fetch.fulfillRequest']
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0], payloads[1])
+        connection = self.fetch_connection([self.paused_request(), self.paused_request(requestId='request-two'),
+            self.paused_request(requestId='request-three'), self.fetch_ack(4)])
+        with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+            self.fulfill_document(connection)
+        self.assertEqual(caught.exception.code, 'continuity_fetch_request')
+        self.assertEqual(sum(item['method'] == 'Fetch.fulfillRequest' for item in connection.connection.sent), 2)
+
+    def test_fetch_protocol_errors_and_incomplete_navigation_never_succeed(self):
+        failures = [self.navigation_reply(errorText='net::ERR_PRIVATE_SENTINEL'),
+                    self.navigation_reply(isDownload=True), self.navigation_reply(frameId='other-frame'),
+                    self.navigation_reply(loaderId=''), self.navigation_reply(loaderId=None),
+                    self.fetch_ack(1, error={'message': 'synthetic-private-protocol-detail'}),
+                    self.fetch_ack(2, error={'message': 'synthetic-private-protocol-detail'}),
+                    self.fetch_ack(999), self.fetch_ack(True)]
+        for number, reply in enumerate(failures):
+            with self.subTest(case=number):
+                connection = self.fetch_connection([self.paused_request(), reply])
+                with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+                    self.fulfill_document(connection)
+                self.assertTrue(caught.exception.code.startswith('continuity_fetch_'))
+                self.assertNotIn('PRIVATE_SENTINEL', str(caught.exception))
+                self.assertNotIn('synthetic-private', str(caught.exception))
+        connection = self.fetch_connection([self.paused_request(), self.navigation_reply()])
+        with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+            self.fulfill_document(connection)
+        self.assertEqual(caught.exception.code, 'continuity_fetch_transport')
+        self.assertNotIn('synthetic-private', str(caught.exception))
+        self.assertEqual(len(connection.connection.sent), 2)
+
+    def test_fetch_message_shape_byte_budget_and_event_count_are_bounded(self):
+        messages = [[], 'not-json', 'x' * 1_000_001,
+                    json.dumps({'method': 'Runtime.executionContextsCleared', 'private': '中' * 400_000}, ensure_ascii=False),
+                    {'method': 'Unexpected.private-event', 'sessionId': 'owned-session'}]
+        for number, message in enumerate(messages):
+            with self.subTest(case=number):
+                connection = self.fetch_connection([message])
+                with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+                    self.fulfill_document(connection)
+                self.assertTrue(caught.exception.code.startswith('continuity_fetch_'))
+                self.assertNotIn('private-event', str(caught.exception))
+        connection = self.fetch_connection([{'method': 'Runtime.executionContextsCleared', 'sessionId': 'owned-session'}] * 128)
+        with patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+            self.fulfill_document(connection)
+        self.assertEqual(caught.exception.code, 'continuity_fetch_event_limit')
+        self.assertEqual(len(connection.connection.sent), 1)
+
+    def test_fetch_expired_or_late_ack_does_not_extend_the_shared_deadline(self):
+        connection = self.fetch_connection()
+        with patch.object(fc.time, 'monotonic', return_value=5), self.assertRaises(LocalBrowserError) as caught:
+            self.fulfill_document(connection)
+        self.assertEqual(caught.exception.code, 'continuity_fetch_budget')
+        self.assertEqual(connection.connection.sent, [])
+        clock = [0]
+        def late_ack():
+            clock[0] = 5
+            return self.fetch_ack()
+        connection = self.fetch_connection([self.paused_request(), self.navigation_reply(), late_ack])
+        with patch.object(fc.time, 'monotonic', side_effect=lambda: clock[0]), self.assertRaises(LocalBrowserError) as caught:
+            self.fulfill_document(connection)
+        self.assertEqual(caught.exception.code, 'continuity_fetch_budget')
+        self.assertTrue(all(0 < timeout <= 5 for timeout in connection.connection.timeouts))
+
+    def test_fetch_navigation_binds_initial_frame_and_final_loader_before_sampling(self):
+        connection = self.fetch_connection(calls=self.navigation_calls())
+        with patch.object(fc, '_fulfill_probe_document', return_value=self.navigation_reply()['result']) as fulfill, \
+                patch.object(fc.time, 'monotonic', return_value=0):
+            fc._navigate_local_page(connection, 'owned-session', self.fetch_url())
+        fulfill.assert_called_once_with(connection, 'owned-session', 'owned-frame', self.fetch_url(), 5)
+        self.assertEqual([item[0] for item in connection.calls], ['Page.getFrameTree', 'Fetch.enable', 'Fetch.disable',
+            'Runtime.evaluate', 'Page.getFrameTree'])
+        self.assertEqual(connection.calls[1][1], {'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}]})
+        self.assertTrue(all(item[2] == 'owned-session' and 0 < item[3] <= 5 for item in connection.calls))
+        self.assertEqual(connection.timeout, 12)
+
+    def test_fetch_navigation_rejects_unknown_origin_before_any_command(self):
+        for url in ('http://localhost:12345/owned', 'https://probe.invalid/short',
+                    'https://synthetic.invalid/' + 'a' * 32, self.fetch_url() + '?private-input'):
+            connection = self.fetch_connection()
+            with self.subTest(case=url.startswith('http://')), self.assertRaises(LocalBrowserError) as caught:
+                fc._navigate_local_page(connection, 'owned-session', url)
+            self.assertTrue(caught.exception.code.startswith('continuity_fetch_'))
+            self.assertEqual(connection.calls, [])
+            self.assertEqual(connection.timeout, 12)
+            self.assertNotIn('private-input', str(caught.exception))
+
+    def test_fetch_navigation_rejects_unknown_initial_or_changed_final_document(self):
+        for initial, changes in ((True, {'url': 'https://synthetic.invalid/'}), (True, {'id': ''}),
+                (True, {'unreachableUrl': self.fetch_url()}), (False, {'id': 'other-frame'}),
+                (False, {'loaderId': 'old-loader'}), (False, {'url': 'chrome-error://chromewebdata/'}),
+                (False, {'unreachableUrl': self.fetch_url()})):
+            with self.subTest(initial=initial, field=next(iter(changes))):
+                calls = self.navigation_calls()
+                calls[0 if initial else -1][1]['frameTree']['frame'].update(changes)
+                connection = self.fetch_connection(calls=calls)
+                with patch.object(fc, '_fulfill_probe_document', return_value=self.navigation_reply()['result']) as fulfill, \
+                        patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError):
+                    fc._navigate_local_page(connection, 'owned-session', self.fetch_url())
+                self.assertEqual(fulfill.call_count, 0 if initial else 1)
+                self.assertEqual(connection.timeout, 12)
+
+    def test_fetch_navigation_failure_restores_timeout_without_disabling_fetch(self):
+        failure = fc._blocked(['probe.navigation'])
+        failure.code = 'continuity_fetch_protocol'
+        connection = self.fetch_connection(calls=self.navigation_calls()[:2])
+        with patch.object(fc, '_fulfill_probe_document', side_effect=failure), \
+                patch.object(fc.time, 'monotonic', return_value=0), self.assertRaises(LocalBrowserError) as caught:
+            fc._navigate_local_page(connection, 'owned-session', self.fetch_url())
+        self.assertEqual(caught.exception.code, 'continuity_fetch_protocol')
+        self.assertEqual([item[0] for item in connection.calls], ['Page.getFrameTree', 'Fetch.enable'])
+        self.assertEqual(connection.timeout, 12)
+
+    def test_fetch_navigation_never_accepts_insecure_wrong_or_late_ready_document(self):
+        for case in ('insecure', 'wrong_url', 'exception', 'late'):
+            clock = [0.0]
+            connection = self.fetch_connection(calls=self.navigation_calls())
+            call = connection.call
+            def ready_call(method, params=None, session=None):
+                if method != 'Runtime.evaluate':
+                    return call(method, params, session)
+                if case == 'late':
+                    clock[0] = 5
+                if case == 'exception':
+                    return {'exceptionDetails': {'text': 'synthetic-private-evaluation-detail'}}
+                return {'result': {'value': {'ready': 'complete', 'secure': case != 'insecure',
+                    'url': 'https://synthetic.invalid/' if case == 'wrong_url' else self.fetch_url()}}}
+            connection.call = ready_call
+            def advance(seconds):
+                clock[0] += seconds
+            with self.subTest(case=case), patch.object(fc, '_fulfill_probe_document', return_value=self.navigation_reply()['result']), \
+                    patch.object(fc.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(fc.time, 'sleep', side_effect=advance), \
+                    self.assertRaises(LocalBrowserError) as caught:
+                fc._navigate_local_page(connection, 'owned-session', self.fetch_url())
+            self.assertEqual(connection.timeout, 12)
+            self.assertNotIn('synthetic-private', str(caught.exception))
+            self.assertLessEqual(clock[0], 5.001)
+
+    def test_probe_creates_no_http_socket_or_worker(self):
+        observed, controller, cdp, processes, navigation = self.probe_fakes()
+        with controller, cdp, processes, navigation, \
+                patch('socket.socket', side_effect=AssertionError('HTTP socket forbidden')) as socket, \
+                patch('threading.Thread', side_effect=AssertionError('HTTP worker forbidden')) as thread:
+            fc.probe_snapshot(self.record, self.root)
+        socket.assert_not_called()
+        thread.assert_not_called()
+        self.assertTrue(observed['closed'])
+
+    def test_default_strict_comparison_does_not_relax_nine_device_variance_fields(self):
+        pairs = {'canvas.geometry': ('sha256:' + '1' * 64, 'sha256:' + '2' * 64),
+                 'canvas.text': ('sha256:' + '1' * 64, 'sha256:' + '2' * 64),
+                 'fonts.metrics': ([['Arial', [1] * 5, [1] * 5, [1] * 5]], [['Arial', [2] * 5, [2] * 5, [2] * 5]]),
+                 'devices.kinds': ({'audioinput': 0, 'audiooutput': 0, 'videoinput': 0}, {'audioinput': 1, 'audiooutput': 0, 'videoinput': 0}),
+                 'screen.media': ({'(prefers-reduced-motion: reduce)': False}, {'(prefers-reduced-motion: reduce)': True}),
+                 'webgl1.extensions': ([], ['EXT_synthetic']), 'webgl2.extensions': ([], ['EXT_synthetic']),
+                 'webgl1.pixels': ('sha256:' + '1' * 64, 'sha256:' + '2' * 64),
+                 'webgl2.pixels': ('sha256:' + '1' * 64, 'sha256:' + '2' * 64)}
+        for field, (old, changed) in pairs.items():
+            with self.subTest(field=field):
+                original = sample()
+                original['values'][field] = old
+                self.enroll(original, original)
+                before = copy.deepcopy(self.record)
+                actual = copy.deepcopy(original)
+                actual['values'][field] = changed
+                with patch.object(fc, 'probe_snapshot', return_value=actual), patch.object(fc, 'create_baseline') as enroll:
+                    with self.assertRaises(LocalBrowserError):
+                        fc.verify_continuity(self.record, self.root)
+                enroll.assert_not_called()
+                self.assertEqual(self.record, before)
 
     def test_device_measurement_requests_no_permission_and_keeps_no_identifiers(self):
         for forbidden in ('getUserMedia', 'deviceId', 'groupId', '.label', 'requestAdapter'):

@@ -19,6 +19,7 @@ import fingerprint_continuity
 import local_engine
 from engine_validation import digest_file, verification_scope
 from local_state import LocalBrowserError
+from native_paths import absolute_path
 
 
 def public_der(key):
@@ -268,7 +269,7 @@ class LocalEngineTests(unittest.TestCase):
 
         def staging_is_reparse(path):
             result = original_lstat(path)
-            if path == staging:
+            if absolute_path(path) == staging:
                 return SimpleNamespace(st_mode=result.st_mode, st_file_attributes=0x400)
             return result
 
@@ -533,7 +534,7 @@ class LocalEngineTests(unittest.TestCase):
 
         def source_is_reparse(path):
             result = original_lstat(path)
-            if path == self.source:
+            if absolute_path(path) == self.source:
                 return SimpleNamespace(st_mode=result.st_mode, st_file_attributes=0x400)
             return result
 

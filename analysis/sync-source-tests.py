@@ -131,11 +131,13 @@ def direct_request_tests():
             assert 'fixture' not in str(error) and '无需启动' in str(error)
         else:raise AssertionError('request failure accepted')
     for args in [['--user-data-dir=fixture-profile'],['--user-data-dir','"fixture-profile"']]:
-        process=SimpleNamespace(info={'name':'BitBrowser.exe','cmdline':args,'exe':'BitBrowser.exe'})
-        with patch('browser_processes.psutil.process_iter',return_value=[process]):
+        process=SimpleNamespace(pid=101,info={'pid':101,'name':'BitBrowser.exe','cmdline':args,'exe':'BitBrowser.exe','create_time':100})
+        process.as_dict=lambda attrs:{name:process.info.get(name) for name in attrs}
+        with patch('browser_processes.psutil.process_iter',return_value=[process]),patch('browser_processes.psutil.Process',return_value=process):
             assert profile_processes(Path('fixture-profile'),require_inspectable=True)==[process]
             assert profile_processes(Path('fixture-profile-other'),require_inspectable=True)==[]
-    process=SimpleNamespace(info={'name':'BitBrowser.exe','cmdline':None,'exe':None})
+    process=SimpleNamespace(pid=101,info={'name':'BitBrowser.exe','cmdline':None,'exe':None})
+    process.as_dict=lambda attrs:{name:process.info.get(name) for name in attrs}
     with patch('browser_processes.psutil.process_iter',return_value=[process]):
         assert profile_processes(Path('fixture-profile'))==[]
         try:profile_processes(Path('fixture-profile'),require_inspectable=True)

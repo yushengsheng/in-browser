@@ -57,6 +57,9 @@ def dispatch(service,action,payload=None):
                     errors=[{'id':identity,'error':message} for identity in selected]
                     results=[{'id':identity,'ok':False,'error':message} for identity in selected]
                 result={'completed':completed,'errors':errors,'results':results}
+            elif payload['action'] in ('open','close'):
+                from batch_operations import parallel_batch
+                result=parallel_batch(service,payload['action'],selected)
             else:
                 for identity in selected:
                     reply=service.request(payload['action'],{'id':identity})

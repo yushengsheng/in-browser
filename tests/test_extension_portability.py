@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 
 from extension_portability import verify_secure_extension_paths
+from browser_policy import verify_proxy_extensions
 from local_state import LocalBrowserError
 from window_sync import WindowSynchronizer
 
@@ -79,6 +81,7 @@ class ExtensionPortabilityTests(unittest.TestCase):
         self.verify_copy()
         protected_before = (self.staged / 'Default/Secure Preferences').read_bytes()
         synchronizer = WindowSynchronizer.__new__(WindowSynchronizer)
+        synchronizer._asset_lock = threading.Lock()
         synchronizer.service = SimpleNamespace(root=self.data, _manifest=self.digest,
             _copy_profile=lambda old, new: shutil.copytree(old, new))
         synchronizer._extensions(self.source, self.staged, self.final)
@@ -148,6 +151,61 @@ class ExtensionPortabilityTests(unittest.TestCase):
         self.extension(self.source / 'Default/Extensions' / identity / '1.0_0')
         self.register(identity + '\\1.0_0')
         self.verify_copy()
+
+    def test_proxy_guard_reads_managed_manifest_from_extensions_install_root(self):
+        relative='a'*32+'/1.0_0'
+        manifest=self.source/'Default/Extensions'/relative/'manifest.json'
+        for filename in ('Preferences','Secure Preferences'):
+            for permission in ('permissions','optional_permissions'):
+                with self.subTest(filename=filename,permission=permission):
+                    self.write_json(self.source/'Default/Preferences',{})
+                    self.write_json(self.source/'Default/Secure Preferences',{})
+                    self.write_json(manifest,{'manifest_version':3,'name':'Synthetic','version':'1',permission:['proxy']})
+                    self.register(relative,name=filename)
+                    before=self.digest(self.source)
+                    with self.assertRaises(LocalBrowserError):verify_proxy_extensions(self.source)
+                    self.assertEqual(self.digest(self.source),before)
+
+    def test_proxy_guard_accepts_existing_managed_nonproxy_extension(self):
+        relative='a'*32+'\\1.0_0'
+        self.extension(self.source/'Default/Extensions'/relative)
+        self.register(relative)
+        before=self.digest(self.source)
+        verify_proxy_extensions(self.source)
+        self.assertEqual(self.digest(self.source),before)
+
+    def test_proxy_guard_rejects_escaping_enabled_manifest(self):
+        for relative in ('../outside','C:outside','\\outside'):
+            with self.subTest(relative=relative):
+                self.register(relative)
+                with self.assertRaises(LocalBrowserError):verify_proxy_extensions(self.source)
+        self.register('a'*32+'/missing',state=0)
+        verify_proxy_extensions(self.source)
+
+    def test_proxy_guard_preserves_missing_manifest_behavior_for_components(self):
+        resource=self.base/'engine/resources/pdf'
+        resource.mkdir(parents=True)
+        for location in (1,5):
+            with self.subTest(location=location):
+                entry={'state':1,'location':location,'path':str(resource),
+                       'manifest':{'manifest_version':2,'name':'Synthetic embedded component','version':'1','permissions':[]}}
+                self.write_json(self.source/'Default/Preferences',{'extensions':{'settings':{'a'*32:entry}}})
+                before=self.digest(self.source)
+                verify_proxy_extensions(self.source)
+                self.assertEqual(self.digest(self.source),before)
+
+    def test_component_location_does_not_skip_inline_or_readable_proxy_permissions(self):
+        resource=self.base/'engine/resources/pdf'
+        resource.mkdir(parents=True)
+        for field in ('manifest','active_permissions','granted_permissions'):
+            with self.subTest(field=field):
+                entry={'state':1,'location':5,'path':str(resource),field:{'permissions':['proxy']}}
+                self.write_json(self.source/'Default/Preferences',{'extensions':{'settings':{'a'*32:entry}}})
+                with self.assertRaises(LocalBrowserError):verify_proxy_extensions(self.source)
+        self.write_json(resource/'manifest.json',{'manifest_version':3,'name':'Synthetic','version':'1','permissions':['proxy']})
+        entry={'state':1,'location':5,'path':str(resource)}
+        self.write_json(self.source/'Default/Preferences',{'extensions':{'settings':{'a'*32:entry}}})
+        with self.assertRaises(LocalBrowserError):verify_proxy_extensions(self.source)
 
     def test_escaping_drive_relative_and_rooted_paths_are_rejected(self):
         for raw in ('../external', 'C:external', '\\external', '\\\\synthetic-host\\share'):

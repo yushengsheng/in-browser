@@ -292,6 +292,7 @@ class Configuration:
         from local_signer import LocalSigner
         from bit_source import BitSource
         from portable_paths import encode_archive
+        from native_paths import io_path
         major=str(major)
         if not supports_major(major):raise LocalBrowserError('此内核精确构建尚未验证，未部署或更新本地映射。')
         with _SOURCE_ENGINE_LOCK:
@@ -308,11 +309,11 @@ class Configuration:
             signer=LocalSigner(self.root,load_private=False)
             if signer.key_id!=archive['key_id']:raise LocalBrowserError('本地内核与签名根不匹配，未更新映射。')
             bundled=EngineStore();candidate=bundled.root/major
-            if candidate.exists() or candidate.is_symlink():source=bundled.resolve(major)
+            if io_path(candidate).exists() or io_path(candidate).is_symlink():source=bundled.resolve(major)
             else:
                 reader=copy.copy(self);reader.independent=False
                 source=BitSource(reader)._core_path(major)
-            path=store.ensure(major,source,signer.public_der)
+            path=store.ensure(major,source,signer.public_der,current=True)
             path=store.ensure_current(path,archive['key_id'],major)
             path=store.validate(path,archive['key_id'],major)
             updated=copy.deepcopy(archive)

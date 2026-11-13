@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 from ctypes import wintypes
 import hashlib
 from http.client import HTTPConnection, HTTPException
@@ -23,11 +24,13 @@ from app_paths import APP_ROOT,DATA_ROOT
 from local_state import LocalBrowserError, protect, read_encrypted, write_encrypted
 from browser_processes import (ProfileProcessSnapshot, profile_processes, _switch_values,
                                _is_browser, _profile_browsers)
+from batch_operations import WindowLocks
+from native_paths import absolute_path, io_path, resolved_path
 
 
 def sha256(path: Path):
     digest = hashlib.sha256()
-    with path.open('rb') as handle:
+    with io_path(path).open('rb') as handle:
         while block := handle.read(1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
@@ -36,15 +39,18 @@ def sha256(path: Path):
 def _short_executable_path(executable):
     """Use an existing Windows spelling only; never create a link or copy."""
     try:
+        executable=absolute_path(executable)
         api=ctypes.WinDLL('kernel32',use_last_error=True).GetShortPathNameW
         api.argtypes=[wintypes.LPCWSTR,wintypes.LPWSTR,wintypes.DWORD]
         api.restype=wintypes.DWORD
         output=ctypes.create_unicode_buffer(32768)
-        size=api(str(executable),output,len(output))
+        size=api(str(io_path(executable)),output,len(output))
         if not 0<size<len(output):return None
-        alias=Path(output.value)
-        if (alias.is_absolute() and alias.resolve()==executable.resolve()
-                and alias.samefile(executable) and alias.parent.samefile(executable.parent)):
+        if not Path(output.value).is_absolute():return None
+        alias=absolute_path(output.value)
+        if (alias.is_absolute() and resolved_path(alias)==resolved_path(executable)
+                and io_path(alias).samefile(io_path(executable))
+                and io_path(alias.parent).samefile(io_path(executable.parent))):
             return alias
     except (OSError,ValueError,AttributeError):pass
     return None
@@ -53,12 +59,13 @@ def _short_executable_path(executable):
 def _check_launch_paths(executable):
     executable=Path(executable)
     if os.name!='nt':return executable
+    executable=absolute_path(executable)
     # Chromium also loads nested resources in its utility/network processes.
     # A short executable path alone does not ensure those files are accessible.
     manifest=executable.parent/'manifest.json'
     relative=[]
-    if manifest.is_file():
-        with manifest.open('rb') as stream:raw=stream.read(16*1024*1024+1)
+    if io_path(manifest).is_file():
+        with io_path(manifest).open('rb') as stream:raw=stream.read(16*1024*1024+1)
         if len(raw)>16*1024*1024:raise LocalBrowserError('内核清单不完整，未启动浏览器。')
         try:
             relative=[Path(name) for name in json.loads(raw).get('files',{})]
@@ -68,7 +75,7 @@ def _check_launch_paths(executable):
         # Resolving here would expand an 8.3 spelling back to the long path.
         return all(len(str(path).encode('utf-16-le'))//2<260
                    for path in (candidate,*(candidate.parent/name for name in relative)))
-    canonical=executable.resolve()
+    canonical=resolved_path(executable)
     if fits(canonical):return canonical
     alias=_short_executable_path(canonical)
     if alias is not None and fits(alias):return alias
@@ -162,6 +169,9 @@ class BrowserController:
     def __init__(self, data_root=DATA_ROOT, settings=None):
         self.root = Path(data_root).resolve()
         self.lock = threading.RLock()
+        self._state_lock = self.lock
+        self._save_lock = threading.RLock()
+        self._windows = WindowLocks()
         self.settings = settings if settings is not None else read_encrypted(self.root / 'settings.bin')
         self.profiles = {item['alias']: item for item in self.settings['windows']}
         if any(not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',identity) for identity in self.profiles):
@@ -177,16 +187,39 @@ class BrowserController:
         self._closing_workers = set()
 
     def _save(self):
-        write_encrypted(self.state_path, self.state)
+        # A single serialized snapshot prevents concurrent launches/closures
+        # from replacing each other's records in the shared runtime journal.
+        with self._save_lock:
+            with self._state_lock:
+                snapshot = copy.deepcopy(self.state)
+            for attempt in range(3):
+                try:
+                    write_encrypted(self.state_path, snapshot)
+                    break
+                except OSError as error:
+                    if getattr(error, 'winerror', None) not in (5, 32, 33) or attempt == 2:
+                        raise
+                    # Windows readers/scanners can briefly deny atomic replace.
+                    # Access denied can also mean a reader denied deletion.
+                    # Persistent failures still reach safe launch-failure handling.
+                    time.sleep(.05 * (attempt + 1))
+
+    def set_profile(self, alias, runtime):
+        with self._windows.hold(alias), self._state_lock:
+            self.profiles[alias] = copy.deepcopy(runtime)
 
     def _core_valid(self, item):
-        executable = Path(item['core_path']).resolve()
-        stamp = (executable.stat().st_size, executable.stat().st_mtime_ns, item['core_sha256'])
+        executable = resolved_path(item['core_path'])
+        info = io_path(executable).stat()
+        stamp = (info.st_size, info.st_mtime_ns, item['core_sha256'])
         key = os.path.normcase(str(executable))
-        if self._checked_cores.get(key) != stamp:
+        with self._state_lock:
+            checked = self._checked_cores.get(key)
+        if checked != stamp:
             if sha256(executable) != item['core_sha256']:
                 return False
-            self._checked_cores[key] = stamp
+            with self._state_lock:
+                self._checked_cores[key] = stamp
         return True
 
     def _record_valid(self, alias):
@@ -232,14 +265,16 @@ class BrowserController:
                 record = {'pid': process.pid, 'created': process.create_time(), 'port': ports[0], 'ready': True,
                           'window_observed': bool(_visible_windows(process.pid))}
                 previous = self.state.get(alias)
-                self.state[alias] = record
+                with self._state_lock:
+                    self.state[alias] = record
                 try:
                     self.endpoint(alias, timeout=.4)
                 except (OSError, ValueError, KeyError, LocalBrowserError, psutil.Error):
-                    if previous is None:
-                        self.state.pop(alias, None)
-                    else:
-                        self.state[alias] = previous
+                    with self._state_lock:
+                        if previous is None:
+                            self.state.pop(alias, None)
+                        else:
+                            self.state[alias] = previous
                     continue
                 try:
                     self._save()
@@ -254,9 +289,10 @@ class BrowserController:
         return self._record_valid(alias) or self._adopt(alias)
 
     def _forget(self, alias, *, deferred=None):
-        self.state.pop(alias, None)
-        self._status_cache.pop(alias, None)
-        self._windowless_since.pop(alias, None)
+        with self._state_lock:
+            self.state.pop(alias, None)
+            self._status_cache.pop(alias, None)
+            self._windowless_since.pop(alias, None)
         if deferred is not None:
             deferred.add(alias)
             return
@@ -278,14 +314,15 @@ class BrowserController:
         """Normal shutdown only, after the last real window has disappeared."""
         try:
             time.sleep(1)
-            with self.lock:
+            with self._windows.hold(alias):
                 current = self.state.get(alias)
                 if not current or (current['pid'], current['created']) != identity or not self._record_valid(alias):
                     return
                 if self.profiles[alias].get('enable_background_mode'):
                     return
                 if _visible_windows(current['pid']):
-                    current['window_observed'] = True
+                    with self._state_lock:
+                        current['window_observed'] = True
                     self._windowless_since.pop(alias, None)
                     self._status_cache.pop(alias, None)
                     return
@@ -294,7 +331,7 @@ class BrowserController:
                 self._request_close(alias, timeout=.8)
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
-                with self.lock:
+                with self._windows.hold(alias):
                     current = self.state.get(alias)
                     if not current or (current['pid'], current['created']) != identity:
                         return
@@ -305,16 +342,17 @@ class BrowserController:
         except (OSError, ValueError, KeyError, LocalBrowserError, psutil.Error, websocket.WebSocketException):
             pass  # Never replace a failed graceful close with process termination.
         finally:
-            with self.lock:
+            with self._state_lock:
                 self._closing_workers.discard(alias)
 
     def _queue_windowless_close(self, alias):
-        self._windowless_since.setdefault(alias, time.monotonic())
-        if alias not in self._closing_workers:
-            self._closing_workers.add(alias)
-            record = self.state[alias]
-            threading.Thread(target=self._finish_windowless, args=(alias, (record['pid'], record['created'])),
-                             name='browser-close', daemon=True).start()
+        with self._state_lock:
+            self._windowless_since.setdefault(alias, time.monotonic())
+            if alias not in self._closing_workers:
+                self._closing_workers.add(alias)
+                record = self.state[alias]
+                threading.Thread(target=self._finish_windowless, args=(alias, (record['pid'], record['created'])),
+                                 name='browser-close', daemon=True).start()
 
     def status(self, alias):
         # Lifecycle operations can be waiting for Chromium to flush profile data.
@@ -322,21 +360,28 @@ class BrowserController:
         if not self.lock.acquire(blocking=False):
             cached = self._status_cache.get(alias)
             return cached[1] if cached else '启动未完成'
-        try:
+        self.lock.release()
+        with self._windows.hold(alias, blocking=False) as acquired:
             cached = self._status_cache.get(alias)
+            if not acquired:
+                return cached[1] if cached else '启动未完成'
             if cached and time.monotonic() - cached[0] < .4:
                 return cached[1]
             value = self._status(alias)
-            self._status_cache[alias] = (time.monotonic(), value)
+            with self._state_lock:
+                self._status_cache[alias] = (time.monotonic(), value)
             return value
-        finally:
-            self.lock.release()
 
     def statuses(self, aliases=None):
         """Read many statuses using one process scan, retaining live control checks."""
-        aliases = list(dict.fromkeys(self.profiles if aliases is None else aliases))
         if not self.lock.acquire(blocking=False):
+            aliases = list(dict.fromkeys(tuple(self.profiles) if aliases is None else aliases))
             return {alias: self._status_cache.get(alias, (None, '启动未完成'))[1] for alias in aliases}
+        try:
+            aliases = list(dict.fromkeys(self.profiles if aliases is None else aliases))
+            core_names = {Path(self.profiles[alias]['core_path']).name for alias in aliases}
+        finally:
+            self.lock.release()
         deferred_forgets = set()
         try:
             now = time.monotonic()
@@ -349,12 +394,21 @@ class BrowserController:
                 else:
                     pending.append(alias)
             if pending:
-                snapshot = ProfileProcessSnapshot(browser_names={
-                    Path(self.profiles[alias]['core_path']).name for alias in pending})
+                snapshot = ProfileProcessSnapshot(browser_names=core_names)
                 for alias in pending:
-                    value = self._status(alias, snapshot=snapshot, deferred_forgets=deferred_forgets)
-                    self._status_cache[alias] = (time.monotonic(), value)
-                    result[alias] = value
+                    with self._windows.hold(alias, blocking=False) as acquired:
+                        if not acquired:
+                            result[alias] = self._status_cache.get(alias, (None, '启动未完成'))[1]
+                            continue
+                        # A completed catalog deletion may have removed this
+                        # alias while the process snapshot was being collected.
+                        if alias not in self.profiles:
+                            result[alias] = '未打开'
+                            continue
+                        value = self._status(alias, snapshot=snapshot, deferred_forgets=deferred_forgets)
+                        with self._state_lock:
+                            self._status_cache[alias] = (time.monotonic(), value)
+                        result[alias] = value
             return result
         finally:
             try:
@@ -362,8 +416,6 @@ class BrowserController:
                     self._save()
             except (OSError, LocalBrowserError):
                 pass  # A dead PID is never trusted when the manager next starts.
-            finally:
-                self.lock.release()
 
     def _status(self, alias, *, snapshot=None, deferred_forgets=None):
         if snapshot is None:
@@ -381,11 +433,13 @@ class BrowserController:
             if _visible_windows(self.state[alias]['pid']):
                 self._windowless_since.pop(alias, None)
                 observed = self.state[alias].get('window_observed', False)
-                self.state[alias]['window_observed'] = True
+                with self._state_lock:
+                    self.state[alias]['window_observed'] = True
                 if not self.state[alias].get('ready', True):
                     try:
                         self.endpoint(alias, timeout=.4)
-                        self.state[alias]['ready'] = True
+                        with self._state_lock:
+                            self.state[alias]['ready'] = True
                         self._save()
                     except (OSError, ValueError, KeyError, LocalBrowserError, psutil.Error):
                         return '启动未完成'
@@ -413,7 +467,7 @@ class BrowserController:
         return '已在其他进程打开' if _profile_browsers(Path(self.profiles[alias]['profile_path'])) else '未打开'
 
     def endpoint(self, alias, *, timeout=1):
-        with self.lock:
+        with self._windows.hold(alias):
             if not self._record_valid(alias):
                 raise LocalBrowserError('该窗口尚未打开。')
             record = self.state[alias]
@@ -424,8 +478,10 @@ class BrowserController:
                 raise LocalBrowserError('无法确认窗口的本地控制接口。')
             return _endpoint(record['port'], timeout=timeout)
 
-    def open(self, alias, *, offline_test=False, extra_urls=None, bootstrap_blank=False, before_launch=None, background_probe=False, background_desktop=None):
-        with self.lock:
+    def open(self, alias, *, offline_test=False, extra_urls=None, bootstrap_blank=False, before_launch=None, background_probe=False, background_desktop=None,tab_group_restore=None):
+        with self._windows.hold(alias):
+            if tab_group_restore is not None and (bootstrap_blank or background_probe or extra_urls is not None):
+                raise LocalBrowserError('来源标签组恢复不能与空白检查或另一次标签启动合并，未启动。')
             if background_desktop is not None and not background_probe:
                 raise LocalBrowserError('后台验证桌面只用于独立空白环境检查。')
             if background_probe:
@@ -456,8 +512,9 @@ class BrowserController:
                 if _visible_windows(self.state[alias]['pid']):
                     self.endpoint(alias)
                     self.activate(alias)
-                    self.state[alias]['ready']=True
-                    self.state[alias]['window_observed']=True
+                    with self._state_lock:
+                        self.state[alias]['ready']=True
+                        self.state[alias]['window_observed']=True
                     self._save()
                     return self.state[alias]
                 if current.get('enable_background_mode') and record.get('window_observed') and record.get('ready'):
@@ -475,7 +532,7 @@ class BrowserController:
             executable = Path(item['core_path'])
             config = Path(item['fingerprint_path'])
             for path in (executable, config):
-                if not path.is_file():
+                if not io_path(path).is_file():
                     raise LocalBrowserError('所需内核或指纹文件不存在。')
             if not self._core_valid(item):
                 raise LocalBrowserError('内核文件已变化，请先重新核对兼容性。')
@@ -489,7 +546,11 @@ class BrowserController:
                     f'--file-url-path-alias=/gen={executable.parent / "gen"}', '--no-default-browser-check',
                     '--no-first-run', '--disable-background-mode', '--disable-blink-features=AutomationControlled']
             if item.get('enable_background_mode'):args.remove('--disable-background-mode')
-            if item.get('restore_session',True) and not bootstrap_blank:
+            if tab_group_restore is not None:
+                from source_sessions import verify_tab_group_restore
+                verify_tab_group_restore(profile,item,tab_group_restore,verify_engine=True)
+                args.append('--x-enable-tab-group-store')
+            elif item.get('restore_session',True) and not bootstrap_blank:
                 args.append('--restore-last-session')
             if item.get('window_size_once'):
                 width,height=item['window_size_once']
@@ -509,6 +570,8 @@ class BrowserController:
             from browser_policy import validate_launch_args
             validate_launch_args(item.get('launch_args') or [],proxy_active=bool(item.get('local_proxy_mode')))
             for argument in item.get('launch_args') or []:
+                if tab_group_restore is not None and argument.split('=',1)[0].lower() in ('--restore-last-session','--x-enable-tab-group-store'):
+                    raise LocalBrowserError('自定义启动参数与来源标签组恢复冲突，未启动。')
                 args.append(argument)
             from environment_compatibility import validated_environment_args
             args.extend(validated_environment_args(item))
@@ -532,13 +595,10 @@ class BrowserController:
                 # Unified Chromium uses the same browser/renderer without showing
                 # a platform window. Continuity checks still compare every field.
                 args.append('--headless=new')
-            urls = ['about:blank'] if bootstrap_blank else list(extra_urls) if extra_urls is not None else list(item.get('open_urls_once') or [])
-            if not urls and not offline_test and not bootstrap_blank:
-                sessions = profile / 'Default' / 'Sessions'
-                has_saved_session = sessions.is_dir() and any(
-                    path.name.startswith('Session_') and path.is_file() and path.stat().st_size > 8
-                    for path in sessions.iterdir())
-                if not item.get('restore_session',True) or not has_saved_session:
+            urls = [] if tab_group_restore is not None else ['about:blank'] if bootstrap_blank else list(extra_urls) if extra_urls is not None else list(item.get('open_urls_once') or [])
+            if not urls and not offline_test and not bootstrap_blank and tab_group_restore is None:
+                from session_recovery import has_saved_session
+                if not item.get('restore_session',True) or not has_saved_session(profile):
                     urls = item.get('initial_urls') or []
             args.extend(urls)
             try:
@@ -552,13 +612,23 @@ class BrowserController:
             args[0]=str(launch_executable)
             resource_alias=f'--file-url-path-alias=/gen={executable.parent / "gen"}'
             args[args.index(resource_alias)]=f'--file-url-path-alias=/gen={launch_executable.parent / "gen"}'
-            if not background_probe and not bootstrap_blank:
+            if not background_probe and not bootstrap_blank and tab_group_restore is None:
                 from session_recovery import prepare_session
                 prepare_session(profile,restore=item.get('restore_session',True))
             presentation={'startupinfo':background_desktop.startupinfo()} if background_desktop is not None else {}
             # Older Chromium writes debug.log in its working directory even
             # during startup failures; keep that out of the immutable engine.
             working_directory=profile if str(item.get('core_major'))=='104' else launch_executable.parent
+            from profile_launch_path import choose_profile_launch_path,ProfileLaunchPathError
+            try:
+                launch_profile,_path_check=choose_profile_launch_path(
+                    absolute_path(item['profile_path']),shortener=_short_executable_path)
+            except ProfileLaunchPathError as error:
+                failure=LocalBrowserError(str(error));failure.code=error.code
+                raise failure from None
+            args[args.index('--user-data-dir='+str(profile))]='--user-data-dir='+str(launch_profile)
+            if tab_group_restore is not None:
+                verify_tab_group_restore(profile,item,tab_group_restore)
             process = subprocess.Popen(args, cwd=working_directory, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,**presentation)
@@ -568,7 +638,8 @@ class BrowserController:
                 if self._adopt(alias):
                     return self.state[alias]
                 raise LocalBrowserError('内核未能完成启动，资料已保留。') from None
-            self.state[alias] = {'pid': process.pid, 'created': created, 'port': port, 'ready': False, 'window_observed': False}
+            with self._state_lock:
+                self.state[alias] = {'pid': process.pid, 'created': created, 'port': port, 'ready': False, 'window_observed': False}
             self._windowless_since.pop(alias, None)
             record_failed = False
             try:
@@ -581,7 +652,8 @@ class BrowserController:
                     self.endpoint(alias)
                 except (OSError, LocalBrowserError, psutil.Error, ValueError, KeyError):
                     if process.poll() is not None and not profile_processes(profile):
-                        self.state.pop(alias, None)
+                        with self._state_lock:
+                            self.state.pop(alias, None)
                         try:
                             self._save()
                         except (OSError, LocalBrowserError):
@@ -606,13 +678,18 @@ class BrowserController:
                     if not visible:
                         time.sleep(min(.2, remaining))
                         continue
-                self.state[alias]['ready'] = True
-                self.state[alias]['window_observed'] = visible
+                with self._state_lock:
+                    self.state[alias]['ready'] = True
+                    self.state[alias]['window_observed'] = visible
                 try:
                     self._save()
-                    item['has_launched'] = True
+                    with self._state_lock:
+                        item['has_launched'] = True
                     if self.settings.get('persistent', True):
-                        write_encrypted(self.root / 'settings.bin', self.settings)
+                        with self._save_lock:
+                            with self._state_lock:
+                                settings = copy.deepcopy(self.settings)
+                            write_encrypted(self.root / 'settings.bin', settings)
                 except (OSError, LocalBrowserError):
                     raise LocalBrowserError('窗口已打开，但管理记录未能完整保存；资料和窗口已保留，重开管理器可重新识别。') from None
                 return self.state[alias]
@@ -620,7 +697,7 @@ class BrowserController:
             raise LocalBrowserError('窗口启动超时；请检查已显示的浏览器提示，资料已保留。')
 
     def close(self, alias):
-        with self.lock:
+        with self._windows.hold(alias):
             self._status_cache[alias] = (time.monotonic(), '正在关闭')
             if not self._ensure_record(alias):
                 if _profile_browsers(Path(self.profiles[alias]['profile_path'])):
@@ -643,6 +720,10 @@ class BrowserController:
             raise LocalBrowserError('窗口仍在退出，请等待浏览器完成保存；未强制结束进程。')
 
     def activate(self, alias):
+        with self._windows.hold(alias):
+            return self._activate(alias)
+
+    def _activate(self, alias):
         with CDP(self.endpoint(alias)) as connection:
             targets = connection.call('Target.getTargets').get('targetInfos', [])
             page = next((item for item in targets if item.get('type') == 'page'), None)

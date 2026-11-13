@@ -28,6 +28,7 @@ PREFIX = 'Synthetic manager UI '
 HELPERS = r'''(async() => {
   window.managerQA = {
     checks: {}, stage: 'initializing',
+    cancelActive: Array.from({length:5},(_,index)=>'Synthetic cancel ACTIVE '+(index+1)),
     q: s => document.querySelector(s),
     qa: s => [...document.querySelectorAll(s)],
     pause: ms => new Promise(resolve => setTimeout(resolve, ms)),
@@ -179,7 +180,7 @@ CASES = [
       Q.q('[data-filter="all"]').click();Q.q('#clear-filters').click();
     '''),
     ('sync_preview_and_partial_failure', r'''
-      Q.q('#sync-preview-button').click();await Q.wait(()=>Q.q('#sync-dialog').open&&!state.sync.loading&&state.sync.preview.length===6);
+      Q.q('#sync-preview-button').click();await Q.wait(()=>Q.q('#sync-dialog').open&&!state.sync.loading&&state.sync.preview.length===10);
       Q.check('sync_preview_receipt',typeof state.sync.previewId==='string'&&state.sync.previewId.length>0);
       Q.check('preview_does_not_import',state.profiles.length===22&&!state.sync.jobId);
       const refused=await window.pywebview.api.request('sync_windows',{source_keys:[state.sync.preview[0].source_key]});
@@ -196,14 +197,14 @@ CASES = [
       Q.check('duplicate_source_marked_imported',state.sync.preview.find(p=>p.name==='Synthetic source OK').status==='already_imported');
     '''),
     ('sync_cancel_start', r'''
-      await Q.selectSources(['Synthetic cancel ACTIVE','Synthetic cancel PENDING']);Q.q('#sync-start').click();
-      await Q.wait(()=>state.sync.jobId&&!state.sync.starting);Q.check('cancel_batch_started',state.sync.status.total===2);
+      await Q.selectSources([...Q.cancelActive,'Synthetic cancel PENDING']);Q.q('#sync-start').click();
+      await Q.wait(()=>state.sync.jobId&&!state.sync.starting);Q.check('cancel_batch_started',state.sync.status.total===6);
     '''),
     ('sync_cancel_finish', r'''
       Q.q('#sync-cancel-job').click();await Q.wait(()=>state.sync.cancelRequested&&!state.sync.cancelling);
       await Q.wait(()=>state.sync.status&&state.sync.status.state!=='running',360);
-      Q.check('cancel_stops_remaining',state.sync.status.state==='cancelled'&&state.sync.status.completed===1&&state.sync.status.failed===0);
-      await Q.wait(()=>state.profiles.some(p=>p.name==='Synthetic cancel ACTIVE'));
+      Q.check('cancel_stops_remaining',state.sync.status.state==='cancelled'&&state.sync.status.completed===5&&state.sync.status.failed===0);
+      await Q.wait(()=>Q.cancelActive.every(name=>state.profiles.some(p=>p.name===name)));
       Q.check('current_import_survives_cancel',!state.profiles.some(p=>p.name==='Synthetic cancel PENDING'));
       Q.q('#sync-dismiss').click();await Q.wait(()=>!Q.q('#sync-dialog').open);
     '''),
@@ -217,7 +218,7 @@ CASES = [
       await Q.wait(()=>state.sync.status&&state.sync.status.state!=='running',360);
       Q.check('cancelled_remainder_new_batch_completed',state.sync.status.completed===1&&state.sync.status.failed===0);
       await Q.wait(()=>state.profiles.some(p=>p.name==='Synthetic cancel PENDING'));
-      Q.check('cancelled_current_not_duplicated',state.profiles.filter(p=>p.name==='Synthetic cancel ACTIVE').length===1);
+      Q.check('cancelled_current_not_duplicated',Q.cancelActive.every(name=>state.profiles.filter(p=>p.name===name).length===1));
     '''),
     ('interruption_start', r'''
       Q.q('#sync-start').click();await Q.wait(()=>!state.sync.loading&&!state.sync.jobId);
@@ -322,6 +323,8 @@ def run(args, report):
     sys.path[:0] = [str(package / 'app'), str(package / 'tools')]
     service = window = None
     cancel_entered, cancel_release = threading.Event(), threading.Event()
+    cancel_pending_started = threading.Event()
+    cancel_lock, cancel_started = threading.Lock(), set()
     stopping = threading.Event()
     owned_ids = set()
     opened_instances = {}
@@ -358,15 +361,21 @@ def run(args, report):
         from installation import initialize_installation
         from local_state import LocalBrowserError, read_encrypted
         from manager_service import ManagerService
-        from window_sync import WindowSynchronizer, source_key
+        from window_sync import MAX_SYNC_WORKERS, WindowSynchronizer, source_key
         from window_store import now
         existing = 0
-        for process in psutil.process_iter(['exe', 'cmdline']):
+        known = {'bitbrowser.exe', 'chrome.exe', 'msedgewebview2.exe', 'python.exe', 'pythonw.exe'}
+        for process in psutil.process_iter(['exe', 'cmdline', 'name']):
             try:
                 info = process.info
                 exe = info.get('exe')
-                if exe and Path(exe).resolve().is_relative_to(package):
+                executable = Path(exe) if exe else None
+                absolute_exe = bool(executable and executable.is_absolute() and executable.root)
+                # System virtual-process names are not paths relative to cwd.
+                if absolute_exe and executable.resolve().is_relative_to(package):
                     require(process.pid == os.getpid())
+                if process.pid != os.getpid() and str(info.get('name') or '').casefold() in known:
+                    require(absolute_exe and info.get('cmdline'))
                 for value in info.get('cmdline') or []:
                     if str(value).startswith('--user-data-dir='):
                         require(not Path(value.split('=', 1)[1]).resolve().is_relative_to(package))
@@ -437,8 +446,10 @@ def run(args, report):
             require(not sources.exists())
             sources.mkdir(parents=True)
             items, source_manifests, full_by_id = [], {}, {}
-            names = ['Synthetic source OK', 'Synthetic source FAIL', 'Synthetic cancel ACTIVE', 'Synthetic cancel PENDING',
-                'Synthetic interrupted FIRST', 'Synthetic interrupted SECOND']
+            cancel_active_names = tuple('Synthetic cancel ACTIVE ' + str(index) for index in range(1, 6))
+            require(MAX_SYNC_WORKERS == len(cancel_active_names))
+            names = ['Synthetic source OK', 'Synthetic source FAIL', *cancel_active_names,
+                'Synthetic cancel PENDING', 'Synthetic interrupted FIRST', 'Synthetic interrupted SECOND']
             for index, name in enumerate(names):
                 source_id = uuid.uuid4().hex
                 folder = sources / str(index)
@@ -468,10 +479,17 @@ def run(args, report):
                     index = next(i for i, value in enumerate(items) if value['source_id'] == candidate['source_id'])
                     if index == 1:
                         raise LocalBrowserError('Synthetic source intentionally unavailable.')
-                    if index == 2:
-                        cancel_entered.set()
+                    name = full_by_id[candidate['source_id']]['name']
+                    if name in cancel_active_names:
+                        with cancel_lock:
+                            require(name not in cancel_started)
+                            cancel_started.add(name)
+                            if len(cancel_started) == len(cancel_active_names):
+                                cancel_entered.set()
                         require(cancel_release.wait(90))
-                    if index == 5 and self.interrupt_once:
+                    if name == 'Synthetic cancel PENDING':
+                        cancel_pending_started.set()
+                    if name == 'Synthetic interrupted SECOND' and self.interrupt_once:
                         self.interrupt_once = False
                         raise SystemExit()
                     return {'info': copy.deepcopy(full_by_id[candidate['source_id']]),
@@ -540,7 +558,11 @@ def run(args, report):
                         require(not stopping.is_set())
                         report['stage'] = stage
                         write_report(args.report, report)
-                        if stage == 'sync_cancel_finish': require(cancel_entered.wait(90))
+                        if stage == 'sync_cancel_finish':
+                            require(cancel_entered.wait(90))
+                            with cancel_lock:
+                                report['checks']['five_cancel_imports_started'] = len(cancel_started) == 5
+                            require(report['checks']['five_cancel_imports_started'] and not cancel_pending_started.is_set())
                         if stage == 'sync_resume_after_manager_recreation':
                             sync.worker.join(360)
                             require(not sync.worker.is_alive())
@@ -562,6 +584,9 @@ def run(args, report):
                         if result.get('ok') is not True:
                             report['ui_error_type'] = result.get('error_type', 'Unknown')
                             raise AssertionError('Synthetic UI case failed')
+                        if stage == 'sync_cancel_finish':
+                            report['checks']['cancel_pending_not_started'] = not cancel_pending_started.is_set()
+                            require(report['checks']['cancel_pending_not_started'])
                         report['completed_stages'].append(stage)
                         print(json.dumps({'stage': stage, 'passed': True}), file=sys.__stdout__, flush=True)
                     exported = read_encrypted(export_path, root=data)

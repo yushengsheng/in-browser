@@ -275,10 +275,14 @@ class SyncReliabilityTests(unittest.TestCase):
         from import_progress import emit
         service,sync,items=fixture(self.root,count=2)
         entered=threading.Event();release=threading.Event();original=service._copy_profile
+        copying_lock=threading.Lock();started=[]
         def copying(source,target):
             result=original(source,target)
             emit('copying',done=10,total=10,unit='bytes')
-            entered.set();release.wait(10)
+            with copying_lock:
+                started.append(source)
+                if len(started)==2:entered.set()
+            release.wait(10)
             return result
         service._copy_profile=copying;sync.preview();job=sync.start([i['source_key'] for i in items])
         try:
@@ -291,7 +295,7 @@ class SyncReliabilityTests(unittest.TestCase):
             sync.cancel(job['job_id'])
         finally:release.set()
         status=self.wait(sync)
-        self.assertEqual((status['state'],status['completed']),('cancelled',1))
+        self.assertEqual((status['state'],status['completed']),('cancelled',2))
         self.assertIsNone(status['progress'])
 
     def test_progress_uses_remaining_item_position_after_history_deletion(self):
@@ -361,20 +365,24 @@ class SyncReliabilityTests(unittest.TestCase):
                 path.write_bytes((str(index)+':'+relative).encode()*9)
             (source/'Default/empty').mkdir()
             before[item['source_key']]=manifest(source)
-        copied=service._copy_profile;calls=0
+        copied=service._copy_profile;calls=0;copying_lock=threading.Lock()
         def copying(source,target):
             nonlocal calls
-            result=copied(source,target);calls+=1
-            if calls==37:sync.cancel(sync.active)
+            result=copied(source,target)
+            with copying_lock:
+                calls+=1
+                if calls==37:sync.cancel(sync.active)
             return result
         service._copy_profile=copying
         sync.preview();job=sync.start([i['source_key'] for i in items]);status=self.wait(sync)
-        self.assertEqual((status['state'],status['completed']),('cancelled',37))
+        self.assertEqual(status['state'],'cancelled')
+        self.assertTrue(37<=status['completed']<=41)
+        completed=status['completed']
         # Remaining entries can be selected by the next normal preview; cancelled jobs stay cancelled.
         preview=sync.preview();remaining=[i['source_key'] for i in preview['items'] if i['status']=='ready']
-        self.assertEqual(len(remaining),83)
+        self.assertEqual(len(remaining),120-completed)
         sync.start(remaining,preview_id=preview['preview_id']);status=self.wait(sync)
-        self.assertEqual((status['completed'],status['failed']),(83,0))
+        self.assertEqual((status['completed'],status['failed']),(120-completed,0))
         self.assertEqual(calls,120)
         bindings=service.store.source_bindings();self.assertEqual(len(set(bindings.values())),120)
         for item in items:
@@ -518,14 +526,18 @@ class SyncReliabilityTests(unittest.TestCase):
 
     def test_cancel_is_constant_size_and_stops_only_following_items(self):
         service,sync,items=fixture(self.root,count=3);entered=threading.Event();release=threading.Event()
-        copy_profile=service._copy_profile
-        def copying(*args):entered.set();release.wait(10);return copy_profile(*args)
+        copy_profile=service._copy_profile;copying_lock=threading.Lock();started=[]
+        def copying(*args):
+            with copying_lock:
+                started.append(args[0])
+                if len(started)==3:entered.set()
+            release.wait(10);return copy_profile(*args)
         service._copy_profile=copying;sync.preview();job=sync.start([item['source_key'] for item in items])
         self.assertTrue(entered.wait(5));sync.cancel(job['job_id']);release.set()
         with patch.object(sync,'status',side_effect=AssertionError('Cancellation must not copy history')):
             sync.worker.join(20)
         status=sync.state.status(job['job_id'])
-        self.assertEqual((status['state'],status['completed'],len(service.store.all())),('cancelled',1,1))
+        self.assertEqual((status['state'],status['completed'],len(service.store.all())),('cancelled',3,3))
 
     def test_restart_marks_interrupted_and_can_resume_or_cancel(self):
         service,sync,items=fixture(self.root,count=3)
@@ -612,7 +624,8 @@ class SyncReliabilityTests(unittest.TestCase):
                     original_mkdir=Path.mkdir
                     def mkdir(path,*args,**kwargs):
                         result=original_mkdir(path,*args,**kwargs)
-                        if path==link and not os.path.islink(path) and not getattr(path.lstat(),'st_file_attributes',0)&0x400:
+                        if (path==link and any(intent['state']=='prepared' for intent in sync.state.intents()) and
+                                not os.path.islink(path) and not getattr(path.lstat(),'st_file_attributes',0)&0x400):
                             path.rmdir();self.junction(path,external)
                         return result
                     guard=patch.object(Path,'mkdir',new=mkdir)

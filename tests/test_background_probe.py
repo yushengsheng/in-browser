@@ -60,11 +60,20 @@ class BackgroundProbeTests(unittest.TestCase):
         self.assertIn('--disable-background-networking',args)
         self.assertIn('--proxy-server=http://127.0.0.1:1',args)
         self.assertIn('--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost',args)
-        self.assertIn('--user-data-dir='+str(self.profile.resolve()),args)
+        profiles=[Path(value.split('=',1)[1]) for value in args if value.startswith('--user-data-dir=')]
+        self.assertEqual(len(profiles),1)
+        self.assertEqual(profiles[0].resolve(),self.profile.resolve())
+        self.assertTrue(profiles[0].samefile(self.profile))
         self.assertEqual(args[-1],'about:blank')
         self.assertEqual(signatures,2)
         self.assertTrue(result['ready']);self.assertFalse(result['window_observed'])
         controller.endpoint.assert_called_once()
+
+    def test_unsafe_profile_spelling_refuses_before_process_creation(self):
+        from profile_launch_path import ProfileLaunchPathError
+        with patch('profile_launch_path.choose_profile_launch_path',side_effect=ProfileLaunchPathError('profile_path_too_long')):
+            with self.assertRaises(core.LocalBrowserError) as caught:self.launch(expect_no_launch=True)
+        self.assertEqual(caught.exception.code,'profile_path_too_long')
 
     def test_normal_browser_launch_keeps_existing_visible_mode(self):
         call,_,result,_=self.launch(background=False)
@@ -81,14 +90,15 @@ class BackgroundProbeTests(unittest.TestCase):
 
     def test_path_limit_cause_survives_environment_probe_wrapping(self):
         import fingerprint_continuity as continuity
-        error=core.LocalBrowserError('程序目录层级过深');error.code='engine_path_too_long'
         before=copy.deepcopy(self.runtime)
-        controller=Mock();controller.profiles={'synthetic':{}};controller.open.side_effect=error
-        with patch.object(continuity,'BrowserController',return_value=controller), \
-                patch.object(continuity,'profile_processes',return_value=[]):
-            with self.assertRaises(core.LocalBrowserError) as caught:
-                continuity.probe_snapshot({'_runtime':self.runtime},self.root)
-        self.assertIs(caught.exception,error)
+        for code in ('engine_path_too_long','profile_path_too_long','profile_path_invalid','profile_path_changed','profile_tree_limit'):
+            error=core.LocalBrowserError('受管路径检查未通过');error.code=code
+            controller=Mock();controller.profiles={'synthetic':{}};controller.open.side_effect=error
+            with self.subTest(code=code),patch.object(continuity,'BrowserController',return_value=controller), \
+                    patch.object(continuity,'profile_processes',return_value=[]):
+                with self.assertRaises(core.LocalBrowserError) as caught:
+                    continuity.probe_snapshot({'_runtime':self.runtime},self.root)
+            self.assertIs(caught.exception,error)
         self.assertEqual(self.runtime,before)
 
     def test_normal_launch_waits_for_visible_window_after_control_is_ready(self):

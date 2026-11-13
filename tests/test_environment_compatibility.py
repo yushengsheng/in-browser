@@ -486,8 +486,7 @@ class ExactBuildGateTests(unittest.TestCase):
             record['_runtime'] = runtime
             record['_continuity']['binding'] = continuity.binding_for(record, data)
             before = copy.deepcopy(record)
-            with patch.object(continuity, '_LoopbackPage'), \
-                    patch.object(continuity, 'profile_processes', return_value=[]), \
+            with patch.object(continuity, 'profile_processes', return_value=[]), \
                     patch.object(browser_core, '_profile_browsers', return_value=[]), \
                     patch.object(browser_core.subprocess, 'Popen') as popen, \
                     patch.object(signature_lifetime, 'require_current_signature',

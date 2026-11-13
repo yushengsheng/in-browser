@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import release_archive as archive_tool
 import unpack_core_fixture as fixture_tool
+import overlay_layout
 
 
 def item(value):
@@ -34,8 +35,20 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.files = {name: b'synthetic' for name in archive_tool.REQUIRED
                       if name not in ('release-manifest.json', 'runtime/manifest.sha256.json')}
 
-    def write(self, *, wrapper='', extras=(), changed=None, missing=()):
+    def write(self, *, wrapper='', extras=(), changed=None, missing=(), overlay=False,
+              marker=None, root_launcher=None, payload_launcher=None):
         files = dict(self.files)
+        package_id = '1' * 32
+        if overlay:
+            for name in archive_tool.OVERLAY_REQUIRED:
+                if name not in ('release-manifest.json', 'runtime/manifest.sha256.json'):
+                    files.setdefault(name, b'synthetic')
+            files['VERSION'] = b'0.2.7\n'
+            files[overlay_layout.BOOTSTRAP] = b'# synthetic bootstrap'
+            files[overlay_layout.MARKER] = (json.dumps({'format': 1, 'package_id': package_id}).encode()
+                                          if marker is None else marker)
+            files[overlay_layout.LAUNCHER] = (overlay_layout.launcher_bytes(package_id)
+                                            if payload_launcher is None else payload_launcher)
         runtime = {name[len('runtime/'):]: item(value) for name, value in files.items()
                    if name.startswith('runtime/')}
         files['runtime/manifest.sha256.json'] = json.dumps({'algorithm': 'SHA256', 'files': runtime}).encode()
@@ -45,6 +58,11 @@ class ReleaseArchiveTests(unittest.TestCase):
             files.update(changed)
         for name in missing:
             del files[name]
+        if overlay:
+            prefix = overlay_layout.PACKAGE_DIRECTORY + '/' + package_id + '/'
+            files = {prefix + name: value for name, value in files.items()}
+            files[overlay_layout.LAUNCHER] = (overlay_layout.launcher_bytes(package_id)
+                                            if root_launcher is None else root_launcher)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', UserWarning)
             with zipfile.ZipFile(self.archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
@@ -71,6 +89,102 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.write(wrapper='InBrowser-v0.2.6')
         self.assertTrue(self.extract()['success'])
         self.assertTrue((self.output / 'VERSION').is_file())
+
+    def test_overlay_and_wrapped_overlay_report_verified_program_root(self):
+        for wrapper in ('', 'InBrowser-v0.2.7'):
+            with self.subTest(wrapper=wrapper):
+                self.output = self.root / ('wrapped' if wrapper else 'overlay')
+                self.write(overlay=True, wrapper=wrapper)
+                report = self.extract()
+                program = self.output / overlay_layout.PACKAGE_DIRECTORY / ('1' * 32)
+                self.assertEqual(report['layout'], 'overlay')
+                self.assertEqual(report['package_id'], '1' * 32)
+                self.assertEqual(Path(report['program_root']), program)
+                self.assertTrue((program / 'runtime/python/python.exe').is_file())
+                self.assertEqual((program / overlay_layout.LAUNCHER).read_bytes(),
+                                 (self.output / overlay_layout.LAUNCHER).read_bytes())
+                self.assertFalse((self.output / 'app').exists())
+
+    def test_overlay_rejects_incomplete_mismatched_or_extra_payload(self):
+        prefix = overlay_layout.PACKAGE_DIRECTORY + '/' + '1' * 32 + '/'
+        cases = [
+            {'missing': [overlay_layout.MARKER]},
+            {'missing': [overlay_layout.BOOTSTRAP]},
+            {'missing': ['runtime/python/pythonw.exe']},
+            {'missing': ['app/local_browser.pyw']},
+            {'missing': ['tools/inplace_update.py']},
+            {'changed': {'VERSION': b'0.2.7-preview'}},
+            {'root_launcher': b'old launcher'},
+            {'payload_launcher': b'different launcher'},
+            {'extras': [('app/data/', b'')]},
+            {'extras': [('app/stray.py', b'not allowed')]},
+            {'extras': [(overlay_layout.PACKAGE_DIRECTORY + '/' + '2' * 32 + '/extra', b'other')]},
+            {'extras': [(overlay_layout.PACKAGE_DIRECTORY + '/' + '2' * 32 + '/', b'')]},
+            {'extras': [(prefix + 'app/data/', b'')]},
+            {'extras': [(prefix + 'app/local-engines/', b'')]},
+            {'extras': [(prefix + 'unlisted', b'extra')]},
+        ]
+        for index, options in enumerate(cases):
+            with self.subTest(case=index):
+                self.write(overlay=True, **options)
+                with self.assertRaises(ValueError):
+                    self.extract()
+                self.assertFalse(self.output.exists())
+
+    def test_overlay_marker_has_only_exact_format_and_identity(self):
+        values = [
+            {'format': True, 'package_id': '1' * 32},
+            {'format': 2, 'package_id': '1' * 32},
+            {'format': 1, 'package_id': '2' * 32},
+            {'format': 1, 'package_id': '1' * 32, 'extra': 1},
+            {'format': 1}, [],
+        ]
+        for value in values:
+            with self.subTest(marker=value):
+                self.write(overlay=True, marker=json.dumps(value).encode())
+                with self.assertRaises(ValueError):
+                    self.extract()
+                self.assertFalse(self.output.exists())
+        self.write(overlay=True, marker=b'{"format":1,"format":1,"package_id":"' + b'1' * 32 + b'"}')
+        with self.assertRaises(ValueError):
+            self.extract()
+        self.assertFalse(self.output.exists())
+
+    def test_overlay_metadata_is_in_its_complete_release_manifest(self):
+        self.write(overlay=True)
+        prefix = overlay_layout.PACKAGE_DIRECTORY + '/' + '1' * 32 + '/'
+        with zipfile.ZipFile(self.archive) as zipped:
+            release = json.loads(zipped.read(prefix + 'release-manifest.json'))
+        del release['files'][overlay_layout.MARKER]
+        self.write(overlay=True, changed={'release-manifest.json': json.dumps(release).encode()})
+        with self.assertRaises(ValueError):
+            self.extract()
+        self.assertFalse(self.output.exists())
+
+    def test_payload_cannot_publish_other_packages_or_update_backups(self):
+        for name in ('.program-packages/' + '2' * 32 + '/payload',
+                     '.program-update-backup-synthetic/saved.bin',
+                     '.PROGRAM-UPDATE-BACKUP-other/saved.bin'):
+            with self.subTest(name=name):
+                self.files[name] = b'not public program content'
+                self.write(overlay=True)
+                with self.assertRaises(ValueError):
+                    self.extract()
+                self.assertFalse(self.output.exists())
+                del self.files[name]
+                raw = json.dumps({'algorithm': 'SHA256', 'files': {name: item(b'content')}}).encode()
+                with self.assertRaises(ValueError):
+                    archive_tool.manifest(raw)
+
+    def test_overlay_excludes_retired_manual_launchers(self):
+        for name in (*overlay_layout.RETIRED_LAUNCHERS, *(name.upper() for name in overlay_layout.RETIRED_LAUNCHERS)):
+            with self.subTest(launcher=name):
+                self.files[name] = b'legacy launcher'
+                self.write(overlay=True)
+                with self.assertRaises(ValueError):
+                    self.extract()
+                self.assertFalse(self.output.exists())
+                del self.files[name]
 
     def test_bad_digest_and_existing_destination_are_not_modified(self):
         self.write()
@@ -174,6 +288,41 @@ class ReleaseArchiveTests(unittest.TestCase):
                 archive_tool.verify_source(source_root, self.output)
             extra.unlink()
             target.write_bytes(b'changed')
+            with self.assertRaises(ValueError):
+                archive_tool.verify_source(source_root, self.output)
+
+    def test_overlay_source_comparison_only_allows_exact_generated_launcher_and_marker(self):
+        import build_release
+        source_root = self.root / 'source'
+        source_root.mkdir()
+        sources = []
+        for name, raw in (('VERSION', b'0.2.7\n'), (overlay_layout.LAUNCHER, b'legacy launcher'),
+                          (overlay_layout.BOOTSTRAP, b'# synthetic bootstrap')):
+            path = source_root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            sources.append(path)
+        package_id = '1' * 32
+        program = self.output / overlay_layout.PACKAGE_DIRECTORY / package_id
+        program.mkdir(parents=True)
+        for source in sources:
+            target = program / source.relative_to(source_root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        launcher = overlay_layout.launcher_bytes(package_id)
+        (self.output / overlay_layout.LAUNCHER).write_bytes(launcher)
+        (program / overlay_layout.LAUNCHER).write_bytes(launcher)
+        (program / overlay_layout.MARKER).write_text(json.dumps({'format': 1, 'package_id': package_id}), 'utf-8')
+        with patch.object(build_release, 'source_files', return_value=sources):
+            self.assertEqual(archive_tool.verify_source(source_root, self.output), len(sources))
+            for relative in ('VERSION', overlay_layout.BOOTSTRAP, overlay_layout.LAUNCHER):
+                target = program / relative
+                saved = target.read_bytes()
+                target.write_bytes(b'changed')
+                with self.assertRaises(ValueError):
+                    archive_tool.verify_source(source_root, self.output)
+                target.write_bytes(saved)
+            (program / 'extra.py').write_bytes(b'changed')
             with self.assertRaises(ValueError):
                 archive_tool.verify_source(source_root, self.output)
 

@@ -71,7 +71,9 @@ class LaunchPaths(unittest.TestCase):
     def test_non_bmp_characters_count_as_two_windows_path_units(self):
         with tempfile.TemporaryDirectory() as directory:
             executable=Path(directory)/'BitBrowser.exe'
-            resource='assets/'+'\U0001f642'*100+'/'+'x'*40+'.dat'
+            fixed_units=len(str(executable.parent/'assets/resource.dat').encode('utf-16-le'))//2
+            emoji_count=max(1,(260-fixed_units+1)//2)
+            resource='assets/'+'\U0001f642'*emoji_count+'/resource.dat'
             self.assertLess(len(str(executable.parent/resource)),260)
             self.assertGreaterEqual(len(str(executable.parent/resource).encode('utf-16-le'))//2,260)
             (executable.parent/'manifest.json').write_text(json.dumps({'files':{resource:{}}}),'utf-8')

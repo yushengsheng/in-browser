@@ -216,6 +216,8 @@ const state = {
   settingsSaving: false,
   settingsLoaded: false,
   settingsRevision: 0,
+  settingsDraftRevision: 0,
+  settingsReadRequest: 0,
   windowLayout: { loading: false, loaded: false, saving: false, arranging: false, session: 0, settings: null, returnFocus: null },
   creatingDraft: false,
   creation: { job: null, requestId: null, revision: 0, fingerprintRevision: 0, timer: null, reading: false, opening: false },
@@ -225,6 +227,8 @@ const state = {
   statusRefreshing: false,
   statusTimer: null,
   statusRevision: 0,
+  profileRenderPending: false,
+  profileFocusTimer: null,
   proxyRevision: 0,
   proxyParseRequest: 0,
   proxyParsePromise: null,
@@ -725,6 +729,7 @@ async function loadSyncPreview() {
   sync.page = 1;
   sync.search = "";
   $("#sync-search").value = "";
+  $("#sync-search").rows = 1;
   showSyncError();
   renderSync();
   try {
@@ -787,9 +792,20 @@ function renderSyncPreview() {
   const guidance = sourceGuidance();
   const ready = sync.preview.filter(syncCanImport);
   const imported = sync.preview.filter((item) => item.status === "already_imported").length;
-  const query = sync.search.toLocaleLowerCase();
-  const items = sync.preview.map((item, index) => ({ item, index })).filter(({ item }) =>
-    !query || `${item.name || ""} ${item.remark || ""} ${item.seq ?? ""}`.toLocaleLowerCase().includes(query));
+  const terms = profileSearchTerms(sync.search);
+  const tooManyTerms = terms.length > MAX_SEARCH_TERMS;
+  const searchFeedback = $("#sync-search-feedback");
+  searchFeedback.hidden = terms.length < 2;
+  searchFeedback.classList.toggle("error", tooManyTerms);
+  searchFeedback.textContent = tooManyTerms
+    ? `最多支持 ${MAX_SEARCH_TERMS} 项，当前 ${terms.length} 项，请删减后搜索`
+    : `批量搜索 ${terms.length} 项，匹配任意一项`;
+  $("#sync-search").setAttribute("aria-invalid", String(tooManyTerms));
+  const items = sync.preview.map((item, index) => ({ item, index })).filter(({ item }) => {
+    if (tooManyTerms) return false;
+    const text = `${item.name || ""} ${item.remark || ""} ${item.seq ?? ""}`.toLowerCase();
+    return !terms.length || terms.some((term) => text.includes(term));
+  });
   const pages = Math.max(1, Math.ceil(items.length / 50));
   sync.page = Math.min(Math.max(1, sync.page), pages);
   const offset = (sync.page - 1) * 50;
@@ -806,7 +822,7 @@ function renderSyncPreview() {
     return `<tr><td class="select-cell"><input type="checkbox" data-sync-index="${index}" aria-label="选择 ${esc(name)}" ${enabled ? "" : "disabled"} ${sync.selected.has(item.source_key) ? "checked" : ""}></td><td><strong class="sync-source-name" title="${esc(name)}">${esc(name)}</strong><small>来源序号 ${esc(item.seq ?? "—")}${item.created_at ? ` · ${esc(displayDate(item.created_at))}` : ""}</small><small class="sync-source-remark" title="${esc(remark || "无备注")}">备注：${esc(remark || "—")}</small>${item.metadata_note ? `<small>${esc(item.metadata_note)}</small>` : ""}</td><td>${esc(item.os || "—")}<small>内核 ${esc(item.core_version || "—")}</small></td><td><span class="sync-status ${syncCanImport(item) ? "ready" : item.status === "already_imported" ? "muted" : "blocked"}">${status}</span>${reason ? `<small>${esc(reason)}</small>` : ""}</td></tr>`;
   }).join("");
   $("#sync-empty").hidden = sync.loading || rows.length > 0;
-  $("#sync-empty").textContent = sync.search ? "没有符合条件的本机窗口。" : guidance.previewEmpty;
+  $("#sync-empty").textContent = tooManyTerms ? `最多支持 ${MAX_SEARCH_TERMS} 项，请删减后搜索` : sync.search ? "没有符合条件的本机窗口。" : guidance.previewEmpty;
   const selectAll = $("#sync-select-all");
   selectAll.setAttribute("aria-label", `选择本批最多 ${SYNC_BATCH_LIMIT} 个可导入窗口`);
   selectAll.checked = ready.length > 0 && (ready.every((item) => sync.selected.has(item.source_key)) || (ready.length > SYNC_BATCH_LIMIT && sync.selected.size === SYNC_BATCH_LIMIT));
@@ -851,7 +867,8 @@ function renderSyncCurrentProgress(status) {
   $("#sync-stage-timings").hidden = true;
   if (!progress) return;
   const index = syncCount(progress.index), total = syncCount(status.total);
-  $("#sync-current-label").textContent = `${state.sync.pollPaused ? "上次读取 · " : ""}当前窗口${index ? ` ${index}${total ? ` / ${total}` : ""}` : ""}`;
+  const active = Array.isArray(status.active_items) ? status.active_items.length : 0;
+  $("#sync-current-label").textContent = `${state.sync.pollPaused ? "上次读取 · " : ""}当前窗口${index ? ` ${index}${total ? ` / ${total}` : ""}` : ""}${active > 1 ? ` · 同时处理 ${active} 个窗口` : ""}`;
   const name = state.sync.names.get(progress.source_key) || (typeof progress.name === "string" && progress.name ? progress.name : "未命名窗口");
   $("#sync-current-name").textContent = name;
   $("#sync-current-name").title = name;
@@ -896,7 +913,7 @@ function renderSyncProgress() {
   $("#sync-progress").value = done;
   $("#sync-progress-summary").textContent = syncResultSummary(status);
   renderSyncCurrentProgress(status);
-  const note = interrupted ? "上次运行已中断，当前没有继续复制。可继续检查并同步剩余窗口，或取消剩余同步；已保存的副本会保留。" : running ? sync.cancelRequested ? "当前窗口会继续处理，只取消尚未开始的窗口。可关闭此面板，后台将继续更新结果。" : "可关闭此面板继续管理本地窗口；同步将在后台继续。" : "已导入的窗口是独立本地副本，来源后续改动或删除不会覆盖、删除它。";
+  const note = interrupted ? "上次运行已中断，当前没有继续复制。可继续检查并同步剩余窗口，或取消剩余同步；已保存的副本会保留。" : running ? sync.cancelRequested ? "已开始的窗口会继续处理，只取消尚未开始的窗口。可关闭此面板，后台将继续更新结果。" : "可关闭此面板继续管理本地窗口；同步将在后台继续。" : "已导入的窗口是独立本地副本，来源后续改动或删除不会覆盖、删除它。";
   $("#sync-background-note").textContent = note + (sync.deferred ? ` 本批未选 ${sync.deferred} 个来源，本批结束后可重新预览，留待下批同步。` : "");
   const items = Array.isArray(status.items) ? status.items : [];
   $("#sync-result-list").innerHTML = items.slice(-100).map((item) =>
@@ -1063,11 +1080,12 @@ async function bootstrap({ quiet = false } = {}) {
   const syncRevision = state.sync.requestRevision;
   const creationRevision = state.creation.revision;
   const settingsRevision = state.settingsRevision;
+  const settingsDraftRevision = state.settingsDraftRevision;
   $("#refresh-button").disabled = true;
   try {
     const data = await api("bootstrap", { include_archived: true });
     const profilesCurrent = revision === state.statusRevision;
-    acceptBootstrap(data, { preserveDrafts: quiet || !profilesCurrent, syncRevision, creationRevision, profilesCurrent,
+    acceptBootstrap(data, { preserveDrafts: quiet || !profilesCurrent || settingsDraftRevision !== state.settingsDraftRevision, syncRevision, creationRevision, profilesCurrent,
       settingsCurrent: settingsRevision === state.settingsRevision && !state.settingsSaving });
     setConnection(true);
     if (profilesCurrent) showServiceError("");
@@ -1190,9 +1208,12 @@ function updateRunningIndicators() {
   const active = state.profiles.filter((profile) => !isArchived(profile));
   $("#count-running").textContent = active.filter(isRunning).length;
   const focused = document.activeElement;
-  if (state.filter === "running" && !$("#profile-rows").contains(focused)) {
-    renderProfiles();
-    return;
+  if (state.filter === "running") {
+    if (!$("#profile-rows").contains(focused)) {
+      renderProfiles();
+      return;
+    }
+    state.profileRenderPending = true;
   }
   $$("#profile-rows > tr").forEach((row) => {
     const profile = profileById(row.dataset.id);
@@ -1328,6 +1349,9 @@ function filteredProfiles() {
     });
 }
 function renderProfiles() {
+  clearTimeout(state.profileFocusTimer);
+  state.profileFocusTimer = null;
+  state.profileRenderPending = false;
   const terms = profileSearchTerms(state.search);
   const tooManyTerms = terms.length > MAX_SEARCH_TERMS;
   const searchFeedback = $("#search-feedback");
@@ -1445,6 +1469,7 @@ async function navigate(panel) {
     ))) return;
     state.settingsDraft = copy(state.settings);
     state.settingsDirty = false;
+    state.settingsDraftRevision++;
   }
   state.panel = panel;
   $$(".panel").forEach((el) =>
@@ -1486,9 +1511,14 @@ function renderGroups() {
         .join("")
     : '<div class="plain-empty">暂无分组，点击“新增分组”开始整理窗口。</div>';
 }
+function normalizeGroupName(value) {
+  // Match Python str.strip() and its Unicode code-point length limit.
+  const strip = (name) => name.replace(/^[\p{White_Space}\u001c-\u001f]+|[\p{White_Space}\u001c-\u001f]+$/gu, "");
+  return strip(Array.from(strip(String(value))).slice(0, 100).join(""));
+}
 async function saveGroups() {
   if (state.groupsSaving) return;
-  const groups = state.groupDraft.map((group) => group.trim());
+  const groups = state.groupDraft.map(normalizeGroupName);
   if (groups.some((group) => !group))
     return toast("分组名称不能为空。", "error");
   if (new Set(groups).size !== groups.length)
@@ -1501,7 +1531,7 @@ async function saveGroups() {
   try {
     const renames = Object.fromEntries(
       state.groupSources
-        .map((old, index) => [old, state.groupDraft[index]?.trim()])
+        .map((old, index) => [old, groups[index]])
         .filter(([old, value]) => old && value && old !== value),
     );
     const result = await api("groups_save", { groups, renames });
@@ -1513,6 +1543,8 @@ async function saveGroups() {
       profile.group = existingGroups.has(next) ? next : "";
     }
     state.groups = [...savedGroups];
+    const filteredGroup = Object.hasOwn(renames, state.group) ? renames[state.group] : state.group;
+    state.group = existingGroups.has(filteredGroup) ? filteredGroup : "";
     state.groupDraft = [...savedGroups];
     state.groupOriginal = [...savedGroups];
     state.groupSources = [...savedGroups];
@@ -1566,16 +1598,22 @@ function renderRecycle() {
 
 async function loadSettings() {
   const revision = state.settingsRevision;
+  const draftRevision = state.settingsDraftRevision;
+  const request = ++state.settingsReadRequest;
+  const current = () => request === state.settingsReadRequest && revision === state.settingsRevision && !state.settingsSaving;
+  const edited = () => draftRevision !== state.settingsDraftRevision || state.settingsDirty;
   try {
     const data = await api("settings_get");
-    if (revision !== state.settingsRevision || state.settingsSaving) return;
+    if (!current()) return;
     state.settings = copy(data?.settings || data || {});
-    state.settingsDraft = copy(state.settings);
     state.settingsLoaded = true;
+    if (edited()) return;
+    state.settingsDraft = copy(state.settings);
     state.settingsDirty = false;
     renderSettings();
   } catch (error) {
-    if (revision !== state.settingsRevision || state.settingsSaving) return;
+    if (!current()) return;
+    if (edited()) { toast(error.message, "error"); return; }
     $("#settings-form").innerHTML =
       `<div class="inline-error">${esc(error.message)}</div>`;
     $("#save-settings").disabled = true;
@@ -1624,6 +1662,7 @@ async function chooseSetting(key, button) {
     if (path && state.settingsDraft === draft && state.panel === "settings") {
       draft[key] = path;
       state.settingsDirty = true;
+      state.settingsDraftRevision++;
       $("#settings-" + key).value = path;
     }
   } catch (error) {
@@ -2838,6 +2877,7 @@ function bindEvents() {
   $("#sync-cancel-job").onclick = cancelSyncJob;
   $("#sync-retry-status").onclick = resumeSyncStatus;
   $("#sync-search").oninput = (event) => {
+    event.target.rows = Math.min(4, Math.max(1, event.target.value.split(/\r\n|\r|\n/).length));
     state.sync.search = event.target.value.trim();
     state.sync.page = 1;
     renderSyncPreview();
@@ -2968,6 +3008,14 @@ function bindEvents() {
       ? state.selected.add(event.target.dataset.id)
       : state.selected.delete(event.target.dataset.id);
     renderProfiles();
+  });
+  $("#profile-rows").addEventListener("focusout", () => {
+    if (!state.profileRenderPending) return;
+    clearTimeout(state.profileFocusTimer);
+    state.profileFocusTimer = setTimeout(() => {
+      state.profileFocusTimer = null;
+      if (state.profileRenderPending && !$("#profile-rows").contains(document.activeElement)) renderProfiles();
+    }, 0);
   });
   $("#profile-rows").addEventListener("click", (event) => {
     const button = event.target.closest("[data-action]");
@@ -3133,6 +3181,7 @@ function bindEvents() {
           ? event.target.checked
           : event.target.value;
       state.settingsDirty = true;
+      state.settingsDraftRevision++;
     }
   });
   $("#settings-form").addEventListener("change", (event) => {
@@ -3142,6 +3191,7 @@ function bindEvents() {
           ? event.target.checked
           : event.target.value;
       state.settingsDirty = true;
+      state.settingsDraftRevision++;
     }
   });
   $("#settings-form").onclick = (event) => {

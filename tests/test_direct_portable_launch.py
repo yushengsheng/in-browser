@@ -1,15 +1,17 @@
 """Synthetic direct-launch checks. No real data or browser is opened."""
 import ast
 import argparse
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import ctypes
 from ctypes import wintypes
 import io
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,25 +23,106 @@ from unittest.mock import MagicMock, patch
 import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
+# A staged payload already adds one package layer. Keep launcher fixtures beside
+# that payload so this routing test does not accidentally become a MAX_PATH test.
+TEST_ROOT = (ROOT.parent.parent if ROOT.parent.name == '.program-packages'
+             and re.fullmatch('[0-9a-f]{32}', ROOT.name) else ROOT)
+TEST_RUNS = TEST_ROOT / 'analysis/test-runs'
+SYNTHETIC_PACKAGE_ID = '0123456789abcdef0123456789abcdef'
+
+
+@contextmanager
+def launcher_fixture():
+    TEST_RUNS.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix='direct-portable-', dir=TEST_RUNS)
+    base = Path(temporary.name)
+    marker = base / '.fixture-owner.json'
+    owner = {'pid': os.getpid(), 'purpose': 'synthetic-direct-launch', 'scope': str(base)}
+    marker.write_text(json.dumps(owner), 'utf-8')
+    try:
+        yield base
+    finally:
+        safe = base.resolve().parent == TEST_RUNS.resolve()
+        safe = safe and json.loads(marker.read_text('utf-8')) == owner
+        for directory, folders, files in os.walk(base, followlinks=False):
+            for name in (*folders, *files):
+                info = (Path(directory) / name).lstat()
+                safe = safe and not stat.S_ISLNK(info.st_mode)
+                safe = safe and not getattr(info, 'st_file_attributes', 0) & 0x400
+        for process in psutil.process_iter(['exe']):
+            if process.info['exe']:
+                safe = safe and not Path(process.info['exe']).resolve().is_relative_to(base)
+        if not safe:
+            temporary._finalizer.detach()
+            raise AssertionError('synthetic_launcher_cleanup_refused')
+        temporary.cleanup()
+        if base.exists():
+            raise AssertionError('synthetic_launcher_cleanup_incomplete')
 
 
 class DirectLaunch(unittest.TestCase):
-    def launcher(self, name, *, delayed=False, missing=None):
-        with tempfile.TemporaryDirectory(prefix='direct-portable-synthetic-') as directory:
-            base = Path(directory)
+    @classmethod
+    def setUpClass(cls):
+        with launcher_fixture() as base:
+            probe = base
+            (base / 'nested').mkdir()
+            (base / 'nested/probe.txt').write_text('cleanup probe', 'utf-8')
+        if probe.exists():
+            raise AssertionError('synthetic_launcher_preflight_failed')
+
+    @staticmethod
+    def launcher_bytes(generated=False):
+        if generated:
+            layout = runpy.run_path(str(ROOT / 'tools/overlay_layout.py'))
+            return layout['launcher_bytes'](SYNTHETIC_PACKAGE_ID), SYNTHETIC_PACKAGE_ID
+        raw = (ROOT / '启动本地浏览器.cmd').read_bytes()
+        matched = re.search(rb'set "IB_PACKAGE=%~dp0\.program-packages\\([0-9a-f]{32})"', raw)
+        if b'IB_PACKAGE' in raw and matched is None:
+            raise AssertionError('synthetic_launcher_layout_unknown')
+        return raw, matched.group(1).decode('ascii') if matched else None
+
+    @staticmethod
+    def copy_interpreter(runtime):
+        runtime.mkdir(parents=True)
+        # Only the embeddable interpreter; no site packages or private data.
+        for source in (ROOT / 'runtime/python').iterdir():
+            if source.is_file():
+                shutil.copy2(source, runtime / source.name)
+
+    def wait_for_fixture_processes(self, owned, started):
+        for process in psutil.process_iter(['exe', 'cmdline', 'create_time']):
+            info = process.info
+            if not info['exe'] or Path(info['exe']).resolve() not in owned:
+                continue
+            executable = Path(info['exe']).resolve()
+            expected_entry = owned[executable]
+            self.assertGreaterEqual(info['create_time'], started - 2)
+            self.assertIn(str(expected_entry), info['cmdline'] or [])
+            try:
+                process.wait(timeout=10)
+            except psutil.TimeoutExpired:
+                # Only this fixture's exact interpreter and entry may be stopped.
+                self.assertEqual(Path(process.exe()).resolve(), executable)
+                self.assertEqual(process.create_time(), info['create_time'])
+                self.assertIn(str(expected_entry), process.cmdline())
+                process.terminate()
+                process.wait(timeout=10)
+                self.fail('synthetic_interpreter_did_not_exit')
+            except psutil.NoSuchProcess:
+                pass
+
+    def launcher(self, name, *, delayed=False, missing=None, generated=False):
+        raw, package_id = self.launcher_bytes(generated)
+        with launcher_fixture() as base:
             root = base / name
             app = root / 'app'
             runtime = root / 'runtime/python'
             app.mkdir(parents=True)
-            runtime.mkdir(parents=True)
+            self.copy_interpreter(runtime)
             (root / 'runtime/webview2').mkdir()
             (root / 'runtime/webview2/msedgewebview2.exe').write_bytes(b'synthetic, never executed')
-            # Only copy the embeddable interpreter itself, never site packages or app data.
-            for source in (ROOT / 'runtime/python').iterdir():
-                if source.is_file():
-                    shutil.copy2(source, runtime / source.name)
             launcher = root / 'start.cmd'
-            launcher.write_bytes((ROOT / '启动本地浏览器.cmd').read_bytes())
+            launcher.write_bytes(raw)
             (app / 'local_browser.pyw').write_text(
                 "import json,os,sys\nfrom pathlib import Path\n"
                 "here=Path(__file__).resolve().parent\n"
@@ -52,42 +135,66 @@ class DirectLaunch(unittest.TestCase):
                 "pending=here/'fixture-result.tmp'\n"
                 "pending.write_text(json.dumps(result),'utf-8')\n"
                 "pending.replace(here/'fixture-result.json')\n", 'utf-8')
+            owned = {(runtime / 'pythonw.exe').resolve(): app / 'local_browser.pyw'}
+            startup_root = root
+            if package_id:
+                startup_root = root / '.program-packages' / package_id
+                self.copy_interpreter(startup_root / 'runtime/python')
+                tools = startup_root / 'tools'
+                tools.mkdir()
+                # The stub tests CMD routing only. Preparation transactions have
+                # their own fixtures; the final Popen is the production launch().
+                shutil.copy2(ROOT / 'tools/portable_bootstrap.py', tools / 'fixture_production_bootstrap.py')
+                (startup_root / 'release-manifest.json').write_text('{"synthetic":true}', 'utf-8')
+                (startup_root / 'overlay-package.json').write_text(json.dumps(
+                    {'format': 1, 'package_id': package_id}), 'utf-8')
+                (tools / 'portable_bootstrap.py').write_text(
+                    "import json,os,runpy,sys\nfrom pathlib import Path\n"
+                    "payload=Path(__file__).resolve().parents[1]\n"
+                    "assert len(sys.argv)==3 and sys.argv[1]=='--target'\n"
+                    "target=Path(sys.argv[2]).resolve()\n"
+                    "assert target==payload.parent.parent\n"
+                    "result={'target_ok':target==payload.parent.parent,"
+                    "'exe_ok':Path(sys.executable).resolve()==payload/'runtime/python/pythonw.exe',"
+                    "'isolated':bool(sys.flags.isolated),"
+                    "'ignore_environment':bool(sys.flags.ignore_environment),"
+                    "'outside_path_absent':all('synthetic_external' not in x for x in sys.path)}\n"
+                    "(target/'app/bootstrap-result.json').write_text(json.dumps(result),'utf-8')\n"
+                    "module=runpy.run_path(str(payload/'tools/fixture_production_bootstrap.py'),"
+                    "run_name='synthetic_bootstrap_import')\n"
+                    "module['launch'](target)\n", 'utf-8')
+                owned[(startup_root / 'runtime/python/pythonw.exe').resolve()] = tools / 'portable_bootstrap.py'
             if missing:
-                (root / missing).unlink()
+                (startup_root / missing).unlink()
             env = os.environ.copy()
             env.update(PYTHONHOME=str(base / 'synthetic_external_home'),
-                       PYTHONPATH=str(base / 'synthetic_external_path'))
+                       PYTHONPATH=str(base / 'synthetic_external_path'), TEMP=str(base), TMP=str(base))
             command = '"{}" /d /v:{} /s /c ""{}""'.format(
                 os.environ.get('COMSPEC', 'cmd.exe'), 'on' if delayed else 'off', launcher)
             started = time.time()
-            result = subprocess.run(command, cwd=base, env=env, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-            if missing:
-                self.assertEqual(result.returncode, 1)
-                self.assertFalse((app / 'fixture-result.json').exists())
-                return
-            self.assertEqual(result.returncode, 0)
-            marker = app / 'fixture-result.json'
-            deadline = time.monotonic() + 5
-            while not marker.is_file() and time.monotonic() < deadline:
-                time.sleep(.05)
-            self.assertTrue(marker.is_file(), 'synthetic_launcher_did_not_reach_bundled_python')
-            observed = json.loads(marker.read_text('utf-8'))
             try:
-                process = psutil.Process(observed.pop('pid'))
-                self.assertGreaterEqual(process.create_time(), started-2)
-                self.assertEqual(Path(process.exe()).resolve(), runtime / 'pythonw.exe')
-                self.assertIn(str(app / 'local_browser.pyw'), process.cmdline())
-                # The result file proves execution, not interpreter exit. Wait before removal.
-                try:
-                    process.wait(timeout=10)
-                except psutil.TimeoutExpired:
-                    process.terminate()
-                    process.wait(timeout=10)
-                    self.fail('synthetic_interpreter_did_not_exit')
-            except psutil.NoSuchProcess:
-                pass
-            self.assertTrue(all(observed.values()))
+                result = subprocess.run(command, cwd=base, env=env, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                if missing:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertFalse((app / 'fixture-result.json').exists())
+                    self.assertFalse((app / 'bootstrap-result.json').exists())
+                    return
+                self.assertEqual(result.returncode, 0)
+                marker = app / 'fixture-result.json'
+                deadline = time.monotonic() + 5
+                while not marker.is_file() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertTrue(marker.is_file(), 'synthetic_launcher_did_not_reach_bundled_python')
+                observed = json.loads(marker.read_text('utf-8'))
+                self.assertIsInstance(observed.pop('pid'), int)
+                self.assertTrue(all(observed.values()))
+                if package_id:
+                    self.assertTrue(all(json.loads((app / 'bootstrap-result.json').read_text('utf-8')).values()))
+                    self.assertFalse((startup_root / 'app').exists())
+            finally:
+                self.wait_for_fixture_processes(owned, started)
 
     def test_spaces_chinese_arbitrary_cwd_and_python_env(self):
         self.launcher('移动盘 便携目录')
@@ -96,10 +203,25 @@ class DirectLaunch(unittest.TestCase):
         self.launcher('移动盘 !合成! 便携目录', delayed=True)
 
     def test_launcher_refuses_incomplete_bundle(self):
-        for missing in ('runtime/python/pythonw.exe', 'runtime/webview2/msedgewebview2.exe',
-                        'app/local_browser.pyw'):
+        _, package_id = self.launcher_bytes()
+        components = ('runtime/python/pythonw.exe', 'tools/portable_bootstrap.py',
+                      'release-manifest.json', 'overlay-package.json') if package_id else (
+                      'runtime/python/pythonw.exe', 'runtime/webview2/msedgewebview2.exe', 'app/local_browser.pyw')
+        for missing in components:
             with self.subTest(component=missing):
                 self.launcher('移动盘 便携目录', missing=missing)
+
+    def test_generated_cmd_spaces_chinese_arbitrary_cwd_and_python_env(self):
+        self.launcher('移动盘 生成入口 便携目录', generated=True)
+
+    def test_generated_cmd_exclamation_with_inherited_delayed_expansion(self):
+        self.launcher('移动盘 !生成入口! 便携目录', delayed=True, generated=True)
+
+    def test_generated_cmd_refuses_missing_payload_components(self):
+        for missing in ('runtime/python/pythonw.exe', 'tools/portable_bootstrap.py',
+                        'release-manifest.json', 'overlay-package.json'):
+            with self.subTest(component=missing):
+                self.launcher('移动盘 生成入口 便携目录', missing=missing, generated=True)
 
     def manager(self, root, *, present=True, version=None):
         app = root / 'app'
@@ -128,6 +250,8 @@ class DirectLaunch(unittest.TestCase):
         manager.ManagerService = MagicMock(return_value=types.SimpleNamespace())
         installation = types.ModuleType('installation')
         installation.initialize_installation = MagicMock()
+        guard = types.ModuleType('update_guard')
+        guard.require_complete_installation = MagicMock()
         kernel = types.SimpleNamespace(CreateMutexW=MagicMock(return_value=1), CloseHandle=MagicMock())
         user = types.SimpleNamespace(MessageBoxW=MagicMock())
         env = {'WEBVIEW2_BROWSER_EXECUTABLE_FOLDER':str(root / 'outside-runtime'),
@@ -136,18 +260,20 @@ class DirectLaunch(unittest.TestCase):
                'WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER':'1'}
         with ExitStack() as stack:
             stack.enter_context(patch.dict(sys.modules, browser_core=core, manager_service=manager,
-                                           installation=installation, webview=webview))
+                                           installation=installation, webview=webview, update_guard=guard))
             stack.enter_context(patch.object(ctypes, 'WinDLL', return_value=kernel))
             stack.enter_context(patch.object(ctypes, 'get_last_error', return_value=0))
             stack.enter_context(patch.object(ctypes, 'windll', types.SimpleNamespace(user32=user)))
             stack.enter_context(patch.dict(os.environ, env))
             stack.enter_context(patch.object(sys, 'argv', ['local_browser.pyw']))
             previous_path = list(sys.path)
+            previous_cache = sys.pycache_prefix, sys.dont_write_bytecode
             try:
                 namespace = runpy.run_path(str(ROOT / 'app/local_browser.pyw'), run_name='portable_synthetic')
                 namespace['main']()
             finally:
                 sys.path[:] = previous_path
+                sys.pycache_prefix, sys.dont_write_bytecode = previous_cache
         return captured, installation.initialize_installation.call_count, webview.start.call_count
 
     def test_missing_bundled_webview_refuses_before_installation(self):
@@ -278,6 +404,37 @@ class DirectLaunch(unittest.TestCase):
         user.ShowWindow.assert_not_called()
         user.SetForegroundWindow.assert_not_called()
 
+    def test_clean_acceptance_preserves_platform_and_isolates_user_environment(self):
+        scope = runpy.run_path(str(ROOT / 'tools/verify_clean_start.py'), run_name='clean_environment_fixture')
+        platform = ('SystemRoot', 'WINDIR', 'COMSPEC', 'SystemDrive', 'ProgramFiles', 'ProgramFiles(x86)',
+                    'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432',
+                    'ProgramData', 'ALLUSERSPROFILE', 'PUBLIC', 'OS', 'PROCESSOR_ARCHITECTURE',
+                    'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION', 'NUMBER_OF_PROCESSORS')
+        isolated = (('APPDATA', 'roaming'), ('LOCALAPPDATA', 'local'), ('USERPROFILE', 'user'),
+                    ('HOME', 'user'), ('TEMP', 'temp'), ('TMP', 'temp'))
+        excluded = ('USERNAME', 'USERDOMAIN', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+                    'API_TOKEN', 'OPENAI_API_KEY', 'PYTHONHOME', 'PYTHONPATH')
+        parent_environment = dict(os.environ)
+        with launcher_fixture() as base:
+            inherited = {key: 'synthetic-platform-' + str(index) for index, key in enumerate(platform)}
+            inherited.update(SystemRoot=str(base / 'synthetic-windows'), SystemDrive=base.drive)
+            inherited.update({key: str(base / 'inherited-user-directory') for key, _ in isolated})
+            inherited.update({key: 'synthetic-excluded-value' for key in excluded})
+            with patch.dict(os.environ, inherited, clear=True):
+                before = dict(os.environ)
+                environment = scope['_environment'](base, base / 'runtime/python/python.exe')
+                self.assertTrue(dict(os.environ) == before, 'synthetic_parent_environment_changed')
+                for key in platform:
+                    self.assertEqual(environment[key], inherited[key])
+                for key, folder in isolated:
+                    expected = base / 'environment' / folder
+                    self.assertEqual(environment[key], str(expected))
+                    self.assertTrue(expected.is_dir() and expected.resolve().is_relative_to(base.resolve()))
+                    self.assertNotEqual(environment[key], inherited[key])
+                for key in excluded:
+                    self.assertNotIn(key, environment)
+        self.assertTrue(dict(os.environ) == parent_environment, 'synthetic_parent_environment_not_restored')
+
     def test_clean_acceptance_copies_version_and_requires_native_title(self):
         scope=runpy.run_path(str(ROOT/'tools/verify_clean_start.py'),run_name='clean_acceptance_fixture')
         with tempfile.TemporaryDirectory(prefix='clean-title-synthetic-') as directory:
@@ -320,6 +477,7 @@ if __name__ == '__main__':
               'passed':result.testsRun-len(failed), 'failed':sorted(failed),
               'real_browser_started':False, 'real_user_data_accessed':False}
     if options.report:
+        options.report.parent.mkdir(parents=True, exist_ok=True)
         options.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), 'utf-8')
     print(json.dumps(report, ensure_ascii=False))
     print('Ran {} tests in synthetic fixtures'.format(result.testsRun), file=sys.stderr)

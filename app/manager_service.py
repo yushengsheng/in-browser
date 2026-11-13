@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import re
-import threading
 import uuid
 
 from app_paths import DATA_ROOT
@@ -19,6 +18,7 @@ from engine_validation import verification_scope
 from proxy_runtime import ProxyRuntime
 from signature_lifetime import require_current_signature,runtime_signature_options
 from signature_status import SignatureStatusCache
+from batch_operations import Operations
 
 
 class ManagerService:
@@ -40,7 +40,7 @@ class ManagerService:
         from portable_paths import relocate
         relocate(self)
         self.engines=EngineStore()
-        self.operations=threading.RLock(); self.window=None
+        self.operations=Operations(); self.window=None
         self.controller=BrowserController(self.root,settings={'windows':[p['_runtime'] for p in self.store.all()], 'persistent':False})
         self._synchronizer=None
         self._creator=None
@@ -62,13 +62,13 @@ class ManagerService:
         return data
 
     def detail(self,identity):
-        with self.operations:
+        with self._window_operation(identity):
             self._require_available(identity)
             p=self.store.get(identity)
             return self._public(p,self._status(p))
 
     def activate(self,identity):
-        with self.operations:
+        with self._window_operation(identity):
             self._require_available(identity)
             self.controller.activate(identity)
             return {'activated':True}
@@ -117,7 +117,11 @@ class ManagerService:
         found.update(self.engines.available())
         return found
 
-    def _sync(self,p): self.controller.profiles[p['id']]=copy.deepcopy(p['_runtime'])
+    def _window_operation(self,identity):
+        # Retain compatibility with isolated fixtures and older embedders.
+        return self.operations.window(identity) if hasattr(self.operations,'window') else self.operations
+
+    def _sync(self,p): self.controller.set_profile(p['id'],p['_runtime'])
 
     def _status(self,p,values=None):
         value=self.controller.status(p['id']) if values is None else values[p['id']]
@@ -184,6 +188,11 @@ class ManagerService:
         if profile_processes(Path(p['_runtime']['profile_path'])):
             raise LocalBrowserError('请先正常关闭该窗口，再修改代理或指纹配置。')
 
+    def _check_duplicate(self,p):
+        if p.get('duplicate_check') and p.get('username'):
+            if any(x['id']!=p['id'] and not x.get('archived') and x.get('platform')==p.get('platform') and x.get('username')==p.get('username') for x in self.store.all()):
+                raise LocalBrowserError('已有相同平台和用户名的本地窗口。')
+
     def _runtime(self,p,previous=None):
         fp=p['fingerprint']; settings=self.settings(); core=str(fp['coreVersion'])
         local=(previous or {}).get('signature_provider')=='local-v1' or getattr(self.configuration,'independent',False)
@@ -232,7 +241,7 @@ class ManagerService:
         return runtime
 
     def save(self,incoming,*,allow_fingerprint=True):
-        with self.operations:
+        with self._window_operation(incoming.get('id') if isinstance(incoming,dict) else ''):
             if not isinstance(incoming,dict):raise LocalBrowserError('窗口配置格式不正确。')
             if not incoming.get('id'):raise LocalBrowserError('仅支持编辑已导入的窗口；新增来源须具备完整本地迁移配置和资料。')
             self._require_available(incoming['id'])
@@ -251,9 +260,7 @@ class ManagerService:
             if not allow_fingerprint and p['fingerprint']!=old['fingerprint']:raise LocalBrowserError('此版本的指纹配置只读，不能在本地更换。')
             p['name']=p['name'].strip() or '窗口 '+str(p['seq'])
             cookies=parse_cookies(p.get('cookie_text',''),p)
-            if p.get('duplicate_check') and p.get('username'):
-                if any(x['id']!=p['id'] and not x.get('archived') and x.get('platform')==p.get('platform') and x.get('username')==p.get('username') for x in self.store.all()):
-                    raise LocalBrowserError('已有相同平台和用户名的本地窗口。')
+            self._check_duplicate(p)
             needs_config=any(p.get(k)!=old.get(k) for k in ['fingerprint','preferences'])
             if old.get('created_locally') and p.get('created_options',{}).get('image_limit_kb')!=old.get('created_options',{}).get('image_limit_kb'):
                 needs_config=True
@@ -288,7 +295,9 @@ class ManagerService:
                 if proxy_changed:
                     runtime.pop('local_proxy_port',None)
                 commit_attempted=True
-                self.store.put(p,include_group=True)
+                with getattr(self.store,'lock',self.operations):
+                    self._check_duplicate(p)
+                    self.store.put(p,include_group=True)
             except Exception:
                 if (new_file and new_file.parent.resolve()==(self.root/'fingerprints').resolve()
                         and (not commit_attempted or fingerprint_unreferenced(self.store,p['id'],new_file))):
@@ -314,11 +323,22 @@ class ManagerService:
 
     @verification_scope()
     def open(self,identity,*,offline_test=False,extra_urls=None):
-        with self.operations:
+        with self._window_operation(identity):
             self._require_available(identity)
             p=self.store.get(identity)
             if p.get('archived'): raise LocalBrowserError('请先恢复回收站中的窗口。')
             already=self._status(p)=='open'
+            restoring_source_tabs=False
+            tab_group_restore=None
+            if not already and extra_urls is None:
+                from source_sessions import pending_source_restore
+                source_restore=pending_source_restore(p)
+                if source_restore is not None:
+                    from session_recovery import has_saved_session
+                    if not has_saved_session(p['_runtime']['profile_path']):
+                        if source_restore['mode']=='tab-group-store':tab_group_restore=source_restore
+                        else:extra_urls=source_restore['urls']
+                    restoring_source_tabs=True
             if self._status(p)=='closing':raise LocalBrowserError('窗口正在正常保存并退出，请稍候再打开。')
             if not already and (getattr(self.configuration,'independent',False) or p['_runtime'].get('signature_provider')=='local-v1'):
                 from local_runtime import LocalRuntime
@@ -387,7 +407,8 @@ class ManagerService:
                         if route:p['_runtime']['local_proxy_port']=route['port']
                         else:p['_runtime'].pop('local_proxy_port',None)
                         self._sync(p)
-                self.controller.open(identity,offline_test=offline_test,extra_urls=extra_urls,bootstrap_blank=bootstrap_blank,before_launch=before_launch)
+                restore_options={'tab_group_restore':tab_group_restore} if tab_group_restore is not None else {}
+                self.controller.open(identity,offline_test=offline_test,extra_urls=extra_urls,bootstrap_blank=bootstrap_blank,before_launch=before_launch,**restore_options)
             except Exception:
                 if not profile_processes(Path(p['_runtime']['profile_path'])):self.proxy_runtime.stop_if_unused(identity)
                 raise
@@ -416,6 +437,8 @@ class ManagerService:
                 if p.get('_pending_creation_egress'):p['_last_creation_egress']=p.pop('_pending_creation_egress')
                 p['_runtime'].pop('window_size_once',None); p['_runtime'].pop('open_urls_once',None)
                 p['_runtime'].pop('environment_args',None)
+                if restoring_source_tabs:
+                    p['_source_session_restore']={**p['_source_session_restore'],'pending':False}
                 self.store.put(p); self._sync(p)
             except Exception:
                 if not already:
@@ -438,7 +461,7 @@ class ManagerService:
             return self.store.public(p,'open')
 
     def close(self,identity):
-        with self.operations:
+        with self._window_operation(identity):
             self.controller.close(identity)
             self.proxy_runtime.stop_if_unused(identity)
             return self.store.public(self.store.get(identity),'closed')
@@ -457,7 +480,7 @@ class ManagerService:
             renames=payload.get('renames') or {}
             rows=con.execute('SELECT id,data FROM profiles').fetchall()
             for identity,blob in rows:
-                p=self.store.unpack(blob); old=p.get('group',''); new=renames.get(old,old)
+                p=self.store.unpack(blob); old=p.get('group',''); new=str(renames.get(old,old)).strip()[:100]
                 if new not in groups: new=''
                 if old!=new:
                     p['group']=new
@@ -479,3 +502,8 @@ class ManagerService:
     def request(self,action,payload=None):
         from api import dispatch
         return dispatch(self,action,payload)
+
+    def shutdown_batches(self):
+        from batch_operations import shutdown_batches
+        with self.operations:
+            shutdown_batches(self)

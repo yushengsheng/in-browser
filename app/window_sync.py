@@ -1,5 +1,6 @@
 """Add-only, verified snapshots of local BitBrowser windows; never mirror deletes."""
 import copy
+from contextvars import ContextVar
 import hashlib
 from itertools import chain
 import json
@@ -23,10 +24,12 @@ from profile_model import defaults,PREFERENCES,sanitize,fingerprint_fields
 from proxy_config import normalize_proxy
 from window_store import now,source_time
 from sync_state import SyncState,WorkerLease
+from sync_executor import run_bounded
 from engine_validation import verification_scope
 from import_progress import ImportProgress,observe,emit
 
 MAX_SYNC_SOURCES=9999
+MAX_SYNC_WORKERS=5
 SYNC_PREVIEW_TTL=600
 _INTERNAL_START=object()
 
@@ -55,9 +58,11 @@ class WindowSynchronizer:
         from profile_delete import get_pending_ids
         self.service=service;self.provider=provider or BitSource(service.configuration)
         self.lock=threading.RLock();self.candidates={};self.active=None;self.diagnostics={}
+        self._asset_lock=threading.Lock()
         self.preview_id=None;self.preview_created=0;self.confirmed_jobs={}
-        self.state=SyncState(service.store);self.lease=WorkerLease(service.root);self._job_item=None
-        self.progress=ImportProgress()
+        self.state=SyncState(service.store);self.lease=WorkerLease(service.root)
+        self._item_context=ContextVar('sync_job_item',default=None)
+        self.progress=ImportProgress();self._progress_items={}
         if self.lease.acquire():
             try:
                 self.state.interrupt_running()
@@ -186,9 +191,18 @@ class WindowSynchronizer:
 
     def _with_progress(self,result):
         if result is not None:
-            result['progress']=self.progress.snapshot(result['job_id']) if result['state']=='running' else None
+            active=[]
+            if result['state']=='running':
+                with self.lock:observers=list(self._progress_items.items())
+                for (job,index),(progress,position) in sorted(observers):
+                    if job!=result['job_id']:continue
+                    value=progress.snapshot(job)
+                    if value:
+                        value.update(ordinal=index,index=position);active.append(value)
+            result['active_items']=active
+            result['progress']=active[0] if active else self.progress.snapshot(result['job_id']) if result['state']=='running' else None
             if result['progress']:
-                result['progress']['index']=result['current']
+                if not active:result['progress']['index']=result['current']
                 result['phase']=result['progress']['phase']
         return result
 
@@ -215,44 +229,75 @@ class WindowSynchronizer:
         self.state.update(identity,**values)
         if values.get('phase'):emit(values['phase'])
 
+    @property
+    def _job_item(self):
+        return self._item_context.get()
+
+    def _diagnostic(self,identity,value):
+        with self.lock:
+            entries=self.diagnostics.setdefault(identity,[])
+            entries.append(value)
+            del entries[:-100]
+
+    def _run_item(self,identity,index,candidate,*,preflight_error=None):
+        position=self.state.begin_item(identity,index)
+        if position is None:return
+        token=self._item_context.set((identity,index))
+        progress=ImportProgress();progress.begin(identity,index,candidate)
+        with self.lock:self._progress_items[(identity,index)]=(progress,position)
+        result={'source_key':candidate['source_key']}
+        try:
+            with observe(progress.update):
+                if preflight_error:raise LocalBrowserError(preflight_error)
+                key=candidate['source_key']
+                if self.service.store.source_binding(key):result.update(status='skipped',message='该来源已经同步，保留原有副本。')
+                elif candidate['status']!='ready':result.update(status='skipped',message=candidate.get('reason') or '来源尚未准备好。')
+                else:
+                    imported=self._import(candidate,emit)
+                    result.update(status='skipped' if imported is False else 'completed',message='该来源已经同步，保留原有副本。' if imported is False else '完整独立副本已保存。')
+        except LocalBrowserError as exc:result.update(status='failed',message=str(exc))
+        except Exception as exc:
+            self._diagnostic(identity,{'ordinal':index,'type':type(exc).__name__,'errno':getattr(exc,'errno',None),'winerror':getattr(exc,'winerror',None),
+                'frames':[{'file':Path(f.filename).name,'line':f.lineno} for f in traceback.extract_tb(exc.__traceback__)]})
+            result.update(status='failed',message='本次同步未完成，来源和已有本地窗口未修改。请检查磁盘、文件占用或授权。')
+        finally:
+            timing=progress.finish()
+            if timing:self._diagnostic(identity,timing)
+            with self.lock:self._progress_items.pop((identity,index),None)
+            self._item_context.reset(token)
+        self.state.finish_item(identity,index,result['status'],result['message'])
+
+    def _prepare_roots(self):
+        # Establish shared parents before workers resolve missing descendants.
+        # Windows realpath can retain an extended prefix when another thread
+        # creates a missing ancestor during its fallback resolution.
+        root=self.service.root.resolve()
+        for name in ('.sync-work','profiles','fingerprints'):
+            folder=root/name
+            for create in (True,False):
+                if (not folder.resolve().is_relative_to(root) or folder.is_symlink() or
+                        (folder.exists() and getattr(folder.lstat(),'st_file_attributes',0)&0x400)):
+                    raise LocalBrowserError('同步目标包含特殊链接或越界，未发布资料。')
+                if create:folder.mkdir(exist_ok=True)
+
     def _run(self,identity):
         self.diagnostics.setdefault(identity,[])
         try:
-            for index,candidate in self.state.pending(identity):
-                if self.state.cancelled(identity):
-                    self._update(identity,state='cancelled',phase='finished');return
-                self.state.begin_item(identity,index);self._job_item=(identity,index)
-                self.progress.begin(identity,index,candidate)
-                key=candidate['source_key'];result={'source_key':key}
-                try:
-                    with observe(self.progress.update),self.service.operations:
-                        if self.service.store.source_binding(key):result.update(status='skipped',message='该来源已经同步，保留原有副本。')
-                        elif candidate['status']!='ready':result.update(status='skipped',message=candidate.get('reason') or '来源尚未准备好。')
-                        else:
-                            imported=self._import(candidate,lambda phase:self._update(identity,phase=phase))
-                            result.update(status='skipped' if imported is False else 'completed',message='该来源已经同步，保留原有副本。' if imported is False else '完整独立副本已保存。')
-                except LocalBrowserError as exc:result.update(status='failed',message=str(exc))
-                except Exception as exc:
-                    # Developer diagnostics contain only source-code locations,
-                    # never exception text, paths, account fields or credentials.
-                    self.diagnostics[identity].append({'type':type(exc).__name__,'errno':getattr(exc,'errno',None),'winerror':getattr(exc,'winerror',None),
-                        'frames':[{'file':Path(f.filename).name,'line':f.lineno} for f in traceback.extract_tb(exc.__traceback__)]})
-                    self.diagnostics[identity]=self.diagnostics[identity][-100:]
-                    result.update(status='failed',message='本次同步未完成，来源和已有本地窗口未修改。请检查磁盘、文件占用或授权。')
-                finally:
-                    timing=self.progress.finish()
-                    if timing:
-                        self.diagnostics[identity].append(timing)
-                        self.diagnostics[identity]=self.diagnostics[identity][-100:]
-                self.state.finish_item(identity,index,result['status'],result['message'])
-                self._job_item=None
-            self._update(identity,state='completed',phase='finished')
+            operations=self.service.operations
+            with operations.shared() if hasattr(operations,'shared') else operations:
+                preflight_error=None
+                if not self.state.cancelled(identity):
+                    try:self._prepare_roots()
+                    except LocalBrowserError as exc:preflight_error=str(exc)
+                run_bounded(self.state.pending(identity),lambda index,candidate:self._run_item(identity,index,candidate,preflight_error=preflight_error),
+                            lambda:self.state.cancelled(identity),max_workers=MAX_SYNC_WORKERS)
+            self._update(identity,state='cancelled' if self.state.cancelled(identity) else 'completed',phase='finished')
         except Exception:
             try:self._update(identity,state='interrupted',phase='finished',message='同步任务中止，已完成的副本仍保留，可继续剩余项。')
             except Exception:pass
         finally:
             self.progress.finish()
-            with self.lock:self._job_item=None;self.lease.release()
+            with self.lock:self.lease.release()
 
     def _startup(self,candidate):
         from local_source import source_protection
@@ -270,6 +315,7 @@ class WindowSynchronizer:
 
     def _extensions(self,source,staged,final):
         """Rebase extension filesystem references; never enable vendor cloud sync."""
+        from delete_paths import checked
         from extension_portability import verify_secure_extension_paths
         verify_secure_extension_paths(staged)
         path=staged/'Default/Preferences'
@@ -293,8 +339,23 @@ class WindowSynchronizer:
             manifest=self.service._manifest(original)
             digest=hashlib.sha256(json.dumps(manifest,sort_keys=True).encode()).hexdigest()
             asset=self.service.root/'assets/extensions'/digest
-            if not asset.exists():self.service._copy_profile(original,asset)
-            if self.service._manifest(asset)!=manifest:raise LocalBrowserError('扩展资源复制校验失败，未提交副本。')
+            with self._asset_lock:
+                checked(asset,self.service.root)
+                if not asset.exists():
+                    # The caller's staged profile is inside its authenticated intent.
+                    # Interrupted extension copies therefore share its recovery owner.
+                    pending=staged.parent/'extension-assets'/digest
+                    self.service._copy_profile(original,pending)
+                    if self.service._manifest(pending)!=manifest:raise LocalBrowserError('扩展资源复制校验失败，未提交副本。')
+                    checked(asset,self.service.root)
+                    asset.parent.mkdir(parents=True,exist_ok=True)
+                    checked(asset,self.service.root)
+                    if not asset.exists():
+                        try:self._publish(pending,asset)
+                        except (FileExistsError,LocalBrowserError):
+                            if not asset.exists():raise
+                checked(asset,self.service.root)
+                if self.service._manifest(asset)!=manifest:raise LocalBrowserError('扩展资源复制校验失败，未提交副本。')
             entry['path']=str(asset);changed=True
         if changed:
             temporary=path.with_suffix('.sync-tmp')

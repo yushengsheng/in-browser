@@ -23,6 +23,9 @@ def prepare_import(service,record,candidate,staged,work):
         record['_portable_crypt']=capture_profile(Path(staged))
         record['_portable_app']=str(APP_ROOT)
     if record.get('_source_info'):
+        from source_sessions import collect_source_restore
+        restore=collect_source_restore(staged,runtime,record.get('urls') or (),source_record=record)
+        if restore:record['_source_session_restore']=restore
         emit('cookies')
         from import_cookies import materialize
         materialize(service,record,staged,signature=Path(work)/'fingerprint.bin',work_parent=Path(work))

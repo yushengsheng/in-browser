@@ -96,7 +96,7 @@ class BundledCoreCreationTests(unittest.TestCase):
         self.assertFalse((self.configuration.vendor_data / 'db.sqlite').exists())
         self.assertEqual(self.configuration.local_core('148'), self.deployed)
         self.snapshot.assert_not_called()
-        self.store.ensure.assert_called_once_with('148', source.resolve(), self.signer.public_der)
+        self.store.ensure.assert_called_once_with('148', source.resolve(), self.signer.public_der, current=True)
         self.store.ensure_current.assert_called_once_with(self.deployed, self.signer.key_id, '148')
         self.store.validate.assert_called_once_with(self.deployed, self.signer.key_id, '148')
         self.assertEqual(self.configuration.source_archive()['engines'], {'148': str(self.deployed)})
@@ -129,7 +129,7 @@ class BundledCoreCreationTests(unittest.TestCase):
         source = self.vendor_engine()
         self.assertEqual(self.configuration.local_core('148'), self.deployed)
         self.assertEqual(self.snapshot.call_count, 1)
-        self.store.ensure.assert_called_once_with('148', source, self.signer.public_der)
+        self.store.ensure.assert_called_once_with('148', source, self.signer.public_der, current=True)
         self.assertEqual(self.configuration.source_archive()['engines'], {'148': str(self.deployed)})
 
     def test_existing_mapping_keeps_priority_and_does_not_read_broken_bundle(self):

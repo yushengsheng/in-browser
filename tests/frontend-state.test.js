@@ -970,6 +970,59 @@ test("failed settings save retains the saved policy and unsaved draft", async ()
   assert.equal(h.element("#save-settings").disabled, false);
 });
 
+for (const outcome of ["success", "failure"]) {
+  test(`a delayed settings read ${outcome} preserves edits made during the request`, async () => {
+    const h = fixture(), pending = deferred();
+    h.state.panel = "settings";
+    h.state.settings = { confirm_close: true };
+    const draft = h.state.settingsDraft = { confirm_close: true };
+    h.context.renderSettings();
+    const form = h.element("#settings-form").innerHTML;
+    h.context.api = async () => pending.promise;
+    const reading = h.context.loadSettings();
+    h.setting("confirm_close", false);
+    if (outcome === "success") pending.resolve({ confirm_close: true });
+    else pending.reject(new Error("Fixture read failure"));
+    await reading;
+    assert.equal(h.state.settingsDraft, draft);
+    assert.equal(h.state.settingsDraft.confirm_close, false);
+    assert.equal(h.state.settings.confirm_close, true);
+    assert.equal(h.state.settingsDirty, true);
+    assert.equal(h.element("#settings-form").innerHTML, form);
+    assert.equal(h.element("#save-settings").disabled, false);
+    if (outcome === "failure") assert.match(h.toasts.at(-1).message, /Fixture read failure/);
+  });
+}
+
+test("an older settings read cannot replace a newer read", async () => {
+  const h = fixture(), older = deferred(), newer = deferred();
+  let calls = 0;
+  h.context.api = async () => ++calls === 1 ? older.promise : newer.promise;
+  const first = h.context.loadSettings(), second = h.context.loadSettings();
+  newer.resolve({ start_page: "https://newer.fixture.invalid" });
+  await second;
+  older.resolve({ start_page: "https://older.fixture.invalid" });
+  await first;
+  assert.equal(h.state.settings.start_page, "https://newer.fixture.invalid");
+  assert.equal(h.state.settingsDraft.start_page, "https://newer.fixture.invalid");
+  assert.equal(h.state.settingsDirty, false);
+});
+
+test("manual refresh preserves settings edits made after the request starts", async () => {
+  const h = fixture(), pending = deferred();
+  h.state.panel = "settings";
+  h.state.settings = { start_page: "https://saved.fixture.invalid" };
+  const draft = h.state.settingsDraft = { ...h.state.settings };
+  h.context.api = async () => pending.promise;
+  const reading = h.context.bootstrap();
+  h.setting("start_page", "https://draft.fixture.invalid");
+  pending.resolve({ profiles: [], settings: { start_page: "https://saved.fixture.invalid" } });
+  await reading;
+  assert.equal(h.state.settingsDraft, draft);
+  assert.equal(h.state.settingsDraft.start_page, "https://draft.fixture.invalid");
+  assert.equal(h.state.settingsDirty, true);
+});
+
 test("late path selection cannot overwrite a replacement settings draft", async () => {
   const h = fixture(), pending = deferred();
   h.state.panel = "settings";
@@ -1216,19 +1269,78 @@ test("committed group names survive refresh failure and are used by the next ren
   assert.equal(h.state.groupsSaving, false);
 });
 
-test("group commit accepts the service's normalized names and membership rules", async () => {
-  const h = fixture(), requested = "Z".repeat(101), normalized = requested.slice(0, 100);
-  h.state.groupDraft = [requested];
-  h.state.groupSources = ["A"];
-  h.state.groupOriginal = ["A"];
-  h.state.profiles = [{ id: "fixture", group: "A" }];
-  h.context.api = async () => ({ groups: [normalized] });
+test("renaming the active group filter keeps its windows visible after a refresh failure", async () => {
+  const h = fixture();
+  h.state.group = "Before";
+  h.state.groupDraft = ["After", "Keep"];
+  h.state.groupSources = ["Before", "Keep"];
+  h.state.groupOriginal = ["Before", "Keep"];
+  h.state.profiles = [{ id: "renamed", group: "Before" }, { id: "other", group: "Keep" }];
+  h.context.api = async (_, payload) => ({ groups: payload.groups });
   h.context.refreshProfiles = async () => { throw new Error("Fixture refresh failure"); };
   await h.context.saveGroups();
-  assert.deepEqual(Array.from(h.state.groups), [normalized]);
-  assert.deepEqual(Array.from(h.state.groupDraft), [normalized]);
-  assert.deepEqual(Array.from(h.state.groupSources), [normalized]);
-  assert.equal(h.state.profiles[0].group, "");
+  assert.equal(h.state.group, "After");
+  assert.deepEqual(Array.from(h.context.filteredProfiles(), (profile) => profile.id), ["renamed"]);
+});
+
+test("removing the active group clears its filter while unrelated filters survive", async () => {
+  for (const selected of ["Removed", "Keep"]) {
+    const h = fixture();
+    h.state.group = selected;
+    h.state.groupDraft = ["Keep"];
+    h.state.groupSources = ["Keep"];
+    h.state.groupOriginal = ["Removed", "Keep"];
+    h.state.profiles = [{ id: "ungrouped", group: "Removed" }, { id: "kept", group: "Keep" }];
+    h.context.api = async (_, payload) => ({ groups: payload.groups });
+    await h.context.saveGroups();
+    assert.equal(h.state.group, selected === "Removed" ? "" : "Keep");
+    assert.deepEqual(Array.from(h.context.filteredProfiles(), (profile) => profile.id),
+      selected === "Removed" ? ["ungrouped", "kept"] : ["kept"]);
+  }
+});
+
+test("group names share Python whitespace and code-point limits across membership and filters", async () => {
+  for (const [requested, normalized] of [
+    [" \t" + "Z".repeat(101) + "\n", "Z".repeat(100)],
+    ["\u0085" + "🙂".repeat(101) + "\u001c", "🙂".repeat(100)],
+    [" \ufeffKeep ", "\ufeffKeep"],
+    ["A".repeat(99) + " Z", "A".repeat(99)],
+  ]) {
+    const h = fixture();
+    h.state.group = "A";
+    h.state.groupDraft = [requested];
+    h.state.groupSources = ["A"];
+    h.state.groupOriginal = ["A"];
+    h.state.profiles = [{ id: "fixture", group: "A" }];
+    h.context.api = async (action, payload) => {
+      assert.equal(action, "groups_save");
+      assert.deepEqual(Array.from(payload.groups), [normalized]);
+      assert.equal(payload.renames.A, normalized);
+      return { groups: payload.groups };
+    };
+    h.context.refreshProfiles = async () => { throw new Error("Fixture refresh failure"); };
+    await h.context.saveGroups();
+    assert.deepEqual(Array.from(h.state.groups), [normalized]);
+    assert.deepEqual(Array.from(h.state.groupDraft), [normalized]);
+    assert.deepEqual(Array.from(h.state.groupSources), [normalized]);
+    assert.equal(h.state.profiles[0].group, normalized);
+    assert.equal(h.state.group, normalized);
+    assert.deepEqual(Array.from(h.context.filteredProfiles(), (profile) => profile.id), ["fixture"]);
+  }
+});
+
+test("normalized group collisions and Python-only whitespace cannot be submitted", async () => {
+  for (const groups of [["Z".repeat(100) + "A", "Z".repeat(100) + "B"],
+    ["A".repeat(99) + " Z", "A".repeat(99)], ["\u0085\u001f"]]) {
+    const h = fixture();
+    h.state.groupDraft = groups;
+    let submitted = 0;
+    h.context.api = async () => { submitted++; return {}; };
+    await h.context.saveGroups();
+    assert.equal(submitted, 0);
+    assert.equal(h.toasts.at(-1).type, "error");
+    assert.match(h.toasts.at(-1).message, groups.length === 2 ? /重复/ : /不能为空/);
+  }
 });
 
 test("collecting a draft preserves disabled fingerprint values", () => {
@@ -1329,6 +1441,11 @@ test("sync progress separates processed batch counts from measured byte progress
   assert.equal(h.element("#sync-stage-elapsed").textContent, "当前窗口已用 1 分 14 秒 · 本阶段已用 12 秒");
   assert.match(h.element("#sync-stage-timings").textContent, /检查资料 2 秒.*读取来源校验摘要 1 分 0 秒/);
   assert.equal(h.timers.size, 1);
+  h.context.restoreSyncJob(syncStatus({ total: 5, progress: syncProgress({ index: 1 }), active_items: Array.from({ length: 5 }, (_, index) => syncProgress({ index: index + 1 })) }));
+  assert.equal(h.element("#sync-current-label").textContent, "当前窗口 1 / 5 · 同时处理 5 个窗口");
+  h.state.sync.cancelRequested = true;
+  h.context.renderSyncProgress();
+  assert.match(h.element("#sync-background-note").textContent, /已开始的窗口会继续处理/);
 });
 
 test("copying at 100 percent cannot complete a batch and the next phase resets its measurement", () => {
@@ -1477,7 +1594,7 @@ test("cancelling remaining work preserves the current phase until it completes",
   await new Promise(setImmediate);
   assert.equal(h.element("#sync-current").hidden, false);
   assert.match(h.element("#sync-stage-count").textContent, /75%/);
-  assert.match(h.element("#sync-background-note").textContent, /当前窗口会继续处理，只取消尚未开始的窗口/);
+  assert.match(h.element("#sync-background-note").textContent, /已开始的窗口会继续处理，只取消尚未开始的窗口/);
   assert.equal(h.element("#sync-cancel-job").disabled, true);
   assert.equal(h.timers.size, 1);
   assert.equal([...h.timers.values()][0].delay, 1000);
@@ -1503,6 +1620,65 @@ test("sync preview safely displays full source labels and long remarks with empt
   assert.match(rows, /title="无备注">备注：—<\/small>/);
   assert.match(rows, /合成提示 &lt;读取失败&gt; &amp; &quot;重试&quot;/);
   assert.doesNotMatch(rows, /<img|<script|disabled/);
+});
+
+test("sync batch search matches any distinct term without changing choices or the main search", () => {
+  const h = fixture(), input = h.element("#sync-search");
+  h.state.sync.preview = Array.from({ length: 12 }, (_, index) => ({
+    source_key: `batch-${index}`, name: index === 1 ? "Alpha Group" : `Window ${index}`,
+    remark: index === 5 ? "VIP 备注" : "普通备注", seq: 5000 + index, status: "ready",
+  }));
+  h.state.sync.selected = new Set(["batch-1", "batch-8", "batch-10"]);
+  h.state.search = "主列表条件";
+  h.state.sync.page = 2;
+  input.value = " ALPHA Group\r\n vip，5010; alpha group；\n";
+  input.oninput({ target: input });
+  const rows = h.element("#sync-preview-rows").innerHTML;
+  assert.equal(h.element("#sync-range").textContent, "1–3 / 3");
+  for (const index of [1, 5, 10]) assert.match(rows, new RegExp(`data-sync-index="${index}"`));
+  assert.doesNotMatch(rows, /data-sync-index="8"/);
+  assert.match(h.element("#sync-search-feedback").textContent, /批量搜索 3 项/);
+  assert.equal(input["aria-invalid"], "false");
+  assert.equal(input.rows, 3);
+  assert.equal(h.state.sync.page, 1);
+  assert.deepEqual([...h.state.sync.selected], ["batch-1", "batch-8", "batch-10"]);
+  assert.equal(h.state.search, "主列表条件");
+});
+
+test("sync batch search accepts ten terms, rejects eleven and resets without losing selections", async () => {
+  const h = fixture(), input = h.element("#sync-search");
+  const candidates = Array.from({ length: 12 }, (_, index) => ({
+    source_key: `limit-${index}`, name: `token${String(index).padStart(2, "0")}`, status: "ready",
+  }));
+  h.state.sync.preview = candidates;
+  h.state.sync.selected = new Set(["limit-0", "limit-11"]);
+  input.value = candidates.slice(0, 10).map((item) => item.name).join("\n");
+  input.oninput({ target: input });
+  assert.equal(h.element("#sync-range").textContent, "1–10 / 10");
+  assert.equal(input["aria-invalid"], "false");
+  assert.equal(input.rows, 4);
+  input.value += "\ntoken10";
+  input.oninput({ target: input });
+  assert.equal(h.element("#sync-range").textContent, "0–0 / 0");
+  assert.equal(input["aria-invalid"], "true");
+  assert.match(h.element("#sync-search-feedback").textContent, /最多支持 10 项，当前 11 项/);
+  assert.match(h.element("#sync-empty").textContent, /最多支持 10 项/);
+  assert.deepEqual([...h.state.sync.selected], ["limit-0", "limit-11"]);
+  input.value = "";
+  input.oninput({ target: input });
+  assert.equal(h.element("#sync-range").textContent, "1–12 / 12");
+  assert.equal(h.element("#sync-search-feedback").hidden, true);
+  assert.equal(input["aria-invalid"], "false");
+  assert.equal(input.rows, 1);
+  assert.deepEqual([...h.state.sync.selected], ["limit-0", "limit-11"]);
+  input.value = candidates.map((item) => item.name).join("\n");
+  input.oninput({ target: input });
+  h.context.api = async () => ({ preview_id: "batch-reset", items: candidates });
+  await h.context.loadSyncPreview();
+  assert.equal(input.value, "");
+  assert.equal(input.rows, 1);
+  assert.equal(input["aria-invalid"], "false");
+  assert.equal(h.element("#sync-search-feedback").hidden, true);
 });
 
 test("sync remark search preserves original indices and cross-page choices until explicit start", async () => {
@@ -1729,6 +1905,72 @@ test("10k status updates use bounded ID reads and preserve selected rows and dra
   assert.equal(h.state.dirty, true);
   assert.equal(h.state.settingsDraft, settingsDraft);
   assert.equal(h.state.settingsDirty, true);
+});
+
+test("running-filter status changes wait for table focus to leave before updating rows and pagination", async () => {
+  const h = fixture(), rows = h.element("#profile-rows");
+  const focused = h.element("focused-row"), otherRow = h.element("other-row");
+  rows.contains = (node) => node === focused || node === otherRow;
+  h.state.filter = "running";
+  h.state.pageSize = 2;
+  h.state.page = 2;
+  h.state.profiles = [1, 2, 3].map((seq) => ({ id: `fixture-${seq}`, name: `Fixture ${seq}`, seq, status: "open" }));
+  h.state.selected = new Set(["fixture-1", "fixture-3"]);
+  h.renderProfiles();
+  const before = rows.innerHTML;
+  let rendered = 0;
+  h.context.renderProfiles = () => { rendered++; h.renderProfiles(); };
+  h.context.document.activeElement = focused;
+  h.context.api = async () => ({ profiles: [{ id: "fixture-3", status: "closed" }] });
+  await h.context.refreshStatus();
+  await h.context.refreshStatus();
+  assert.equal(rendered, 0);
+  assert.equal(rows.innerHTML, before);
+  assert.equal(h.state.profileRenderPending, true);
+  assert.equal(h.state.page, 2);
+  assert.equal(h.element("#count-running").textContent, 2);
+
+  const leave = (next) => {
+    h.context.document.activeElement = next;
+    rows.listeners.get("focusout")();
+    const timer = h.state.profileFocusTimer;
+    const callback = h.timers.get(timer).callback;
+    h.timers.delete(timer);
+    callback();
+  };
+  leave(otherRow);
+  assert.equal(rendered, 0);
+  assert.equal(h.state.profileRenderPending, true);
+  const outside = h.element("#group-filter");
+  leave(outside);
+  assert.equal(rendered, 1);
+  assert.equal(h.context.document.activeElement, outside);
+  assert.equal(h.state.profileRenderPending, false);
+  assert.equal(h.state.profileFocusTimer, null);
+  assert.equal(h.state.page, 1);
+  assert.match(rows.innerHTML, /data-id="fixture-1"/);
+  assert.match(rows.innerHTML, /data-id="fixture-2"/);
+  assert.doesNotMatch(rows.innerHTML, /data-id="fixture-3"/);
+  assert.deepEqual([...h.state.selected], ["fixture-1", "fixture-3"]);
+  assert.equal(h.element("#selected-count").textContent, 2);
+  assert.equal(h.element("#select-all").checked, false);
+  assert.equal(h.element("#select-all").indeterminate, true);
+});
+
+test("an explicit list redraw cancels a deferred focus redraw", () => {
+  const h = fixture();
+  h.state.profileRenderPending = true;
+  h.element("#profile-rows").listeners.get("focusout")();
+  const timer = h.state.profileFocusTimer;
+  const callback = h.timers.get(timer).callback;
+  h.renderProfiles();
+  assert.equal(h.timers.has(timer), false);
+  assert.equal(h.state.profileRenderPending, false);
+  assert.equal(h.state.profileFocusTimer, null);
+  let rendered = 0;
+  h.context.renderProfiles = () => { rendered++; };
+  callback();
+  assert.equal(rendered, 0);
 });
 
 test("bootstrap restores an active task with bounded results and keeps form drafts", async () => {

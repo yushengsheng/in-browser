@@ -24,7 +24,15 @@ class SessionRecoveryTests(unittest.TestCase):
         self.original={'profile':{'exit_type':'Crashed','keep':True},'other':{'preserved':1}}
         self.preferences.write_text(json.dumps(self.original))
         self.session=self.sessions/'Session_123'
-        self.session.write_bytes(b'SNSS'+struct.pack('<I',3)+b'\x02\x00\x06x\x01\x00\xff')
+        def command(identity,payload=b''):
+            return struct.pack('<H',len(payload)+1)+bytes([identity])+payload
+        def text(value):
+            raw=value.encode('utf-8')
+            return struct.pack('<i',len(raw))+raw+b'\0'*(-len(raw)%4)
+        payload=struct.pack('<ii',2,0)+text('https://synthetic.invalid/')+struct.pack('<iii',0,0,0)
+        self.native=(b'SNSS'+struct.pack('<I',3)+command(0,struct.pack('<ii',1,2))
+                     +command(6,struct.pack('<I',len(payload))+payload)+command(255))
+        self.session.write_bytes(self.native)
         (self.storage/'000001.log').write_bytes(b'synthetic native storage')
 
     def test_repairs_crash_flag_without_changing_native_session_or_storage(self):
@@ -54,6 +62,36 @@ class SessionRecoveryTests(unittest.TestCase):
             self.session.write_bytes(content)
             self.assertFalse(prepare_session(self.root))
             self.assertEqual(self.preferences.read_bytes(),raw)
+
+    def test_empty_shell_corruption_and_closed_final_tab_do_not_suppress_fallback(self):
+        from session_recovery import has_saved_session
+        contents=(b'SNSS'+struct.pack('<I',3)+b'\x01\x00\xff',
+                  b'SNSS'+struct.pack('<I',3)+b'\x02\x00\x06x\x01\x00\xff',
+                  self.native+struct.pack('<HB',17,16)+struct.pack('<i4xq',2,0))
+        original=self.preferences.read_bytes()
+        for content in contents:
+            with self.subTest(size=len(content)):
+                self.session.write_bytes(content)
+                self.assertFalse(has_saved_session(self.root))
+                self.assertFalse(prepare_session(self.root))
+                self.assertEqual(self.preferences.read_bytes(),original)
+                self.assertFalse((self.root/'.local-session-recovery.zip').exists())
+
+    def test_truncated_tail_keeps_native_prefix_and_complete_rollback(self):
+        content=self.native+b'\x20\x00\x06partial'
+        self.session.write_bytes(content)
+        self.assertTrue(prepare_session(self.root))
+        self.assertEqual(self.session.read_bytes(),content)
+        with zipfile.ZipFile(self.root/'.local-session-recovery.zip') as archive:
+            self.assertEqual(archive.read('Default/Sessions/Session_123'),content)
+
+    def test_newer_closed_session_does_not_repair_crash_flag_from_old_live_session(self):
+        closed=self.native+struct.pack('<HB',17,16)+struct.pack('<i4xq',2,0)
+        (self.sessions/'Session_124').write_bytes(closed)
+        raw=self.preferences.read_bytes()
+        self.assertFalse(prepare_session(self.root))
+        self.assertEqual(self.preferences.read_bytes(),raw)
+        self.assertFalse((self.root/'.local-session-recovery.zip').exists())
 
     def test_backup_failure_keeps_original_preferences_and_files(self):
         raw=self.preferences.read_bytes()

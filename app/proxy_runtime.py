@@ -24,7 +24,7 @@ import psutil
 import socks
 
 from local_state import LocalBrowserError, read_encrypted, write_encrypted
-from browser_processes import _profile_browsers, _is_browser, _switch_values
+from browser_processes import _canonical_profile, _profile_browsers, _is_browser, _switch_values
 from proxy_config import normalize_proxy
 from browser_policy import PROXY_SWITCHES,verify_running_proxy_args,verify_proxy_extensions
 
@@ -196,9 +196,9 @@ class Worker:
 
     def matches_browser(self, process):
         args=process.cmdline()
-        expected=os.path.normcase(str(Path(self.config['profile']).resolve()))
+        expected=_canonical_profile(self.config['profile'])
         return (_is_browser(args) and Path(process.exe()).resolve()==Path(self.config['core']).resolve()
-                and any(os.path.normcase(os.path.abspath(value.strip('"')))==expected
+                and any(_canonical_profile(value.strip('"'))==expected
                         for value in _switch_values(args,'--user-data-dir') if value)
                 and verify_running_proxy_args(args,self.state['port'])
                 and '--fingerprint-config='+self.config['fingerprint'] in args)

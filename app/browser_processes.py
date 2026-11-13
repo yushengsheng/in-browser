@@ -100,18 +100,38 @@ class ProfileProcessSnapshot:
 def profile_processes(profile: Path, *, require_inspectable=False):
     expected = _canonical_profile(profile)
     result = []
-    for process in psutil.process_iter(['pid', 'cmdline', 'exe', 'create_time', 'name']):
-        try:
-            args = process.info['cmdline'] or []
-            if require_inspectable and not args and (
-                    str(process.info.get('name') or '').casefold() == 'bitbrowser.exe' or
-                    Path(process.info.get('exe') or '').name.casefold() == 'bitbrowser.exe'):
+    for process in psutil.process_iter(['pid', 'cmdline']):
+        # Iterator objects are shared by psutil; another scan can replace .info.
+        info = dict(process.info)
+        args = info['cmdline'] or []
+        if require_inspectable and not args:
+            try:
+                details = process.as_dict(attrs=['name', 'exe'])
+            except psutil.NoSuchProcess:
+                continue
+            if (str(details.get('name') or '').casefold() == 'bitbrowser.exe' or
+                    Path(details.get('exe') or '').name.casefold() == 'bitbrowser.exe'):
                 raise LocalBrowserError('无法核对某个比特内核的运行状态，请先正常关闭来源浏览器窗口后重试。')
-            if any(_canonical_profile(value.strip('"')) == expected
-                   for value in _switch_values(args, '--user-data-dir') if value):
-                result.append(process)
+        try:
+            matches = any(_canonical_profile(value.strip('"')) == expected
+                          for value in _switch_values(args, '--user-data-dir') if value)
         except (psutil.Error, OSError, ValueError):
             continue
+        if not matches:
+            continue
+        try:
+            current = psutil.Process(process.pid)
+            details = current.as_dict(attrs=['pid', 'cmdline', 'exe', 'create_time', 'name'])
+        except psutil.NoSuchProcess:
+            continue
+        current_args = details.get('cmdline')
+        # Unreadable metadata cannot turn an observed owner into a free profile.
+        # Recheck readable arguments before returning an independent Process.
+        if current_args and not any(_canonical_profile(value.strip('"')) == expected
+                                    for value in _switch_values(current_args, '--user-data-dir') if value):
+            continue
+        current.info = details
+        result.append(current)
     return result
 
 

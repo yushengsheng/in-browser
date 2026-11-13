@@ -96,6 +96,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Candidate download failed' }
           python tools/release_archive.py --archive (Join-Path $env:IB_WORK $env:ASSET_NAME) --sha256 $env:ARCHIVE_SHA256 --destination $package --source-root $env:GITHUB_WORKSPACE --report (Join-Path $reports 'archive.json')
           if ($LASTEXITCODE -ne 0) { throw 'Candidate archive or source verification failed' }
+          $archiveReport = Get-Content -LiteralPath (Join-Path $reports 'archive.json') -Raw | ConvertFrom-Json
+          if (-not $archiveReport.success -or -not $archiveReport.program_root) { throw 'Verified program root missing' }
+          # This is an isolated fixture target, not the normal user-data root.
+          "IB_PROGRAM=$($archiveReport.program_root)" | Out-File -FilePath $env:GITHUB_ENV -Append
           "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Authenticate and load this core's synthetic source-device fixture
         id: fixture
@@ -109,7 +113,7 @@ jobs:
         run: |
           gh release download $env:FIXTURE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:FIXTURE_ASSET --dir $env:IB_WORK 2>$null
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic core fixture download failed' }
-          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/unpack_core_fixture.py" --manifest "$env:GITHUB_WORKSPACE/.github/all-core-fixtures.json" --archive (Join-Path $env:IB_WORK $env:FIXTURE_ASSET) --core $env:CORE --package $env:IB_PACKAGE --report "$env:IB_REPORTS/fixture.json"
+          & "$env:IB_PROGRAM/runtime/python/python.exe" -B "$env:IB_PROGRAM/tools/unpack_core_fixture.py" --manifest "$env:GITHUB_WORKSPACE/.github/all-core-fixtures.json" --archive (Join-Path $env:IB_WORK $env:FIXTURE_ASSET) --core $env:CORE --package $env:IB_PROGRAM --report "$env:IB_REPORTS/fixture.json"
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic core fixture verification failed' }
           "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Require production migration without replacing the source baseline
@@ -118,10 +122,10 @@ jobs:
           CORE: ${{ matrix.fixture.core }}
         shell: pwsh
         run: |
-          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/verify_all_core_device.py" --execute --core $env:CORE
+          & "$env:IB_PROGRAM/runtime/python/python.exe" -B "$env:IB_PROGRAM/tools/verify_all_core_device.py" --execute --core $env:CORE
           $status = $LASTEXITCODE
           foreach ($name in @('all-core-device.json', 'login-storage.json', 'portable-device.json')) {
-            $path = Join-Path "$env:IB_PACKAGE/analysis/reports" $name
+            $path = Join-Path "$env:IB_PROGRAM/analysis/reports" $name
             if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination (Join-Path $env:IB_REPORTS $name) }
           }
           if ($status -ne 0) { throw 'Production source-device migration acceptance failed' }
@@ -131,9 +135,9 @@ jobs:
           CORE: ${{ matrix.fixture.core }}
         shell: pwsh
         run: |
-          & "$env:IB_PACKAGE/runtime/python/python.exe" -B "$env:IB_PACKAGE/tools/compare_vendor_runtime.py" --execute --core $env:CORE
+          & "$env:IB_PROGRAM/runtime/python/python.exe" -B "$env:IB_PROGRAM/tools/compare_vendor_runtime.py" --execute --core $env:CORE
           $status = $LASTEXITCODE
-          $path = "$env:IB_PACKAGE/analysis/reports/vendor-runtime-comparison.json"
+          $path = "$env:IB_PROGRAM/analysis/reports/vendor-runtime-comparison.json"
           if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination "$env:IB_REPORTS/vendor-runtime-comparison.json" }
           if ($status -ne 0) { throw 'Stock and independent runtime comparison failed' }
       - name: Preserve anonymous evidence even when a production gate rejects the core

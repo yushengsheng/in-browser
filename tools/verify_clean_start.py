@@ -74,7 +74,11 @@ def _prepare(work):
 
 
 def _environment(work, python):
-    env = {key: os.environ[key] for key in ('SystemRoot', 'WINDIR', 'COMSPEC') if key in os.environ}
+    platform = ('SystemRoot', 'WINDIR', 'COMSPEC', 'SystemDrive', 'ProgramFiles', 'ProgramFiles(x86)',
+                'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432',
+                'ProgramData', 'ALLUSERSPROFILE', 'PUBLIC', 'OS', 'PROCESSOR_ARCHITECTURE',
+                'PROCESSOR_IDENTIFIER', 'PROCESSOR_LEVEL', 'PROCESSOR_REVISION', 'NUMBER_OF_PROCESSORS')
+    env = {key: os.environ[key] for key in platform if key in os.environ}
     for key, name in (('APPDATA', 'roaming'), ('LOCALAPPDATA', 'local'),
                       ('USERPROFILE', 'user'), ('HOME', 'user'), ('TEMP', 'temp'), ('TMP', 'temp')):
         path = work / 'environment' / name
