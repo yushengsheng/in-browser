@@ -20,6 +20,7 @@ def dispatch(service,action,payload=None):
             from window_layout import arrange
             result=arrange(service)
         elif action=='sync_preview':result=service.synchronizer().preview()
+        elif action=='sync_preview_metadata':result=service.synchronizer().preview_metadata(payload.get('preview_id'))
         elif action=='sync_windows':result=service.synchronizer().start(payload.get('source_keys'),preview_id=payload.get('preview_id'))
         elif action=='sync_status':result=service.synchronizer().status(payload['job_id'],after=payload.get('after'),missing_ok=payload.get('missing_ok') is True)
         elif action=='cancel_sync':result=service.synchronizer().cancel(payload['job_id'])
@@ -45,6 +46,7 @@ def dispatch(service,action,payload=None):
         elif action=='close': result=service.close(payload['id'])
         elif action=='activate': result=service.activate(payload['id'])
         elif action=='delete': result=service.delete(payload['id'])
+        elif action=='clear_cache': result=service.clear_cache(payload.get('ids'))
         elif action=='archive': result=service.archive(payload['id'])
         elif action=='restore': result=service.archive(payload['id'],True)
         elif action=='batch':
@@ -89,5 +91,7 @@ def dispatch(service,action,payload=None):
         return {'ok':True,'data':result}
     except LocalBrowserError as exc: return {'ok':False,'error':str(exc)}
     except Exception:
+        if action=='clear_cache':
+            return {'ok':False,'error':'缓存清理未完成，部分缓存可能已清理；请查看结果并重试。'}
         message='永久删除尚未完成，部分资料可能已清理；请重试或重启继续清理。' if action=='delete' or action=='batch' and payload.get('action')=='delete' else '操作未完成，原有资料和配置已保留。请检查网络、文件占用或输入内容。'
         return {'ok':False,'error':message}

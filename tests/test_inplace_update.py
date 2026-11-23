@@ -11,7 +11,6 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -19,9 +18,9 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_RUNS = ROOT / 'analysis/test-runs'
 PACKAGE_ID = '0123456789abcdef0123456789abcdef'
-sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tools')]
+sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tools'), str(ROOT / 'tests')]
+from retained_fixture import new_scope, report_checks, test_name
 sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location('synthetic_inplace_update', ROOT / 'tools/inplace_update.py')
 updater = importlib.util.module_from_spec(SPEC)
@@ -50,32 +49,14 @@ def snapshot(root):
 
 @contextmanager
 def fixture():
-    TEST_RUNS.mkdir(parents=True, exist_ok=True)
-    temporary = tempfile.TemporaryDirectory(prefix='inplace-update-', dir=TEST_RUNS)
-    scope = Path(temporary.name)
-    owner = {'pid': os.getpid(), 'scope': str(scope), 'purpose': 'synthetic-inplace-update'}
-    marker = scope / '.fixture-owner.json'
-    marker.write_text(json.dumps(owner), 'utf-8')
+    scope = new_scope(ROOT, prefix='inplace-update-', purpose='synthetic-inplace-update')
     try:
         yield scope
     finally:
-        # Synchronous children only create junctions or import synthetic public
-        # modules. All have exited; no browser or application worker is launched.
+        # Keep process-lifetime verification even though the files are retained.
         import psutil
-        safe = not psutil.Process().children(recursive=True)
-        safe = safe and scope.resolve().parent == TEST_RUNS.resolve()
-        safe = safe and json.loads(marker.read_text('utf-8')) == owner
-        for current, directories, files in os.walk(scope, followlinks=False):
-            for name in (*directories, *files):
-                info = (Path(current) / name).lstat()
-                safe = safe and not stat.S_ISLNK(info.st_mode)
-                safe = safe and not getattr(info, 'st_file_attributes', 0) & 0x400
-        if not safe:
-            temporary._finalizer.detach()
-            raise AssertionError('synthetic_cleanup_boundary_refused')
-        temporary.cleanup()
-        if scope.exists():
-            raise AssertionError('synthetic_cleanup_incomplete')
+        if psutil.Process().children(recursive=True):
+            raise AssertionError('synthetic_test_process_still_running')
 
 
 def manifest(root):
@@ -163,14 +144,6 @@ class Interrupted(BaseException):
 
 
 class InplaceUpdate(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        with fixture() as scope:
-            probe = scope
-            write(scope / 'nested/small.txt', b'cleanup probe')
-        if probe.exists():
-            raise AssertionError('synthetic_cleanup_probe_failed')
-
     def assert_protected(self, target, before):
         for name, expected in before.items():
             self.assertEqual(snapshot(target / name), expected, name)
@@ -238,6 +211,95 @@ class InplaceUpdate(unittest.TestCase):
                 updater.update(source, target)
             updater.verify_release(target)
             self.assertFalse((target / 'app/retired.py').exists())
+
+    def test_runtime_upgrade_keeps_legacy_caches_in_backup_without_reading_them(self):
+        with fixture() as scope:
+            source, target = pair(scope)
+            relative = Path('python/site-packages/__pycache__')
+            for name in ('current', 'retired'):
+                write(target / 'runtime' / relative / (name + '.cpython-313.pyc'), b'synthetic old cache')
+            caches = snapshot(target / 'runtime' / relative)
+            expected = updater.subset(updater._manifest(target), 'runtime')
+            self.assertNotEqual(updater.inventory_tree(target / 'runtime'), expected)
+            protected = self.protected(target)
+            original = updater.file_item
+            def without_cache_reads(path):
+                self.assertNotEqual(path.suffix, '.pyc')
+                return original(path)
+            with synthetic_data_check(), patch.object(updater, 'file_item', side_effect=without_cache_reads):
+                result = updater.update(source, target)
+            self.assertEqual(snapshot(target / result['backup'] / 'backup/runtime' / relative), caches)
+            self.assertFalse((target / 'runtime' / relative).exists())
+            self.assertEqual((target / 'runtime/python/site-packages/current.py').read_bytes(),
+                             (source / 'runtime/python/site-packages/current.py').read_bytes())
+            self.assert_protected(target, protected)
+            updater.verify_release(target)
+
+    def test_interrupted_runtime_upgrade_and_recovery_preserve_legacy_cache_identity(self):
+        for phase in ('after_move_old', 'after_publish'):
+            with self.subTest(phase=phase), fixture() as scope:
+                source, target = pair(scope)
+                cache = target / 'runtime/python/site-packages/__pycache__/current.cpython-313.pyc'
+                write(cache, b'synthetic old cache')
+                before = public_bytes(target);caches = snapshot(cache.parent)
+                protected = self.protected(target)
+                def stop(current, relative):
+                    if current == phase and relative == 'runtime':raise Interrupted()
+                with synthetic_data_check(), self.assertRaises(Interrupted):
+                    updater.update(source, target, hook=stop)
+                if phase == 'after_publish':
+                    def stop_recovery(current, relative):
+                        if current == 'after_restore' and relative == 'runtime':raise Interrupted()
+                    with synthetic_data_check(), self.assertRaises(Interrupted):
+                        updater.recover(source, target, hook=stop_recovery)
+                with synthetic_data_check():updater.recover(source, target)
+                self.assertEqual(public_bytes(target), before)
+                self.assertEqual(snapshot(cache.parent), caches)
+                self.assert_protected(target, protected)
+                self.assertFalse((target / updater.PENDING).exists())
+                updater.verify_release(target)
+
+    def test_runtime_cache_exception_keeps_source_inventory_and_link_checks_strict(self):
+        with fixture() as scope:
+            source, target = pair(scope)
+            runtime = target / 'runtime';cache = runtime / 'python/site-packages/__pycache__'
+            write(cache / 'current.cpython-313.pyc', b'synthetic old cache')
+            expected = updater.subset(updater._manifest(target), 'runtime')
+            self.assertTrue(updater.matches(runtime, expected, 'tree'))
+            self.assertIn('python/site-packages/__pycache__/current.cpython-313.pyc',
+                          updater.inventory_tree(runtime))
+            for name in ('orphan.cpython-313.pyc', 'current.py', 'current.cpython-313.opt-3.pyc'):
+                extra = cache / name;write(extra, b'unrecognized cache content')
+                try:
+                    with self.assertRaises(ValueError):updater.matches(runtime, expected, 'tree')
+                finally:extra.unlink()
+            ordinary_source = runtime / 'python/site-packages/current.py'
+            original = ordinary_source.read_bytes()
+            ordinary_source.write_bytes(b'modified source')
+            self.assertFalse(updater.matches(runtime, expected, 'tree'))
+            ordinary_source.write_bytes(original)
+            outside = scope / 'preserved-cache';cache.rename(outside)
+            before = snapshot(outside)
+            try:
+                with self.junction(cache, outside), self.assertRaises(ValueError):
+                    updater.matches(runtime, expected, 'tree')
+                self.assertEqual(snapshot(outside), before)
+            finally:outside.rename(cache)
+
+    def test_recovery_refuses_orphan_cache_added_to_runtime_backup(self):
+        with fixture() as scope:
+            source, target = pair(scope)
+            write(target / 'runtime/python/site-packages/__pycache__/current.cpython-313.pyc', b'old cache')
+            def stop(phase, relative):
+                if phase == 'after_publish' and relative == 'runtime':raise Interrupted()
+            with synthetic_data_check(), self.assertRaises(Interrupted):
+                updater.update(source, target, hook=stop)
+            work = target / updater.PENDING
+            write(work / 'backup/runtime/python/site-packages/__pycache__/orphan.cpython-313.pyc', b'unknown')
+            before = snapshot(target)
+            with synthetic_data_check(), self.assertRaises(updater.UpdateError):updater.recover(source, target)
+            self.assertEqual(snapshot(target), before)
+            self.assertTrue(work.exists())
 
     def test_version_downgrade_same_version_and_non_plain_semver_are_rejected(self):
         for version in ('0.2.6', '0.2.7', '0.2.8-rc1', 'v0.2.8', '01.2.8', '0.2.8+meta'):
@@ -677,6 +739,7 @@ class InplaceUpdate(unittest.TestCase):
         if os.name == 'nt':
             result = subprocess.run([os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/c',
                                      'mklink', '/J', str(link), str(destination)],
+                                    cwd=link.parent, env={**os.environ, 'TEMP': str(link.parent), 'TMP': str(link.parent)},
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, timeout=10,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
@@ -745,12 +808,11 @@ if __name__ == '__main__':
     # Keep synthetic failure diagnostics bounded and free of private paths.
     stream = io.StringIO()
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(InplaceUpdate)
-    names = [test._testMethodName for test in suite]
+    names = [test_name(test) for test in suite]
     result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
-    failed = {getattr(test, 'test_case', test)._testMethodName
-              for test, _ in result.failures + result.errors}
+    checks, failed = report_checks(names, result)
     print(json.dumps({'success': result.wasSuccessful(), 'tests': result.testsRun,
-                      'checks': {name: name not in failed for name in names},
+                      'checks': checks,
                       'failed': sorted(failed)}))
     print('Ran {} tests in synthetic fixtures'.format(result.testsRun), file=sys.stderr)
     print('OK' if result.wasSuccessful() else 'FAILED (failures={}, errors={})'.format(

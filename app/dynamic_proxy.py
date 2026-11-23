@@ -1,9 +1,16 @@
 """Bounded, explicit proxy-provider extraction for locally created windows."""
-import json
 import os
 from pathlib import Path
-import subprocess
 import sys
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+    # A fresh interpreter must neither write caches nor reuse older bytecode.
+    sys.pycache_prefix = str(Path(__file__).resolve().parents[1] /
+                            ('.program-no-cache-' + os.urandom(16).hex()))
+
+import json
+import subprocess
 import threading
 from urllib.parse import urlsplit
 

@@ -1,4 +1,14 @@
 """Per-window loopback proxy workers; upstream credentials never enter argv."""
+import os
+from pathlib import Path
+import sys
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+    # A fresh interpreter must neither write caches nor reuse older bytecode.
+    sys.pycache_prefix = str(Path(__file__).resolve().parents[1] /
+                            ('.program-no-cache-' + os.urandom(16).hex()))
+
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -8,14 +18,11 @@ from ctypes import wintypes
 import hashlib
 import hmac
 import json
-import os
-from pathlib import Path
 import re
 import secrets
 import socket
 import ssl
 import subprocess
-import sys
 import threading
 import time
 from urllib.parse import urlsplit

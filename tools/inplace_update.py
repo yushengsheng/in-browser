@@ -216,7 +216,7 @@ def check_closed(base, target):
             time.sleep(0.2)
 
 
-def inventory_tree(folder):
+def inventory_tree(folder, *, runtime_sources=None):
     _ordinary(folder, directory=True)
     result = {}
     pending = [folder]
@@ -227,7 +227,12 @@ def inventory_tree(folder):
                 path = Path(entry.path)
                 info = _ordinary(path)
                 if stat.S_ISDIR(info.st_mode):
-                    pending.append(path)
+                    relative = path.relative_to(folder).as_posix()
+                    if (runtime_sources is not None and relative.startswith('python/')
+                            and path.name == '__pycache__'):
+                        update_guard._check_runtime_cache(folder, path, runtime_sources)
+                    else:
+                        pending.append(path)
                 else:
                     result[path.relative_to(folder).as_posix()] = file_item(path)
                 require(len(result) <= 40000, 'resource_limit')
@@ -410,7 +415,8 @@ def matches(path, expected, kind):
         return expected is None
     if expected is None:
         return False
-    return (inventory_tree(path) if kind == 'tree' else file_item(path)) == expected
+    # Only runtime operations use tree matching, including staged and backup trees.
+    return (inventory_tree(path, runtime_sources=expected) if kind == 'tree' else file_item(path)) == expected
 
 
 def stage(base, target, work, old_files, new_files, operations, deadline):

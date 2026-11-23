@@ -1,4 +1,4 @@
-"""Normal-launch preparation with disposable releases and synthetic data only."""
+"""Normal-launch preparation with retained releases and synthetic data only."""
 import json
 import os
 from pathlib import Path
@@ -76,6 +76,31 @@ class PortableBootstrap(unittest.TestCase):
                 self.assertEqual(bootstrap.prepare(source, target)['mode'], 'current')
             for name, before in protected.items():
                 self.assertEqual(snapshot(target / name), before)
+
+    def test_reopen_with_legacy_worker_cache_preserves_data_and_same_package(self):
+        with fixture() as scope:
+            source,target=fresh_pair(scope)
+            self.assertEqual(bootstrap.prepare(source,target)['mode'],'installed')
+            write(target/'app/data/synthetic-account.bin',b'preserve synthetic data')
+            cache=target/'runtime/python/site-packages/__pycache__/current.cpython-313.pyc'
+            write(cache,b'legacy worker cache, never read')
+            before=snapshot(target)
+            for _ in range(2):
+                self.assertEqual(bootstrap.prepare(source,target)['mode'],'current')
+                self.assertEqual(snapshot(target),before)
+            write(cache.parent/'orphan.cpython-313.pyc',b'unknown module')
+            with self.assertRaises(Exception):bootstrap.prepare(source,target)
+            self.assertEqual((target/'app/data/synthetic-account.bin').read_bytes(),b'preserve synthetic data')
+
+    def test_upgrade_from_legacy_worker_cache_preserves_protected_data(self):
+        with fixture() as scope:
+            source,target=complete_payload(*overlay_pair(scope))
+            write(target/'runtime/python/site-packages/__pycache__/current.cpython-313.pyc',b'legacy unused cache')
+            protected={name:snapshot(target/name) for name in ('app/data','app/local-engines','app/engines')}
+            with synthetic_data_check():
+                self.assertEqual(bootstrap.prepare(source,target)['mode'],'updated')
+            self.assertEqual(bootstrap.prepare(source,target)['mode'],'current')
+            for name,before in protected.items():self.assertEqual(snapshot(target/name),before)
 
     def test_incomplete_payload_never_changes_existing_target(self):
         for missing in ('release-manifest.json', 'update-policy.json',
@@ -209,7 +234,8 @@ raise SystemExit(85)
                 payload_before = snapshot(source)
                 result = subprocess.run([sys.executable, '-B', '-c', child, str(tests),
                                          str(tests.parent / 'tools'), str(source), str(target), str(stop)],
-                                        capture_output=True, timeout=30,
+                                        capture_output=True, timeout=30, cwd=scope,
+                                        env={**os.environ, 'TEMP': str(scope), 'TMP': str(scope)},
                                         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 self.assertEqual(result.returncode, 84)
                 self.assertEqual(bootstrap.prepare(source, target)['mode'], 'installed')

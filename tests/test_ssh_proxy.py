@@ -1,5 +1,7 @@
 """Authenticated SSH forwarding against loopback fixtures only."""
 import asyncio
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -27,14 +29,26 @@ class Server(asyncssh.SSHServer):
 
 
 class SSHProxyTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        base=ROOT/'测试文件夹';base.mkdir(exist_ok=True)
+        cls.run_root=Path(tempfile.mkdtemp(prefix='ssh-proxy-',dir=base))
+        (cls.run_root/'owner.json').write_text(json.dumps({
+            'purpose':'synthetic-ssh-proxy','pid':os.getpid(),
+            'retained_for_user_deletion':True}),encoding='utf-8')
+
     async def asyncSetUp(self):
+        self.root=self.run_root/self._testMethodName;self.root.mkdir()
         # AsyncSSH also obtains a local display name even with an explicit remote user.
-        self.environment=patch.dict('os.environ',{'USERNAME':'synthetic'});self.environment.start()
+        self.environment=patch.dict('os.environ',{'USERNAME':'synthetic','TEMP':str(self.root),'TMP':str(self.root)});self.environment.start()
         self.addCleanup(self.environment.stop)
-        self.temporary=tempfile.TemporaryDirectory(prefix='ssh-proxy-')
-        self.root=Path(self.temporary.name);PortableVault(self.root).initialize()
+        # Password fixtures do not use GSS. Resolving the machine's FQDN can
+        # block configuration reload before authentication, outside our server.
+        self.fqdn=patch('asyncssh.connection.socket.getfqdn',side_effect=AssertionError('Loopback SSH must not resolve the host FQDN'))
+        self.fqdn.start();self.addCleanup(self.fqdn.stop)
+        PortableVault(self.root).initialize()
         self.key=asyncssh.generate_private_key('ssh-ed25519')
-        self.ssh=await asyncssh.create_server(Server,'127.0.0.1',0,server_host_keys=[self.key])
+        self.ssh=await asyncssh.create_server(Server,'127.0.0.1',0,server_host_keys=[self.key],gss_host=None)
         self.proxy={'type':'ssh','host':'127.0.0.1','port':self.ssh.get_port(),'username':'fixture','password':'synthetic'}
         self.worker=Worker(self.root,{'proxy':self.proxy,'identity':'fixture','instance':'fixture'})
         self.relay=await asyncio.start_server(self.worker.handle,'127.0.0.1',0)
@@ -54,7 +68,7 @@ class SSHProxyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(self.worker.handlers),return_exceptions=True)
         if self.worker.ssh_connector:await self.worker.ssh_connector.close()
         self.worker.browser_checks.shutdown()
-        self.ssh.close();await self.ssh.wait_closed();self.temporary.cleanup()
+        self.ssh.close();await self.ssh.wait_closed()
 
     async def request(self,*,connect=False):
         port=self.origin.sockets[0].getsockname()[1]
@@ -95,7 +109,7 @@ class SSHProxyTests(unittest.IsolatedAsyncioTestCase):
         await self.worker.ssh_connector.close()
         port=self.ssh.get_port();self.ssh.close();await self.ssh.wait_closed()
         self.ssh=await asyncssh.create_server(Server,'127.0.0.1',port,
-            server_host_keys=[asyncssh.generate_private_key('ssh-ed25519')])
+            server_host_keys=[asyncssh.generate_private_key('ssh-ed25519')],gss_host=None)
         self.assertIn(b'502',await self.request())
         self.assertEqual(len(self.received),1)
         self.assertEqual((self.root/'fixture.ssh-hosts.bin').read_bytes(),pin)

@@ -21,7 +21,7 @@ _ID = re.compile(r'[a-fA-F0-9]{32}')
 _VERSION = re.compile(r'([0-9]{2,3})\.[0-9]+\.[0-9]+\.[0-9]+')
 _CHANGED_ERROR = '来源资料或配置已变化，请重新点击同步窗口；尚未复制此来源。'
 _METADATA_NOTE = '名称和备注暂不可读取，请检查比特登录及网络后重新检测；尚未复制资料。'
-_METADATA_PENDING_NOTE = '本轮尚未读到名称和备注，请重新检测以继续读取；尚未复制资料。'
+_METADATA_PENDING_NOTE = '名称、编号和备注正在分批读取；尚未复制资料。'
 
 
 def _reparse(path):
@@ -185,7 +185,7 @@ class BitSource:
         except OSError:
             raise LocalBrowserError('无法枚举原客户端本机资料；原窗口和资料未改动。') from None
 
-    def preview_metadata(self, candidates):
+    def preview_metadata(self, candidates, *, retain_cached=False):
         """Display-only details; never prepare sources or change import candidates."""
         def fields(info, identity):
             if (not isinstance(info, dict) or not isinstance(info.get('id'), str)
@@ -200,7 +200,7 @@ class BitSource:
         now = time.monotonic(); deadline = now + 10
         keys = {candidate['source_key'] for candidate in candidates}
         recent = {key: value for key, value in getattr(self, '_preview_labels', {}).items()
-                  if key in keys and 0 <= now - value[0] < 600}
+                  if (retain_cached or key in keys) and 0 <= now - value[0] < 600}
         self._preview_labels = recent
         for candidate in candidates:
             identity = candidate['source_id']; key = candidate['source_key']
@@ -228,7 +228,7 @@ class BitSource:
                     raise LocalBrowserError(_METADATA_NOTE)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    results[key] = dict(cached or {}, metadata_note=_METADATA_PENDING_NOTE)
+                    results[key] = dict(cached or {}, metadata_note=_METADATA_PENDING_NOTE, metadata_pending=True)
                     continue
                 detail = reader.source_detail(identity, timeout=min(3, remaining))
                 display = fields(detail, identity)

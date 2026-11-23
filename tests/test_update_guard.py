@@ -14,14 +14,14 @@ import runpy
 import stat
 import subprocess
 import sys
-import tempfile
 import types
 import unittest
 from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_RUNS = ROOT / 'analysis/test-runs'
+sys.path.insert(0, str(ROOT / 'tests'))
+from retained_fixture import new_scope, report_checks, test_name
 SPEC = importlib.util.spec_from_file_location('synthetic_update_guard', ROOT / 'app/update_guard.py')
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
@@ -29,30 +29,7 @@ SPEC.loader.exec_module(guard)
 
 @contextmanager
 def fixture():
-    TEST_RUNS.mkdir(parents=True, exist_ok=True)
-    temporary = tempfile.TemporaryDirectory(prefix='update-guard-', dir=TEST_RUNS)
-    base = Path(temporary.name)
-    owner = {'pid': os.getpid(), 'root': str(base), 'fixture': 'update-guard'}
-    marker = base / '.fixture-owner.json'
-    marker.write_text(json.dumps(owner), 'utf-8')
-    try:
-        yield base
-    finally:
-        # Every subprocess used here has synchronously exited. No browser or
-        # application worker is created by this fixture.
-        safe = base.resolve().parent == TEST_RUNS.resolve()
-        safe = safe and json.loads(marker.read_text('utf-8')) == owner
-        for current, directories, files in os.walk(base, followlinks=False):
-            for name in (*directories, *files):
-                info = (Path(current) / name).lstat()
-                safe = safe and not stat.S_ISLNK(info.st_mode)
-                safe = safe and not getattr(info, 'st_file_attributes', 0) & 0x400
-        if not safe:
-            temporary._finalizer.detach()
-            raise AssertionError('synthetic_cleanup_boundary_refused')
-        temporary.cleanup()
-        if base.exists():
-            raise AssertionError('synthetic_cleanup_incomplete')
+    yield new_scope(ROOT, prefix='update-guard-', purpose='synthetic-update-guard')
 
 
 def release(base, *, policy=False):
@@ -84,16 +61,6 @@ def save_manifest(root, files):
 
 
 class StartupGuard(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        # The first use checks creation, writing, nesting and automatic cleanup.
-        with fixture() as base:
-            probe = base
-            (base / 'nested').mkdir()
-            (base / 'nested/small.txt').write_text('synthetic cleanup probe', 'utf-8')
-        if probe.exists():
-            raise AssertionError('synthetic_cleanup_probe_failed')
-
     def rejected(self, root):
         with self.assertRaises(guard.UpdateGuardError):
             guard.verify_release(root)
@@ -263,6 +230,47 @@ class StartupGuard(unittest.TestCase):
             with patch.object(guard.os, 'scandir', side_effect=no_cache_read):
                 self.assertEqual(guard.verify_release(root)['files'], files)
 
+    def test_legacy_runtime_cache_only_for_manifest_sources_is_kept_without_reading(self):
+        with fixture() as base:
+            root,files=release(base)
+            source=root/'runtime/python/site-packages/synthetic.py'
+            source.parent.mkdir(parents=True,exist_ok=True);raw=b'VALUE=1\n';source.write_bytes(raw)
+            files[source.relative_to(root).as_posix()]={'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
+            save_manifest(root,files)
+            cache=source.parent/'__pycache__';cache.mkdir()
+            paths=[cache/('synthetic.cpython-313'+suffix+'.pyc') for suffix in ('','.opt-1','.opt-2')]
+            for path in paths:path.write_bytes(b'legacy bytecode, must never be loaded')
+            original=Path.open
+            def no_cache_read(path,*args,**kwargs):
+                self.assertNotIn(path,paths)
+                return original(path,*args,**kwargs)
+            with patch.object(Path,'open',no_cache_read):
+                self.assertEqual(guard.verify_release(root)['files'],files)
+            self.assertTrue(all(path.read_bytes()==b'legacy bytecode, must never be loaded' for path in paths))
+            source.write_bytes(b'VALUE=2\n')
+            self.rejected(root)
+
+    def test_runtime_cache_rejects_orphans_extra_files_directories_and_links(self):
+        for name in ('synthetic.pyc','synthetic.py','synthetic.cpython-313.pyc',
+                     'synthetic.cpython-313.opt-3.pyc','nested'):
+            with self.subTest(name=name),fixture() as base:
+                root,_=release(base);cache=root/'runtime/python/site-packages/__pycache__'
+                cache.mkdir(parents=True)
+                if name=='nested':(cache/name).mkdir()
+                else:(cache/name).write_bytes(b'synthetic unknown extra')
+                self.rejected(root)
+
+    def test_runtime_cache_junction_is_rejected_without_following_it(self):
+        with fixture() as base:
+            root,_=release(base);parent=root/'runtime/python/site-packages'
+            parent.mkdir(parents=True,exist_ok=True)
+            outside=base/'unrelated-cache';outside.mkdir()
+            marker=outside/'preserve.txt';marker.write_bytes(b'not part of program')
+            link=parent/'__pycache__'
+            self.junction(link,outside)
+            self.rejected(root)
+            self.assertEqual(marker.read_bytes(),b'not part of program')
+
     def test_private_trees_inventory_and_legacy_cache_are_never_enumerated(self):
         with fixture() as base:
             root, _ = release(base)
@@ -334,6 +342,7 @@ class StartupGuard(unittest.TestCase):
     def junction(self, link, target):
         result = subprocess.run([os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/c',
                                  'mklink', '/J', str(link), str(target)],
+                                cwd=link.parent, env={**os.environ, 'TEMP': str(link.parent), 'TMP': str(link.parent)},
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=10)
         self.assertEqual(result.returncode, 0, 'synthetic_junction_creation_failed')
@@ -345,31 +354,18 @@ class StartupGuard(unittest.TestCase):
             original = root / 'app/ui'
             moved = base / 'ui-original'
             original.rename(moved)
-            linked = False
-            try:
-                self.junction(original, moved)
-                linked = True
-                self.rejected(root)
-            finally:
-                if linked:
-                    os.rmdir(original)
-                moved.rename(original)
+            self.junction(original, moved)
+            self.rejected(root)
 
     def test_broken_update_marker_junction_still_blocks(self):
         with fixture() as base:
             marker, target = base / '.program-update', base / 'original'
             target.mkdir()
-            linked = False
-            try:
-                self.junction(marker, target)
-                linked = True
-                target.rmdir()
-                self.assertFalse(marker.exists())
-                with self.assertRaises(guard.UpdateGuardError):
-                    guard.require_complete_installation(base)
-            finally:
-                if linked:
-                    os.rmdir(marker)
+            self.junction(marker, target)
+            target.rmdir()
+            self.assertFalse(marker.exists())
+            with self.assertRaises(guard.UpdateGuardError):
+                guard.require_complete_installation(base)
 
     def test_direct_entry_and_self_check_block_before_business_imports(self):
         original_import = builtins.__import__
@@ -430,12 +426,10 @@ class StartupGuard(unittest.TestCase):
                 launcher = base / 'start.cmd'
                 launcher.write_bytes(raw)
                 marker = base / '.program-update'
-                linked = False
                 if marker_type == 'broken_junction':
                     target = base / 'original'
                     target.mkdir()
                     self.junction(marker, target)
-                    linked = True
                     target.rmdir()
                 elif marker_type == 'directory':
                     marker.mkdir()
@@ -446,22 +440,18 @@ class StartupGuard(unittest.TestCase):
                 env.update(TEMP=str(base), TMP=str(base))
                 command = '"{}" /d /v:off /s /c ""{}""'.format(
                     os.environ.get('COMSPEC', 'cmd.exe'), launcher)
-                try:
-                    result = subprocess.run(command, cwd=base, env=env,
-                                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, timeout=10)
-                    self.assertEqual(result.returncode, 1)
-                    if package:
-                        # Overlay entries need their payload to recover a pending
-                        # update; direct entries must reject it before runtime checks.
-                        self.assertIn(b'Incomplete package.', result.stdout)
-                    else:
-                        self.assertIn(b'Program update is incomplete', result.stdout)
-                    self.assertNotIn(b'Portable runtime is incomplete', result.stdout)
-                    self.assertFalse((base / 'app').exists())
-                finally:
-                    if linked:
-                        os.rmdir(marker)
+                result = subprocess.run(command, cwd=base, env=env,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                if package:
+                    # Overlay entries need their payload to recover a pending
+                    # update; direct entries must reject it before runtime checks.
+                    self.assertIn(b'Incomplete package.', result.stdout)
+                else:
+                    self.assertIn(b'Program update is incomplete', result.stdout)
+                self.assertNotIn(b'Portable runtime is incomplete', result.stdout)
+                self.assertFalse((base / 'app').exists())
 
 
 if __name__ == '__main__':
@@ -471,11 +461,10 @@ if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(StartupGuard)
     names = [test.id().rsplit('.', 1)[-1] for test in suite]
     result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
-    failed = {getattr(test, 'test_case', test)._testMethodName
-              for test, _ in result.failures + result.errors}
-    skipped = {getattr(test, 'test_case', test)._testMethodName for test, _ in result.skipped}
-    report = {'success': result.wasSuccessful(), 'checks': {name: name not in failed for name in names},
-              'passed': result.testsRun - len(failed) - len(skipped), 'failed': sorted(failed),
+    checks, failed = report_checks(names, result)
+    skipped = {test_name(test) for test, _ in result.skipped}
+    report = {'success': result.wasSuccessful(), 'checks': checks,
+              'passed': max(0, result.testsRun - len(failed) - len(skipped)), 'failed': sorted(failed),
               'skipped': sorted(skipped), 'real_browser_started': False, 'real_user_data_accessed': False}
     if options.report:
         options.report.parent.mkdir(parents=True, exist_ok=True)

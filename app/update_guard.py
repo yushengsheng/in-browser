@@ -171,6 +171,19 @@ def _verified_file(root, name, expected):
     _require(size == expected['bytes'] and digest.hexdigest() == expected['sha256'])
 
 
+def _check_runtime_cache(root, directory, files):
+    # Workers and launchers redirect cache lookup before importing these modules.
+    # Keep legacy bytecode without treating an orphan or other added code as cache.
+    with os.scandir(directory) as entries:
+        for index,entry in enumerate(entries):
+            _require(index<MAX_FILES)
+            path=Path(entry.path);_ordinary(path,directory=False)
+            match=re.fullmatch(r'(.+)\.cpython-[0-9]{2,3}(?:\.opt-[12])?\.pyc',entry.name)
+            _require(match is not None)
+            source=(directory.parent/(match[1]+'.py')).relative_to(root).as_posix()
+            _require(source in files)
+
+
 def _check_active_files(root, files):
     # Legacy caches are left intact. The entrypoint redirects Python's cache
     # lookup before importing any application module, and writes no new cache.
@@ -194,7 +207,10 @@ def _check_active_files(root, files):
                         continue
                     info = _ordinary(path)
                     if stat.S_ISDIR(info.st_mode):
-                        pending.append(path)
+                        if relative.startswith('runtime/python/') and path.name=='__pycache__':
+                            _check_runtime_cache(root,path,files)
+                        else:
+                            pending.append(path)
                     else:
                         _require(relative in files)
 

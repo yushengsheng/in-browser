@@ -20,6 +20,9 @@ from unittest.mock import patch
 
 HERE=Path(__file__).resolve()
 PURPOSE={'format':1,'synthetic':True,'purpose':'clean-release-acceptance'}
+# Keep the acceptance policy independent from the implementation's allowlist.
+CACHE_DIRECTORIES=('Default/Cache','Default/Code Cache','Default/GPUCache',
+                   'GPUCache','ShaderCache','GrShaderCache','DawnGraphiteCache')
 
 def require(value):
     if not value:raise ValueError()
@@ -74,8 +77,12 @@ def tree(root):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*_):pass
     def do_GET(self):
-        body=b'<!doctype html><title>Synthetic portable contract</title><p>Local synthetic fixture</p>'
-        self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8')
+        cacheable=self.path=='/cache-probe.js'
+        body=(b'window.syntheticCacheReady=true;\n'+b'/* synthetic local cache payload */\n'*4096 if cacheable else
+              b'<!doctype html><title>Synthetic portable contract</title><p>Local synthetic fixture</p>'
+              b'<script src="/cache-probe.js"></script>')
+        self.send_response(200);self.send_header('Content-Type','application/javascript' if cacheable else 'text/html; charset=utf-8')
+        self.send_header('Cache-Control','public, max-age=86400' if cacheable else 'no-cache')
         self.send_header('Content-Length',str(len(body)));self.end_headers()
         try:self.wfile.write(body)
         except OSError:pass
@@ -99,7 +106,8 @@ def phase(args):
     from window_sync import WindowSynchronizer,source_key
     from window_create import WindowCreator
     report={'success':False,'synthetic':True,'phase':args.phase,'rounds':[],'physical_second_machine':False,
-            'physical_external_drive':False,'simulated_other_user':args.phase=='verify','source_api_synthetic':True}
+            'physical_external_drive':False,'simulated_other_user':args.phase=='verify','source_api_synthetic':True,
+            'cache_clear_requested':args.verify_cache,'cache_rounds':[]}
     service=None;active=None;owned=[];alias_checks=[];source_calls=[];continuity_calls=[];prepare_calls=[]
     original_popen=subprocess.Popen;original_verify=fingerprint_continuity.verify_continuity;original_prepare=portable_browser.prepare_profile
     original_short_path=browser_core._short_executable_path
@@ -167,6 +175,49 @@ def phase(args):
             if checks['two_tabs_restored'] or time.monotonic()>=deadline:break
             time.sleep(.1)
         connection.call('Target.detachFromTarget',{'sessionId':session});return checks
+
+    def clear_selected(identity):
+        response=service.request('clear_cache',{'ids':[identity]})
+        require(response.get('ok') is True and isinstance(response.get('data'),dict))
+        result=response['data'];items=result.get('results')
+        require(isinstance(items,list) and len(items)==1 and items[0].get('id')==identity)
+        return result
+
+    def cache_files(snapshot):
+        return {name:value for name,value in snapshot['files'].items()
+                if any(name.startswith(folder+'/') for folder in CACHE_DIRECTORIES)}
+
+    def clear_closed(identity,identities):
+        record=service.store.get(identity);profile=Path(record['_runtime']['profile_path'])
+        require(not profile_processes(profile,require_inspectable=True))
+        before=tree(profile)[0];caches=cache_files(before);require(caches)
+        others={other:tree(Path(service.store.get(other)['_runtime']['profile_path']))[0]
+                for other in identities if other!=identity}
+        require(others)
+        result=clear_selected(identity);after=tree(profile)[0]
+        remaining=cache_files(after)
+        checks={
+            'closed_cache_cleared':result.get('completed')==1 and result.get('skipped')==0 and result.get('failed')==0,
+            'real_browser_cache_present':bool(caches),
+            'removed_file_count_exact':result.get('removed_files')==len(caches),
+            'removed_byte_count_exact':result.get('removed_bytes')==sum(value['size'] for value in caches.values()),
+            'allowed_caches_empty':not remaining,
+            'all_non_cache_files_unchanged':{name:value for name,value in before['files'].items() if name not in caches}
+                                          =={name:value for name,value in after['files'].items() if name not in remaining},
+            'all_directories_retained':before['directories']==after['directories'],
+            'unselected_profiles_unchanged':all(tree(Path(service.store.get(other)['_runtime']['profile_path']))[0]==value
+                                                for other,value in others.items()),
+            'selected_record_unchanged':service.store.get(identity)==record,
+        }
+        require(all(checks.values()))
+        again=clear_selected(identity)
+        checks['second_clear_idempotent']=(again.get('completed')==1 and again.get('skipped')==0 and again.get('failed')==0
+            and again.get('removed_files')==0 and again.get('removed_bytes')==0 and tree(profile)[0]==after)
+        checks['unselected_profiles_still_unchanged']=all(
+            tree(Path(service.store.get(other)['_runtime']['profile_path']))[0]==value for other,value in others.items())
+        require(all(checks.values()))
+        return {'checks':checks,'removed_files':result['removed_files'],'removed_bytes':result['removed_bytes'],
+                'non_cache_files_verified':len(before['files'])-len(caches),'unselected_profiles_verified':len(others)}
 
     started=time.monotonic()
     def trace_create(function):
@@ -269,8 +320,36 @@ def phase(args):
                 records={active:copy.deepcopy(saved),imported:dict(snapshot(service.store.get(imported)),marker=saved['marker'],history=saved['history'],history_index=saved['history_index'])}
                 for identity,expected in records.items():
                     active=identity;service.open(identity,offline_test=True)
-                    with browser_core.CDP(service.controller.endpoint(identity),timeout=8) as connection:checks=observe(connection,service.store.get(identity),expected)
+                    running_checks={}
+                    with browser_core.CDP(service.controller.endpoint(identity),timeout=8) as connection:
+                        checks=observe(connection,service.store.get(identity),expected)
+                        if args.verify_cache:
+                            result=clear_selected(identity)
+                            running_checks={
+                                'running_cleanup_skipped':result.get('skipped')==1 and result.get('completed')==0 and result.get('failed')==0,
+                                'running_cleanup_removed_nothing':result.get('removed_files')==0 and result.get('removed_bytes')==0,
+                                'running_browser_remains_owned':service.controller._record_valid(identity),
+                            }
+                            checks.update(running_checks)
                     close();require(all(checks.values()))
+                    if args.verify_cache:
+                        cache_report=clear_closed(identity,records)
+                        cache_report['profile_index']=list(records).index(identity)+1
+                        cache_report['checks'].update(running_checks)
+                        report['cache_rounds'].append(cache_report)
+                        before=len(continuity_calls)
+                        service.open(identity,offline_test=True)
+                        with browser_core.CDP(service.controller.endpoint(identity),timeout=8) as connection:
+                            restored=observe(connection,service.store.get(identity),expected)
+                        close();current=snapshot(service.store.get(identity))
+                        restored.update(native_preserved=current['native']==expected['native'],
+                                        baseline_preserved=current['baseline']==expected['baseline'],
+                                        portable_key_preserved=current['crypt']==expected['crypt'],
+                                        binding_preserved=current['binding']==expected['binding'],
+                                        formal_continuity=any(continuity_calls[before:]),
+                                        normal_close=not profile_processes(Path(service.store.get(identity)['_runtime']['profile_path']),require_inspectable=True))
+                        cache_report['after_clear_reopen']=restored
+                        require(all(restored.values()))
                 write_encrypted(data/'workflow-fixture.bin',{'records':records,'original_root':str(root),'original_source':str(source),'source_id':source_id},root=data)
                 with service.store.connect() as con:con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
                 report.update(profile_count=len(records),baseline_fields=[len(v['baseline']['stable']) for v in records.values()],
@@ -377,7 +456,7 @@ def orchestrate(args):
     package=Path(args.package).resolve();work=Path(args.work_dir).absolute();report_path=Path(args.report).absolute()
     report={'success':False,'synthetic':True,'phases':[], 'physical_second_machine':False,
             'physical_external_drive':False,'same_physical_windows_user':True,
-            'dpapi_failure_simulated':True,'source_api_synthetic':True}
+            'dpapi_failure_simulated':True,'source_api_synthetic':True,'cache_clear_requested':args.verify_cache}
     server=None;children=[]
     try:
         require(os.name=='nt' and not (package/'app/data').exists())
@@ -392,6 +471,7 @@ def orchestrate(args):
         original,original_summary=tree(package)
         require(original_summary['file_count']<=40000)
         work.mkdir();seed=work/'A';sibling=work/'B';source=work/'synthetic-source'
+        save(work/'ownership.json',PURPOSE)
         moved=work.with_name(work.name+'-moved');retained=work.with_name(work.name+'-retained')
         require(not moved.exists() and not retained.exists())
         shutil.copytree(package,seed)
@@ -405,6 +485,7 @@ def orchestrate(args):
                      '--execute','--phase',name,'--root',str(selected),'--source',str(source),
                      '--port',str(server.server_port),'--report',str(destination)]
             if role:command.extend(['--role',role,'--barrier',str(work/'barrier')])
+            if args.verify_cache:command.append('--verify-cache')
             return command,clean_environment(envbase),destination
         def collect(name,returncode,destination):
             require(destination.is_file() and destination.stat().st_size<=256*1024)
@@ -439,6 +520,12 @@ def orchestrate(args):
         os.rename(work,retained)
         require(not work.exists());report['old_paths_unavailable']=True
         run('verify',moved,retained/'e-verify')
+        if args.verify_cache:
+            cached=report['phases'][0].get('cache_rounds',[])
+            report['cache_acceptance_passed']=(len(cached)==2 and all(
+                all(item.get('checks',{}).values()) and all(item.get('after_clear_reopen',{}).values())
+                and item.get('removed_files',0)>0 for item in cached))
+            require(report['cache_acceptance_passed'])
         report['public_package_unchanged']=tree(package)[0]==original
         require(report['public_package_unchanged'])
         report['success']=True
@@ -456,6 +543,7 @@ def orchestrate(args):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute',action='store_true')
+    parser.add_argument('--verify-cache',action='store_true',help='Verify selected cache cleanup through the production API and real browser reopen.')
     parser.add_argument('--package',type=Path)
     parser.add_argument('--work-dir',type=Path)
     parser.add_argument('--report',type=Path)

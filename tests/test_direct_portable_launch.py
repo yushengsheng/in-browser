@@ -14,7 +14,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import types
 import unittest
@@ -23,53 +22,29 @@ from unittest.mock import MagicMock, patch
 import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tests'))
+from retained_fixture import new_scope, retained_scope
 # A staged payload already adds one package layer. Keep launcher fixtures beside
 # that payload so this routing test does not accidentally become a MAX_PATH test.
 TEST_ROOT = (ROOT.parent.parent if ROOT.parent.name == '.program-packages'
              and re.fullmatch('[0-9a-f]{32}', ROOT.name) else ROOT)
-TEST_RUNS = TEST_ROOT / 'analysis/test-runs'
 SYNTHETIC_PACKAGE_ID = '0123456789abcdef0123456789abcdef'
 
 
 @contextmanager
 def launcher_fixture():
-    TEST_RUNS.mkdir(parents=True, exist_ok=True)
-    temporary = tempfile.TemporaryDirectory(prefix='direct-portable-', dir=TEST_RUNS)
-    base = Path(temporary.name)
-    marker = base / '.fixture-owner.json'
-    owner = {'pid': os.getpid(), 'purpose': 'synthetic-direct-launch', 'scope': str(base)}
-    marker.write_text(json.dumps(owner), 'utf-8')
+    base = new_scope(TEST_ROOT, prefix='direct-portable-', purpose='synthetic-direct-launch')
     try:
         yield base
     finally:
-        safe = base.resolve().parent == TEST_RUNS.resolve()
-        safe = safe and json.loads(marker.read_text('utf-8')) == owner
-        for directory, folders, files in os.walk(base, followlinks=False):
-            for name in (*folders, *files):
-                info = (Path(directory) / name).lstat()
-                safe = safe and not stat.S_ISLNK(info.st_mode)
-                safe = safe and not getattr(info, 'st_file_attributes', 0) & 0x400
         for process in psutil.process_iter(['exe']):
-            if process.info['exe']:
-                safe = safe and not Path(process.info['exe']).resolve().is_relative_to(base)
-        if not safe:
-            temporary._finalizer.detach()
-            raise AssertionError('synthetic_launcher_cleanup_refused')
-        temporary.cleanup()
-        if base.exists():
-            raise AssertionError('synthetic_launcher_cleanup_incomplete')
+            executable = process.info.get('exe')
+            if (executable and Path(executable).is_absolute()
+                    and Path(executable).resolve().is_relative_to(base)):
+                raise AssertionError('synthetic_launcher_process_still_running')
 
 
 class DirectLaunch(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        with launcher_fixture() as base:
-            probe = base
-            (base / 'nested').mkdir()
-            (base / 'nested/probe.txt').write_text('cleanup probe', 'utf-8')
-        if probe.exists():
-            raise AssertionError('synthetic_launcher_preflight_failed')
-
     @staticmethod
     def launcher_bytes(generated=False):
         if generated:
@@ -277,12 +252,12 @@ class DirectLaunch(unittest.TestCase):
         return captured, installation.initialize_installation.call_count, webview.start.call_count
 
     def test_missing_bundled_webview_refuses_before_installation(self):
-        with tempfile.TemporaryDirectory(prefix='webview-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='webview-synthetic-', purpose='synthetic-webview') as directory:
             captured, installations, starts = self.manager(Path(directory), present=False)
             self.assertEqual((installations, starts), (0, 0))
 
     def test_webview_external_environment_cannot_redirect_runtime_or_data(self):
-        with tempfile.TemporaryDirectory(prefix='webview-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='webview-synthetic-', purpose='synthetic-webview') as directory:
             root = Path(directory)
             captured, installations, starts = self.manager(root)
             self.assertEqual((installations, starts), (1, 1))
@@ -293,14 +268,14 @@ class DirectLaunch(unittest.TestCase):
             self.assertFalse(captured['debugger_wait'])
 
     def test_native_title_reads_version_from_its_bundle(self):
-        with tempfile.TemporaryDirectory(prefix='version-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='version-synthetic-', purpose='synthetic-version') as directory:
             version = (ROOT / 'VERSION').read_bytes()
             captured, installations, starts = self.manager(Path(directory), version=version)
             self.assertEqual((installations, starts), (1, 1))
             self.assertEqual(captured['title'], '本地指纹浏览器 v' + version.decode('utf-8-sig').strip())
 
     def test_title_follows_moved_bundle_metadata(self):
-        with tempfile.TemporaryDirectory(prefix='version-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='version-synthetic-', purpose='synthetic-version') as directory:
             captured, installations, starts = self.manager(Path(directory), version=b'\xef\xbb\xbf9.8.7\r\n')
             self.assertEqual((installations, starts), (1, 1))
             self.assertEqual(captured['title'], '本地指纹浏览器 v9.8.7')
@@ -308,7 +283,7 @@ class DirectLaunch(unittest.TestCase):
     def test_missing_or_invalid_version_does_not_break_startup(self):
         for version in (None, b'', b'\xff', b'0.2.7\nother', b'9' * 129):
             with self.subTest(version_present=version is not None), \
-                    tempfile.TemporaryDirectory(prefix='version-synthetic-') as directory:
+                    retained_scope(TEST_ROOT, prefix='version-synthetic-', purpose='synthetic-version') as directory:
                 captured, installations, starts = self.manager(Path(directory), version=version)
                 self.assertEqual((installations, starts), (1, 1))
                 self.assertEqual(captured['title'], '本地指纹浏览器')
@@ -324,7 +299,7 @@ class DirectLaunch(unittest.TestCase):
         return namespace['_config_command']
 
     def test_missing_bundled_node_never_uses_path_node(self):
-        with tempfile.TemporaryDirectory(prefix='node-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='node-synthetic-', purpose='synthetic-node') as directory:
             root = Path(directory)
             command = self.config_command(root / 'app')
             with patch('shutil.which', return_value=str(root / 'system-node.exe')) as which:
@@ -333,7 +308,7 @@ class DirectLaunch(unittest.TestCase):
                 which.assert_not_called()
 
     def test_existing_bundled_node_uses_absolute_bundle_path(self):
-        with tempfile.TemporaryDirectory(prefix='node-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='node-synthetic-', purpose='synthetic-node') as directory:
             root = Path(directory)
             bundled = root / 'runtime/node/node.exe'
             bundled.parent.mkdir(parents=True)
@@ -344,7 +319,7 @@ class DirectLaunch(unittest.TestCase):
                 which.assert_not_called()
 
     def focus_manager(self, *, match=True, reused_pid=False, title='本地指纹浏览器 v9.8.7'):
-        with tempfile.TemporaryDirectory(prefix='sibling-manager-fixture-') as directory:
+        with retained_scope(TEST_ROOT, prefix='sibling-manager-', purpose='synthetic-sibling-manager') as directory:
             root=Path(directory)
             apps={11:root/'A/app',22:root/'B/app'}
             python=root/'B/runtime/python/pythonw.exe'
@@ -437,7 +412,7 @@ class DirectLaunch(unittest.TestCase):
 
     def test_clean_acceptance_copies_version_and_requires_native_title(self):
         scope=runpy.run_path(str(ROOT/'tools/verify_clean_start.py'),run_name='clean_acceptance_fixture')
-        with tempfile.TemporaryDirectory(prefix='clean-title-synthetic-') as directory:
+        with retained_scope(TEST_ROOT, prefix='clean-title-', purpose='synthetic-clean-title') as directory:
             root=Path(directory)
             with patch.dict(scope['_prepare'].__globals__, _copy_tree=lambda source,target:target.mkdir()):
                 app=scope['_prepare'](root)

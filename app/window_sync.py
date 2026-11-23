@@ -31,6 +31,7 @@ from import_diagnostics import failure_record,persist_failure
 MAX_SYNC_SOURCES=9999
 MAX_SYNC_WORKERS=5
 SYNC_PREVIEW_TTL=600
+MAX_PREVIEW_METADATA_BATCH=50
 _INTERNAL_START=object()
 
 
@@ -59,7 +60,7 @@ class WindowSynchronizer:
         self.service=service;self.provider=provider or BitSource(service.configuration)
         self.lock=threading.RLock();self.candidates={};self.active=None;self.diagnostics={}
         self._asset_lock=threading.Lock()
-        self.preview_id=None;self.preview_created=0;self.confirmed_jobs={}
+        self.preview_id=None;self.preview_created=0;self.confirmed_jobs={};self._preview_pending=[]
         self.state=SyncState(service.store);self.lease=WorkerLease(service.root)
         self._item_context=ContextVar('sync_job_item',default=None)
         self.progress=ImportProgress();self._progress_items={}
@@ -105,11 +106,12 @@ class WindowSynchronizer:
         with self.lock:
             if getattr(self,'worker',None) is not None and self.worker.is_alive():
                 raise LocalBrowserError('同步任务正在处理，请先查看当前进度。')
-            self.preview_id=None;self.candidates={}
+            self.preview_id=None;self.candidates={};self._preview_pending=[]
             unique,conflicts=self._discover();items=[]
             bindings=self.service.store.source_bindings()
             self.candidates=unique
             metadata=self.provider.preview_metadata(list(unique.values())) if hasattr(self.provider,'preview_metadata') else {}
+            self._preview_pending=[key for key in unique if metadata.get(key,{}).get('metadata_pending') is True]
             for candidate in unique.values():
                 info=candidate.get('info') or {};fp=info.get('browserFingerPrint') or {};key=candidate['source_key']
                 display=metadata.get(key,info)
@@ -123,7 +125,30 @@ class WindowSynchronizer:
                     'has_local_data':candidate['status'] in ['ready','source_open']})
             self.preview_id=secrets.token_hex(16);self.preview_created=time.monotonic()
             return {'preview_id':self.preview_id,'expires_in':SYNC_PREVIEW_TTL,'items':items,
+                    'metadata_pending':len(self._preview_pending),
                     'counts':{key:sum(p['status']==key for p in items) for key in ['ready','already_imported','source_open','missing_data','unsupported']}}
+
+    def preview_metadata(self,preview_id):
+        """Continue display reads without rediscovery or renewing import consent."""
+        with self.lock:
+            if (not isinstance(preview_id,str) or not preview_id or preview_id!=self.preview_id
+                    or time.monotonic()-self.preview_created>SYNC_PREVIEW_TTL):
+                raise LocalBrowserError('检测结果已过期，请重新检测以继续读取名称、编号和备注。')
+            if (preview_id in self.confirmed_jobs or
+                    (getattr(self,'worker',None) is not None and self.worker.is_alive())):
+                raise LocalBrowserError('同步任务已开始，来源信息补充已停止。')
+            keys=self._preview_pending[:MAX_PREVIEW_METADATA_BATCH]
+            metadata=self.provider.preview_metadata([self.candidates[key] for key in keys],retain_cached=True) if keys else {}
+            completed={key for key in keys if metadata.get(key,{}).get('metadata_pending') is not True}
+            items=[]
+            for key in keys:
+                if key not in completed:continue
+                info=self.candidates[key].get('info') or {};display=metadata.get(key,info)
+                items.append({'source_key':key,'name':str(display.get('name') or info.get('name') or '本机资料窗口'),
+                    'seq':display.get('seq'),'remark':str(display.get('remark') or ''),
+                    'metadata_note':display.get('metadata_note') or ''})
+            self._preview_pending=[key for key in self._preview_pending if key not in completed]
+            return {'preview_id':preview_id,'items':items,'metadata_pending':len(self._preview_pending)}
 
     def _confirm_preview(self,keys,preview_id):
         if not isinstance(preview_id,str) or not preview_id:

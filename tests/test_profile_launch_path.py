@@ -15,12 +15,12 @@ import tempfile
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
-import uuid
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-sys.path.insert(0, str(ROOT / 'app'))
+sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tests')]
+from retained_fixture import new_scope
 from native_paths import absolute_path, io_path, resolved_path
 spec = importlib.util.spec_from_file_location('profile_path_candidate', ROOT / 'app/profile_launch_path.py')
 module = importlib.util.module_from_spec(spec)
@@ -40,30 +40,12 @@ def shortener():
 @contextmanager
 def scope(label):
     import psutil
-    base = (ROOT / 'analysis/test-runs').resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    temporary = tempfile.TemporaryDirectory(prefix='profile-path-' + label + '-', dir=base)
-    folder = Path(temporary.name).resolve()
-    owner = {'pid': os.getpid(), 'token': uuid.uuid4().hex, 'synthetic': True}
-    (folder / 'owner.json').write_text(json.dumps(owner), 'utf-8')
+    folder = new_scope(ROOT, prefix='profile-path-' + label + '-', purpose='synthetic-profile-path')
     try:
         yield folder
     finally:
-        try:
-            if folder.parent != base or folder.resolve() != folder or json.loads((folder / 'owner.json').read_text('utf-8')) != owner:
-                raise RuntimeError('scope-proof')
-            if psutil.Process().children(recursive=True):
-                raise RuntimeError('scope-process')
-            for path in (folder, *folder.rglob('*')):
-                info = io_path(path).lstat()
-                if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
-                    raise RuntimeError('scope-link')
-            temporary.cleanup()
-            if folder.exists():
-                raise RuntimeError('scope-cleanup')
-        except BaseException:
-            temporary._finalizer.detach()
-            raise
+        if psutil.Process().children(recursive=True):
+            raise RuntimeError('scope-process')
 
 
 def expect_failure(call, code):
@@ -94,16 +76,10 @@ def metadata_tree(folder):
 def main():
     checks = {}
     original_environment, original_tempdir, original_cwd = dict(os.environ), tempfile.tempdir, os.getcwd()
-    with scope('probe') as probe:
-        probe_path = probe
-        (probe / 'nested').mkdir()
-        (probe / 'nested/small').write_bytes(b'synthetic cleanup probe')
-    checks['cleanup_probe_removed'] = not probe_path.exists()
     actual_alias_available = False
     actual_link_tested = False
     samples = []
     with scope('fixture') as fixture:
-        fixture_path = fixture
         profile = fixture / '资料目录_中文非BMP😀_用于真实短名校验'
         io_path(profile).mkdir()
         simple = fixture / 'small'
@@ -246,7 +222,6 @@ def main():
         (benchmark / 'new-member').touch()
         _, metadata = choose(benchmark)
         checks['no_cross_call_scan_cache'] = metadata['entries_checked'] == 1052
-    checks['fixture_automatically_removed'] = not fixture_path.exists()
     checks['parent_environment_unchanged'] = dict(os.environ) == original_environment
     checks['parent_tempfile_tempdir_unchanged'] = tempfile.tempdir is original_tempdir
     checks['parent_cwd_unchanged'] = os.getcwd() == original_cwd
@@ -259,8 +234,7 @@ def main():
 if __name__ == '__main__':
     try:
         result = main()
-        report = ROOT / 'analysis/reports/profile-launch-path-tests.json'
-        report.parent.mkdir(parents=True, exist_ok=True)
+        report = new_scope(ROOT, prefix='profile-path-report-', purpose='synthetic-profile-path-report') / 'report.json'
         report.write_text(json.dumps(result, indent=2), 'utf-8')
         print(json.dumps(result))
         raise SystemExit(0 if result['success'] else 1)

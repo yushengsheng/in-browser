@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import py_compile
 import subprocess
 import sys
 import tempfile
@@ -474,6 +475,88 @@ class WorkerShutdownOwnershipTests(unittest.TestCase):
                     patch.object(proxy_runtime.os,'_exit') as exit_process:
                 proxy_runtime.main()
             timer.start.assert_called_once();timer.cancel.assert_called_once();exit_process.assert_not_called()
+
+
+class WorkerBytecodeIsolationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        base = ROOT / '测试文件夹'
+        base.mkdir(exist_ok=True)
+        cls.suite_root = Path(tempfile.mkdtemp(prefix='worker-bytecode-', dir=base))
+        (cls.suite_root / 'owner.json').write_text(json.dumps({
+            'purpose': 'synthetic-worker-bytecode', 'pid': os.getpid(),
+            'retained_for_user_deletion': True}), encoding='utf-8')
+
+    def worker_fixture(self, name, interceptor, mode):
+        root = self.suite_root / (name + '-' + mode)
+        app = root / 'app'
+        runtime = root / 'runtime/python/site-packages'
+        app.mkdir(parents=True)
+        runtime.mkdir(parents=True)
+        (app / name).write_bytes((ROOT / 'app' / name).read_bytes())
+        dependency = runtime / 'synthetic_dependency.py'
+        dependency.write_text("VALUE = 'cached'\n", encoding='utf-8')
+        cache = runtime / '__pycache__' / ('synthetic_dependency.' + sys.implementation.cache_tag + '.pyc')
+        py_compile.compile(str(dependency), cfile=str(cache), doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+        info = dependency.stat()
+        dependency.write_text("VALUE = 'source'\n", encoding='utf-8')
+        os.utime(dependency, ns=(info.st_atime_ns, info.st_mtime_ns))
+        (runtime / (interceptor + '.py')).write_text(
+            "import json, sys\nfrom pathlib import Path\nimport synthetic_dependency\n"
+            "prefix = sys.pycache_prefix\n"
+            "print(json.dumps({'value': synthetic_dependency.VALUE, "
+            "'disabled': sys.dont_write_bytecode, 'prefix_set': prefix is not None, "
+            "'prefix_uncreated': prefix is not None and not Path(prefix).exists(), "
+            "'prefix_owned': prefix is not None and Path(prefix).parent == "
+            "Path(sys.argv[0]).resolve().parents[1]}))\n"
+            "raise SystemExit(0)\n", encoding='utf-8')
+        return root, app / name, runtime, cache
+
+    def run_child(self, root, code, *arguments):
+        environment = os.environ.copy()
+        environment.update(TEMP=str(root), TMP=str(root))
+        result = subprocess.run([sys.executable, '-B', '-c', code, *map(str, arguments)],
+            cwd=root, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=15,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b'')
+        return json.loads(result.stdout)
+
+    def test_all_worker_entries_ignore_existing_caches_and_write_no_new_cache(self):
+        for name, interceptor in (('proxy_runtime.py', 'psutil'),
+                                  ('dynamic_proxy.py', 'local_state'),
+                                  ('proxy_check.py', 'requests')):
+            with self.subTest(worker=name):
+                root, worker, runtime, cache = self.worker_fixture(name, interceptor, 'worker')
+                # This timestamp-valid cache proves that -B alone still reads it.
+                old = self.run_child(root,
+                    "import json,sys; sys.pycache_prefix=None;sys.path.insert(0,sys.argv[1]);"
+                    "import synthetic_dependency;print(json.dumps(synthetic_dependency.VALUE))", runtime)
+                self.assertEqual(old, 'cached')
+                cached_before = cache.read_bytes()
+                result = self.run_child(root,
+                    "import runpy,sys;sys.path.insert(0,sys.argv[1]);"
+                    "sys.dont_write_bytecode=False;sys.pycache_prefix=None;"
+                    "runpy.run_path(sys.argv[2],run_name='__main__')", runtime, worker)
+                self.assertEqual(result, {'value': 'source', 'disabled': True,
+                    'prefix_set': True, 'prefix_uncreated': True, 'prefix_owned': True})
+                self.assertEqual(list(root.rglob('*.pyc')), [cache])
+                self.assertEqual(cache.read_bytes(), cached_before)
+
+    def test_normal_module_loading_preserves_parent_cache_configuration(self):
+        for name, interceptor in (('proxy_runtime.py', 'psutil'),
+                                  ('dynamic_proxy.py', 'local_state'),
+                                  ('proxy_check.py', 'requests')):
+            with self.subTest(worker=name):
+                root, worker, runtime, _ = self.worker_fixture(name, interceptor, 'module')
+                result = self.run_child(root,
+                    "import runpy,sys;sys.path.insert(0,sys.argv[1]);"
+                    "sys.dont_write_bytecode=False;sys.pycache_prefix=None;"
+                    "runpy.run_path(sys.argv[2],run_name='synthetic_import')", runtime, worker)
+                self.assertEqual(result, {'value': 'cached', 'disabled': False,
+                    'prefix_set': False, 'prefix_uncreated': False, 'prefix_owned': False})
 
 
 if __name__ == '__main__':

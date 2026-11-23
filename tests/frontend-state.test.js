@@ -1458,6 +1458,187 @@ test("list refresh failure does not turn confirmed batch success into operation 
   assert.equal(h.state.batchBusy, false);
 });
 
+function cacheFixture(count = 1) {
+  const h = fixture();
+  h.state.profiles = Array.from({ length: count }, (_, index) => ({ id: `cache-${index}`, name: "Fixture window", seq: index + 1 }));
+  h.state.selected = new Set(h.state.profiles.map((profile) => profile.id));
+  h.context.renderProfiles = h.renderProfiles;
+  h.element("#clear-cache-button").textContent = "清理缓存";
+  return h;
+}
+
+function cacheReply(ids, status = "cleaned", removedBytes = 1024) {
+  return { completed: ids.length, skipped: 0, failed: 0, removed_files: ids.length, removed_bytes: ids.length * removedBytes,
+    results: ids.map((id) => ({ id, status, removed_files: removedBytes ? 1 : 0, removed_bytes: removedBytes, message: "Synthetic private item detail" })) };
+}
+
+test("clear cache follows clear selection and is disabled for empty or busy state", async () => {
+  const html = fs.readFileSync(path.join(root, "app/ui/index.html"), "utf8");
+  assert.match(html, /id="clear-selection"[^>]*>[\s\S]*?取消选择[\s\S]*?<\/button><button id="clear-cache-button"[^>]*disabled[^>]*>[\s\S]*?清理缓存/);
+  assert.match(html, /id="clear-cache-button"[^>]*title="[^"]*临时缓存[^"]*账号登录[^"]*已打开网页[^"]*运行中[^"]*跳过/);
+  const h = cacheFixture();
+  let calls = 0;
+  h.context.api = async () => { calls++; return {}; };
+  h.state.selected.clear();
+  h.renderProfiles();
+  assert.equal(h.element("#clear-cache-button").disabled, true);
+  await h.element("#clear-cache-button").onclick();
+  h.state.selected.add("cache-0");
+  for (const flag of ["batchBusy", "deleteBusy", "saving", "preparingSave", "loading"]) {
+    h.state[flag] = true;
+    h.renderProfiles();
+    assert.equal(h.element("#clear-cache-button").disabled, true);
+    await h.element("#clear-cache-button").onclick();
+    h.state[flag] = false;
+  }
+  h.renderProfiles();
+  assert.equal(h.element("#clear-cache-button").disabled, false);
+  assert.equal(calls, 0);
+});
+
+test("cache cleanup freezes 101 selections, sends serial chunks, and preserves user view and edits", async () => {
+  const h = cacheFixture(102), pending = deferred(), calls = [];
+  h.state.selected.delete("cache-101");
+  h.state.search = "Fixture";
+  h.state.page = 2;
+  h.state.profiles[0].status = "running";
+  const selection = h.state.selected;
+  let active = 0, maximumActive = 0, refreshed = 0;
+  h.context.refreshProfiles = async () => { refreshed++; };
+  h.context.api = async (action, payload) => {
+    assert.equal(action, "clear_cache");
+    assert.equal(h.state.batchBusy, true);
+    assert.equal(h.state.operationIds.size, 101);
+    calls.push(Array.from(payload.ids));
+    active++; maximumActive = Math.max(maximumActive, active);
+    if (calls.length === 1) await pending.promise;
+    active--;
+    const result = cacheReply(payload.ids);
+    if (calls.length === 1) {
+      result.results[0] = { id: "cache-0", status: "skipped", removed_files: 0, removed_bytes: 0, message: "Synthetic private skip detail" };
+      result.results[1] = { id: "cache-1", status: "failed", removed_files: 1, removed_bytes: 512, message: "Synthetic private failure detail" };
+    }
+    return result;
+  };
+  const cleaning = h.element("#clear-cache-button").onclick();
+  assert.equal(h.element("#clear-cache-button").textContent, "正在清理缓存…");
+  assert.equal(h.element("#clear-cache-button").disabled, true);
+  assert.equal(h.state.operationActions.get("cache-0"), "clear_cache");
+  await h.element("#clear-cache-button").onclick();
+  await h.context.batchAction("open", h.element("batch"));
+  await h.context.performAction("open", "cache-1");
+  await h.context.performAction("delete", "cache-1");
+  h.state.draft = { id: "cache-1", name: "Saved fixture" };
+  await h.context.saveProfile();
+  assert.equal(calls.length, 1);
+  h.element("#profile-rows").listeners.get("change")({ target: { matches: () => true, dataset: { id: "cache-0" }, checked: false } });
+  h.element("#profile-rows").listeners.get("change")({ target: { matches: () => true, dataset: { id: "cache-101" }, checked: true } });
+  pending.resolve();
+  await cleaning;
+  assert.deepEqual(calls.map((ids) => ids.length), [100, 1]);
+  assert.equal(new Set(calls.flat()).size, 101);
+  assert.equal(calls[0][0], "cache-0");
+  assert.deepEqual(calls[1], ["cache-100"]);
+  assert.equal(calls.flat().includes("cache-101"), false);
+  assert.equal(maximumActive, 1);
+  assert.equal(h.state.selected, selection);
+  assert.equal(h.state.selected.size, 101);
+  assert.equal(h.state.selected.has("cache-0"), false);
+  assert.equal(h.state.selected.has("cache-101"), true);
+  assert.equal(h.state.search, "Fixture");
+  assert.equal(h.state.page, 2);
+  assert.equal(h.state.profiles[0].status, "running");
+  assert.equal(h.state.batchBusy, false);
+  assert.equal(h.state.operationIds.size, 0);
+  assert.equal(h.state.operationActions.size, 0);
+  assert.equal(h.element("#clear-cache-button").textContent, "清理缓存");
+  assert.equal(h.element("#clear-cache-button").disabled, false);
+  assert.equal(h.confirmations.length, 0);
+  assert.equal(refreshed, 0);
+  assert.equal(h.toasts.at(-1).type, "error");
+  assert.match(h.toasts.at(-1).message, /已清理 99 个，跳过 1 个，失败 1 个，已清理缓存 99\.5 KB/);
+  assert.match(h.toasts.at(-1).message, /保留登录和已打开网页/);
+  assert.doesNotMatch(h.toasts.at(-1).message, /Synthetic private/);
+});
+
+test("cache cleanup interruption stops future chunks and retains confirmed totals without private errors", async () => {
+  const h = cacheFixture(201), requests = [];
+  h.context.api = async (action, payload) => {
+    assert.equal(action, "clear_cache");
+    requests.push(Array.from(payload.ids));
+    if (requests.length === 2) throw new Error("Synthetic private interruption");
+    return cacheReply(payload.ids);
+  };
+  await h.element("#clear-cache-button").onclick();
+  assert.deepEqual(requests.map((ids) => ids.length), [100, 100]);
+  assert.equal(h.toasts.at(-1).type, "error");
+  assert.match(h.toasts.at(-1).message, /缓存清理中断：已清理 100 个，跳过 0 个，失败 0 个，已清理缓存 100 KB/);
+  assert.match(h.toasts.at(-1).message, /另有 101 个结果未确认，后续批次已停止/);
+  assert.doesNotMatch(h.toasts.at(-1).message, /Synthetic private/);
+  assert.equal(h.state.selected.size, 201);
+  assert.equal(h.state.batchBusy, false);
+  assert.equal(h.state.operationIds.size, 0);
+  assert.equal(h.state.operationActions.size, 0);
+  assert.equal(h.element("#clear-cache-button").disabled, false);
+});
+
+test("cache cleanup rejects missing, archived, deleting or concurrently used selections", async () => {
+  for (const invalid of ["missing", "archived", "delete-pending", "deleted", "operation"]) {
+    const h = cacheFixture();
+    if (invalid === "missing") h.state.profiles = [];
+    if (invalid === "archived") h.state.profiles[0].archived = true;
+    if (invalid === "delete-pending") h.state.profiles[0].delete_pending = true;
+    if (invalid === "deleted") h.state.deletedIds.add("cache-0");
+    if (invalid === "operation") { h.state.operationIds.add("cache-0"); h.state.operationActions.set("cache-0", "open"); }
+    let calls = 0;
+    h.context.api = async () => { calls++; return {}; };
+    await h.element("#clear-cache-button").onclick();
+    assert.equal(calls, 0);
+    assert.equal(h.state.batchBusy, false);
+    assert.equal(h.state.selected.size, 1);
+    assert.equal(h.toasts.at(-1).type, "error");
+    if (invalid === "operation") assert.equal(h.state.operationActions.get("cache-0"), "open");
+  }
+});
+
+test("cache cleanup does not claim success for malformed per-window replies", async () => {
+  for (const malformed of ["missing", "duplicate", "unknown-id", "unknown-status", "invalid-bytes", "invalid-files"]) {
+    const h = cacheFixture(101);
+    let requests = 0;
+    h.context.api = async (_action, payload) => {
+      requests++;
+      const result = cacheReply(payload.ids);
+      if (malformed === "missing") result.results.pop();
+      if (malformed === "duplicate") result.results[1] = { ...result.results[0] };
+      if (malformed === "unknown-id") result.results[0].id = "unselected-fixture";
+      if (malformed === "unknown-status") result.results[0].status = "success";
+      if (malformed === "invalid-bytes") result.results[0].removed_bytes = -1;
+      if (malformed === "invalid-files") result.results[0].removed_files = 0.5;
+      return result;
+    };
+    await h.element("#clear-cache-button").onclick();
+    assert.equal(requests, 1);
+    assert.equal(h.toasts.at(-1).type, "error");
+    assert.match(h.toasts.at(-1).message, /已清理 0 个.*已清理缓存 0 B.*101 个结果未确认/);
+    assert.equal(h.state.selected.size, 101);
+    assert.equal(h.state.batchBusy, false);
+    assert.equal(h.state.operationIds.size, 0);
+  }
+});
+
+test("cache cleanup reports running skips and zero-byte clean results independently", async () => {
+  for (const status of ["cleaned", "skipped", "failed"]) {
+    const h = cacheFixture();
+    h.context.api = async (_action, payload) => cacheReply(payload.ids, status, 0);
+    await h.element("#clear-cache-button").onclick();
+    const result = h.toasts.at(-1);
+    assert.equal(result.type, status === "failed" ? "error" : "success");
+    assert.match(result.message, new RegExp(`已清理 ${Number(status === "cleaned")} 个，跳过 ${Number(status === "skipped")} 个，失败 ${Number(status === "failed")} 个，已清理缓存 0 B`));
+    assert.match(result.message, /运行中或占用无法确认的窗口跳过/);
+    assert.equal(h.state.selected.size, 1);
+  }
+});
+
 test("group saving prevents edits and navigation until the snapshot is committed", async () => {
   const h = fixture(), pending = deferred();
   h.state.panel = "groups";
@@ -2032,11 +2213,263 @@ test("closing detection before its response never starts copying and redetection
   await new Promise(setImmediate);
   assert.deepEqual(calls, ["sync_preview"]);
   assert.equal(h.state.sync.jobId, null);
+  assert.equal(h.state.sync.previewId, null);
   h.context.api = async () => ({ preview_id: "second-fixture", items: [] });
   await h.context.loadSyncPreview();
   assert.equal(h.state.sync.previewId, "second-fixture");
   assert.equal(h.state.sync.selected.size, 0);
   assert.equal(h.element("#sync-start").disabled, true);
+});
+
+async function runSyncMetadataTimer(h) {
+  const timerId = h.state.sync.metadataTimer;
+  assert.notEqual(timerId, null);
+  const timer = h.timers.get(timerId);
+  h.timers.delete(timerId);
+  return timer.callback();
+}
+
+test("551 preview rows fill serial metadata batches while preserving search, paging, and selection", async () => {
+  const h = fixture(), firstBatch = deferred(), calls = [];
+  const candidates = Array.from({ length: 551 }, (_, index) => ({
+    source_key: `metadata-${index}`, name: index < 3 ? `Resolved fixture ${index}` : `Pending fixture ${index}`,
+    seq: index < 3 ? index : null, remark: "Fixture remark", metadata_note: index < 3 ? "" : "Pending fixture note",
+    status: index === 550 ? "source_open" : "ready", has_local_data: true, reason: "Original fixture reason",
+  }));
+  let next = 3, rounds = 0, active = 0, maximumActive = 0;
+  h.element("#sync-dialog").showModal();
+  h.context.api = async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "sync_preview") return { preview_id: "metadata-preview", metadata_pending: 548, items: candidates };
+    assert.equal(action, "sync_preview_metadata");
+    assert.deepEqual(JSON.parse(JSON.stringify(payload)), { preview_id: "metadata-preview" });
+    active++; maximumActive = Math.max(maximumActive, active);
+    const begin = next;
+    next = Math.min(next + 50, candidates.length);
+    const items = candidates.slice(begin, next).map((item, offset) => ({
+      source_key: item.source_key, name: `Resolved fixture ${begin + offset}`, seq: begin + offset,
+      remark: "Fixture resolved remark", metadata_note: "", status: "already_imported", has_local_data: false,
+      reason: "Replacement fixture reason",
+    }));
+    items.push({ source_key: "not-in-preview", name: "Unknown fixture", status: "ready" });
+    try {
+      if (++rounds === 1) await firstBatch.promise;
+      return { preview_id: "metadata-preview", metadata_pending: candidates.length - next, items };
+    } finally { active--; }
+  };
+  await h.context.loadSyncPreview();
+  assert.equal(h.state.sync.selected.size, 550);
+  assert.equal(h.state.sync.loading, false);
+  assert.match(h.element("#sync-preview-summary").textContent, /名称、编号和备注尚有 548 个窗口待读取/);
+  const reading = runSyncMetadataTimer(h);
+  await h.context.loadSyncMetadata();
+  assert.equal(rounds, 1);
+  const input = h.element("#sync-search");
+  input.value = "fixture";
+  input.oninput({ target: input });
+  h.element("#sync-next").onclick();
+  h.element("#sync-next").onclick();
+  h.element("#sync-preview-rows").onchange({
+    target: { closest: () => ({ dataset: { syncIndex: "102" }, checked: false }) },
+  });
+  assert.equal(h.element("#sync-search").disabled, false);
+  assert.equal(h.element("#sync-start").disabled, false);
+  assert.equal(h.state.sync.page, 3);
+  firstBatch.resolve();
+  await reading;
+  while (h.state.sync.metadataTimer !== null) await runSyncMetadataTimer(h);
+  assert.equal(rounds, 11);
+  assert.equal(maximumActive, 1);
+  assert.equal(h.state.sync.metadataPending, 0);
+  assert.equal(h.state.sync.metadataActive, false);
+  assert.equal(h.state.sync.preview.length, 551);
+  assert.equal(h.state.sync.previewId, "metadata-preview");
+  assert.equal(h.state.sync.preview[550].name, "Resolved fixture 550");
+  assert.equal(h.state.sync.preview[550].seq, 550);
+  assert.equal(h.state.sync.preview[550].remark, "Fixture resolved remark");
+  assert.equal(h.state.sync.preview[550].metadata_note, "");
+  assert.equal(h.state.sync.preview[550].status, "source_open");
+  assert.equal(h.state.sync.preview[3].status, "ready");
+  assert.equal(h.state.sync.preview[3].has_local_data, true);
+  assert.equal(h.state.sync.preview[3].reason, "Original fixture reason");
+  assert.equal(h.state.sync.names.get("metadata-550"), "Resolved fixture 550");
+  assert.equal(h.state.sync.names.has("not-in-preview"), false);
+  assert.equal(h.state.sync.selected.size, 549);
+  assert.equal(h.state.sync.selected.has("metadata-102"), false);
+  assert.equal(h.state.sync.selected.has("metadata-550"), false);
+  assert.equal(h.state.sync.search, "fixture");
+  assert.equal(input.value, "fixture");
+  assert.equal(h.state.sync.page, 3);
+  assert.equal(h.element("#sync-range").textContent, "101–150 / 551");
+  assert.doesNotMatch(h.element("#sync-preview-summary").textContent, /待读取/);
+  assert.equal(calls.some((call) => call.action === "sync_windows"), false);
+  assert.equal(h.timers.size, 0);
+});
+
+test("metadata result filtering clamps a removed last page and keeps previous-page navigation in sync", async () => {
+  const h = fixture();
+  h.element("#sync-dialog").showModal();
+  const items = Array.from({ length: 151 }, (_, index) => ({ source_key: `page-${index}`, name: "Old fixture", status: "ready" }));
+  h.context.api = async (action) => action === "sync_preview"
+    ? { preview_id: "page-preview", metadata_pending: 1, items }
+    : { preview_id: "page-preview", metadata_pending: 0, items: [{ source_key: "page-150", name: "Resolved fixture" }] };
+  await h.context.loadSyncPreview();
+  h.element("#sync-search").oninput({ target: { value: "Old fixture" } });
+  h.element("#sync-next").onclick();
+  h.element("#sync-next").onclick();
+  h.element("#sync-next").onclick();
+  assert.equal(h.state.sync.page, 4);
+  assert.equal(h.element("#sync-page").textContent, "4 / 4");
+  await runSyncMetadataTimer(h);
+  assert.equal(h.state.sync.page, 3);
+  assert.equal(h.element("#sync-page").textContent, "3 / 3");
+  h.element("#sync-prev").onclick();
+  assert.equal(h.state.sync.page, 2);
+  assert.equal(h.element("#sync-page").textContent, "2 / 3");
+  assert.equal(h.element("#sync-range").textContent, "51–100 / 150");
+  assert.equal(h.state.sync.search, "Old fixture");
+  assert.equal(h.state.sync.selected.size, 151);
+});
+
+test("closing or Escape cancels metadata scheduling and ignores in-flight replies", async () => {
+  for (const closeWithEscape of [false, true]) {
+    for (const inFlight of [false, true]) {
+      const h = fixture(), pending = deferred();
+      let metadataCalls = 0;
+      h.element("#sync-dialog").showModal();
+      h.context.api = async (action) => {
+        if (action === "sync_preview") return { preview_id: "closed-preview", metadata_pending: 1,
+          items: [{ source_key: "closed-fixture", name: "Original fixture", status: "ready" }] };
+        metadataCalls++;
+        return pending.promise;
+      };
+      await h.context.loadSyncPreview();
+      const staleTimer = h.timers.get(h.state.sync.metadataTimer);
+      const reading = inFlight ? runSyncMetadataTimer(h) : null;
+      if (closeWithEscape) {
+        let prevented = false;
+        h.element("#sync-dialog").listeners.get("cancel")({ preventDefault() { prevented = true; } });
+        assert.equal(prevented, true);
+      } else h.context.closeSyncDialog();
+      if (inFlight) {
+        pending.resolve({ preview_id: "closed-preview", metadata_pending: 0,
+          items: [{ source_key: "closed-fixture", name: "Late fixture" }] });
+        await reading;
+      } else await staleTimer.callback();
+      assert.equal(h.element("#sync-dialog").open, false);
+      assert.equal(h.state.sync.preview[0].name, "Original fixture");
+      assert.equal(h.state.sync.metadataActive, false);
+      assert.equal(h.state.sync.metadataTimer, null);
+      assert.equal(h.timers.size, 0);
+      assert.equal(metadataCalls, Number(inFlight));
+    }
+  }
+});
+
+test("redetection waits for the old metadata request and rejects its late fields", async () => {
+  const h = fixture(), pending = deferred();
+  let previews = 0;
+  const metadataIds = [];
+  h.element("#sync-dialog").showModal();
+  h.context.api = async (action, payload) => {
+    if (action === "sync_preview") return { preview_id: `preview-${++previews}`, metadata_pending: 1,
+      items: [{ source_key: "shared-fixture", name: `Original fixture ${previews}`, status: "ready" }] };
+    metadataIds.push(payload.preview_id);
+    if (payload.preview_id === "preview-1") return pending.promise;
+    return { preview_id: "preview-2", metadata_pending: 0, items: [{ source_key: "shared-fixture", name: "Current fixture" }] };
+  };
+  await h.context.loadSyncPreview();
+  const reading = runSyncMetadataTimer(h);
+  await h.context.loadSyncPreview();
+  assert.equal(h.state.sync.metadataTimer, null);
+  assert.equal(h.state.sync.previewId, "preview-2");
+  pending.resolve({ preview_id: "preview-1", metadata_pending: 0, items: [{ source_key: "shared-fixture", name: "Late fixture" }] });
+  await reading;
+  assert.equal(h.state.sync.preview[0].name, "Original fixture 2");
+  await runSyncMetadataTimer(h);
+  assert.deepEqual(metadataIds, ["preview-1", "preview-2"]);
+  assert.equal(h.state.sync.preview[0].name, "Current fixture");
+  assert.equal(h.state.sync.previewId, "preview-2");
+  assert.equal(h.timers.size, 0);
+});
+
+test("starting import or invalidating a deleted preview stops metadata and rejects late replies", async () => {
+  for (const deleting of [false, true]) {
+    const h = fixture(), pending = deferred(), calls = [];
+    h.element("#sync-dialog").showModal();
+    h.context.api = async (action, payload) => {
+      calls.push({ action, payload });
+      if (action === "sync_preview") return { preview_id: "active-preview", metadata_pending: 1,
+        items: [{ source_key: "active-fixture", name: "Original fixture", status: "ready" }] };
+      if (action === "sync_preview_metadata") return pending.promise;
+      if (action === "sync_windows") return { job_id: "fixture-job" };
+      return syncStatus({ state: "completed", total: 1, completed: 1 });
+    };
+    await h.context.loadSyncPreview();
+    const reading = runSyncMetadataTimer(h);
+    if (deleting) h.context.forgetDeletedProfiles([]);
+    else {
+      await h.context.startSync();
+      await new Promise(setImmediate);
+      const submitted = calls.find((call) => call.action === "sync_windows").payload;
+      assert.deepEqual(JSON.parse(JSON.stringify(submitted)), { source_keys: ["active-fixture"], preview_id: "active-preview" });
+    }
+    pending.resolve({ preview_id: "active-preview", metadata_pending: 0, items: [{ source_key: "active-fixture", name: "Late fixture" }] });
+    await reading;
+    assert.equal(h.state.sync.names.get("active-fixture"), deleting ? undefined : "Original fixture");
+    assert.equal(h.state.sync.metadataActive, false);
+    assert.equal(h.state.sync.metadataTimer, null);
+    assert.equal(calls.filter((call) => call.action === "sync_preview_metadata").length, 1);
+    assert.equal(h.timers.size, 0);
+  }
+});
+
+test("metadata errors, expired receipts, malformed replies and no progress stop without retry", async () => {
+  for (const result of ["error", "expired", "wrong-id", "no-progress", "increasing", "invalid-count", "missing-items"]) {
+    const h = fixture();
+    let metadataCalls = 0;
+    h.element("#sync-dialog").showModal();
+    h.context.api = async (action) => {
+      if (action === "sync_preview") return { preview_id: "failure-preview", metadata_pending: 2,
+        items: [{ source_key: "failure-fixture", name: "Original fixture", status: "ready" }] };
+      metadataCalls++;
+      if (result === "error" || result === "expired") throw new Error("Synthetic private failure must not be displayed");
+      return { preview_id: result === "wrong-id" ? "other-preview" : "failure-preview",
+        metadata_pending: result === "no-progress" ? 2 : result === "increasing" ? 3 : result === "invalid-count" ? -1 : 1,
+        items: result === "missing-items" ? null : [{ source_key: "failure-fixture", name: "Unaccepted fixture" }] };
+    };
+    await h.context.loadSyncPreview();
+    await runSyncMetadataTimer(h);
+    h.context.scheduleSyncMetadata();
+    assert.equal(metadataCalls, 1);
+    assert.equal(h.state.sync.preview[0].name, "Original fixture");
+    assert.equal(h.state.sync.previewId, "failure-preview");
+    assert.equal(h.state.sync.selected.size, 1);
+    assert.equal(h.state.sync.metadataPending, 2);
+    assert.equal(h.state.sync.metadataActive, false);
+    assert.equal(h.state.sync.metadataTimer, null);
+    assert.equal(h.element("#sync-start").disabled, false);
+    assert.match(h.state.sync.error, /重新检测/);
+    assert.doesNotMatch(h.state.sync.error, /Synthetic private/);
+    assert.match(h.element("#sync-preview-summary").textContent, /尚有 2 个窗口待读取.*重新检测/);
+    assert.equal(h.timers.size, 0);
+  }
+});
+
+test("previews without pending metadata do not add a continuation request", async () => {
+  for (const metadataPending of [undefined, 0]) {
+    const h = fixture(), calls = [];
+    h.element("#sync-dialog").showModal();
+    h.context.api = async (action) => {
+      calls.push(action);
+      return { preview_id: "complete-preview", metadata_pending: metadataPending,
+        items: [{ source_key: "complete-fixture", name: "Resolved fixture", status: "ready" }] };
+    };
+    await h.context.loadSyncPreview();
+    assert.deepEqual(calls, ["sync_preview"]);
+    assert.equal(h.state.sync.metadataTimer, null);
+    assert.equal(h.timers.size, 0);
+  }
 });
 
 test("missing or failed detection cannot reuse an older receipt or start copying", async () => {

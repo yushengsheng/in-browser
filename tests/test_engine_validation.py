@@ -5,7 +5,6 @@ import hashlib
 import os
 from pathlib import Path
 import sys
-import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -13,6 +12,8 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
+sys.path.insert(0, str(ROOT / 'tests'))
+from retained_fixture import new_scope
 import engine_validation as validation
 from batch_operations import Operations, parallel_batch, shutdown_batches
 from local_state import LocalBrowserError
@@ -21,27 +22,10 @@ from local_state import LocalBrowserError
 @unittest.skipUnless(os.name == 'nt', 'Windows protected read handles')
 class SharedValidationTests(unittest.TestCase):
     def setUp(self):
-        base = ROOT / 'analysis/test-runs'
-        base.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='shared-engine-probe-', dir=base) as name:
-            probe = Path(name)
-            (probe / 'nested').mkdir()
-            (probe / 'nested/proof').write_bytes(b'synthetic')
-        self.assertFalse(probe.exists())
-        self.temporary = tempfile.TemporaryDirectory(prefix='shared-engine-', dir=base)
-        self.root = Path(self.temporary.name).resolve()
-        (self.root / 'owner.json').write_text('{"purpose":"synthetic-engine-handles"}')
-        self.addCleanup(self.cleanup)
+        self.root = new_scope(ROOT, prefix='shared-engine-', purpose='synthetic-engine-handles')
         self.path = self.root / 'engine.bin'
         self.original = bytes(range(256)) * 1024
         self.path.write_bytes(self.original)
-
-    def cleanup(self):
-        self.assertTrue(self.root.is_relative_to((ROOT / 'analysis/test-runs').resolve()))
-        self.assertFalse(any(path.is_symlink() or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400
-                             for path in (self.root, *self.root.rglob('*'))))
-        self.temporary.cleanup()
-        self.assertFalse(self.root.exists())
 
     def service(self, handler):
         service = SimpleNamespace(operations=Operations())

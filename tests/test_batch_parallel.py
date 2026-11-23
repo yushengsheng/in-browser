@@ -240,14 +240,9 @@ class RuntimeJournalTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows atomic replacement sharing')
     def test_real_windows_reader_conflict_is_retried_after_reader_closes(self):
         from ctypes import wintypes
-        base = ROOT / 'analysis/test-runs'
+        base = ROOT / '测试文件夹'
         base.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='journal-probe-', dir=base) as name:
-            probe = Path(name)
-            (probe / 'nested').mkdir()
-            (probe / 'nested/proof').write_bytes(b'synthetic')
-        self.assertFalse(probe.exists())
-        with tempfile.TemporaryDirectory(prefix='journal-sharing-', dir=base) as name:
+        with tempfile.TemporaryDirectory(prefix='journal-sharing-', dir=base, delete=False) as name:
             scope = Path(name).resolve()
             (scope / 'owner.json').write_text('{"purpose":"synthetic-journal-sharing"}')
             controller = self.controller()
@@ -289,7 +284,6 @@ class RuntimeJournalTests(unittest.TestCase):
             self.assertTrue(scope.is_relative_to(base.resolve()))
             self.assertFalse(any(path.is_symlink() or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400
                                  for path in (scope, *scope.rglob('*'))))
-        self.assertFalse(scope.exists())
 
 
 class OperationGateTests(unittest.TestCase):

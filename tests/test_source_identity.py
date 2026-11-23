@@ -1,7 +1,6 @@
 """Read-only bounded prepared-source identities over synthetic browser files."""
 import copy
 import hashlib
-import json
 import os
 from pathlib import Path
 import shutil
@@ -9,13 +8,14 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'app'))
+sys.path.insert(0,str(ROOT/'tests'))
+from retained_fixture import new_scope
 import local_source
 from local_source import profile_identity
 from local_state import LocalBrowserError
@@ -25,14 +25,7 @@ A='1'*32
 
 class SourceIdentityTests(unittest.TestCase):
     def setUp(self):
-        base=ROOT/'analysis/test-runs';base.mkdir(parents=True,exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='source-identity-probe-',dir=base) as name:
-            probe=Path(name).resolve();self.assertTrue(probe.is_relative_to(base.resolve()))
-            (probe/'nested').mkdir();(probe/'nested/proof').write_bytes(b'synthetic')
-        self.assertFalse(probe.exists())
-        self.temporary=tempfile.TemporaryDirectory(prefix='source-identity-',dir=base)
-        self.base=Path(self.temporary.name).resolve();self.addCleanup(self.cleanup)
-        (self.base/'owner.json').write_text(json.dumps({'pid':os.getpid(),'owner':'source-identity-synthetic'}))
+        self.base=new_scope(ROOT,prefix='source-identity-',purpose='synthetic-source-identity')
         self.profiles=self.base/'profiles';self.folder=self.profiles/A
         (self.folder/'Default/Network').mkdir(parents=True)
         (self.folder/'Default/Sessions').mkdir()
@@ -40,12 +33,6 @@ class SourceIdentityTests(unittest.TestCase):
             (self.folder/relative).write_bytes(b'synthetic')
         self.configuration=SimpleNamespace(vendor_data=self.base/'missing-vendor',
             source_archive=lambda:{'profile_root':str(self.profiles)})
-
-    def cleanup(self):
-        self.assertTrue(self.base.is_relative_to((ROOT/'analysis/test-runs').resolve()))
-        self.assertFalse(any(path.is_symlink() or getattr(path.lstat(),'st_file_attributes',0)&0x400
-                             for path in (self.base,*self.base.rglob('*'))))
-        self.temporary.cleanup();self.assertFalse(self.base.exists())
 
     def identity(self):return profile_identity(self.configuration,A)
 
@@ -174,12 +161,11 @@ class SourceIdentityTests(unittest.TestCase):
     def junction(self,link,target):
         if os.name=='nt':
             result=subprocess.run(['cmd','/c','mklink','/J',str(link),str(target)],stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,timeout=10,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                stderr=subprocess.DEVNULL,timeout=10,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),
+                cwd=self.base,env={**os.environ,'TEMP':str(self.base),'TMP':str(self.base)})
             self.assertEqual(result.returncode,0)
-            self.addCleanup(lambda:link.rmdir() if os.path.lexists(link) else None)
         else:
             link.symlink_to(target,target_is_directory=True)
-            self.addCleanup(lambda:link.unlink() if os.path.lexists(link) else None)
 
     def test_directory_links_are_rejected_even_for_missing_optional_files(self):
         for relative in ('Default/Network','Default/Sessions'):

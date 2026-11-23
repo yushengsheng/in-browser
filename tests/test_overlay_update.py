@@ -1,4 +1,4 @@
-"""Overlay updates and hard process exits in disposable synthetic releases."""
+"""Overlay updates and hard process exits in retained synthetic releases."""
 import io
 import json
 import os
@@ -48,7 +48,6 @@ def pending_directory(target):
 
 
 class OverlayUpdate(unittest.TestCase):
-    setUpClass = classmethod(InplaceUpdate.setUpClass.__func__)
     protected = InplaceUpdate.protected
     assert_protected = InplaceUpdate.assert_protected
     junction = InplaceUpdate.junction
@@ -414,7 +413,7 @@ class OverlayUpdate(unittest.TestCase):
                'PYTHONDONTWRITEBYTECODE': '1'}
         completed = subprocess.run(
             [sys.executable, '-B', str(Path(__file__).resolve()), '--worker', action,
-             str(source), str(target), phase, name], env=env,
+             str(source), str(target), phase, name], env=env, cwd=target.parent,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=45, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         self.assertEqual(completed.returncode, EXIT_INTERRUPTED, 'synthetic_hard_exit_not_reached')
@@ -478,12 +477,12 @@ if __name__ == '__main__':
         sys.exit(worker_main(sys.argv[2:]))
     stream = io.StringIO()
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(OverlayUpdate)
-    names = [test._testMethodName for test in suite]
+    from retained_fixture import report_checks, test_name
+    names = [test_name(test) for test in suite]
     result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
-    failed = {getattr(test, 'test_case', test)._testMethodName
-              for test, _ in result.failures + result.errors}
+    checks, failed = report_checks(names, result)
     print(json.dumps({'success': result.wasSuccessful(), 'tests': result.testsRun,
-                      'checks': {name: name not in failed for name in names},
+                      'checks': checks,
                       'failed': sorted(failed)}))
     print('Ran {} tests in synthetic fixtures'.format(result.testsRun), file=sys.stderr)
     print('OK' if result.wasSuccessful() else 'FAILED (failures={}, errors={})'.format(

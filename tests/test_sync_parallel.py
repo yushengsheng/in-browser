@@ -2,11 +2,9 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import sys
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -14,6 +12,7 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'app'))
 sys.path.insert(0,str(ROOT/'tests'))
+from retained_fixture import new_scope
 
 from import_progress import emit, _observer
 from local_state import LocalBrowserError
@@ -27,30 +26,16 @@ from window_sync import WindowSynchronizer
 
 class SyncParallelTests(unittest.TestCase):
     def setUp(self):
-        base=ROOT/'analysis/test-runs';base.mkdir(parents=True,exist_ok=True)
-        # Validate cleanup at the actual test location before creating fixtures.
-        with tempfile.TemporaryDirectory(prefix='sync-parallel-probe-',dir=base) as name:
-            probe=Path(name).resolve()
-            self.assertTrue(probe.is_relative_to(base.resolve()))
-            (probe/'nested').mkdir();(probe/'nested/proof').write_bytes(b'synthetic')
-        self.assertFalse(probe.exists())
-        self.temporary=tempfile.TemporaryDirectory(prefix='sync-parallel-',dir=base)
-        self.root=Path(self.temporary.name).resolve()
-        (self.root/'owner.json').write_text(json.dumps({'pid':os.getpid(),'owner':'sync-parallel-synthetic'}))
+        self.root=new_scope(ROOT,prefix='sync-parallel-',purpose='synthetic-sync-parallel')
         self.workers=[]
-        self.addCleanup(self.cleanup)
+        self.addCleanup(self.join_workers)
         guard=patch.object(window_sync,'profile_processes',return_value=[])
         guard.start();self.addCleanup(guard.stop)
 
-    def cleanup(self):
+    def join_workers(self):
         for worker in self.workers:
             worker.join(15)
             self.assertFalse(worker.is_alive())
-        self.assertTrue(self.root.is_relative_to((ROOT/'analysis/test-runs').resolve()))
-        self.assertFalse(any(path.is_symlink() or getattr(path.lstat(),'st_file_attributes',0)&0x400
-                             for path in (self.root,*self.root.rglob('*'))))
-        self.temporary.cleanup()
-        self.assertFalse(self.root.exists())
 
     def start(self,sync,items):
         sync.preview();job=sync.start([item['source_key'] for item in items])

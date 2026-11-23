@@ -76,6 +76,27 @@ class RunnerContracts(unittest.TestCase):
 
 
 class ApplicationContracts(unittest.TestCase):
+    def test_cache_clear_bridge_keeps_partial_receipts_and_only_selected_ids(self):
+        from api import dispatch
+        from manager_service import ManagerService
+        service=ManagerService.__new__(ManagerService)
+        selected=['synthetic-a','synthetic-b']
+        receipt={'completed':1,'skipped':1,'failed':0,'removed_files':2,'removed_bytes':43,
+                 'results':[{'id':selected[0],'status':'cleaned','removed_files':2,'removed_bytes':43,'message':''},
+                            {'id':selected[1],'status':'skipped','removed_files':0,'removed_bytes':0,'message':'窗口正在运行。'}]}
+        with patch('profile_cache.clear_cache',return_value=receipt) as clear:
+            self.assertEqual(dispatch(service,'clear_cache',{'ids':selected}),{'ok':True,'data':receipt})
+            clear.assert_called_once_with(service,selected)
+
+    def test_cache_clear_bridge_does_not_expose_unexpected_failure_or_claim_no_changes(self):
+        from api import dispatch
+        service=Mock()
+        service.clear_cache.side_effect=OSError('synthetic-private-path-and-account')
+        reply=dispatch(service,'clear_cache',{'ids':['synthetic-a']})
+        self.assertFalse(reply['ok'])
+        self.assertNotIn('synthetic-private',reply['error'])
+        self.assertIn('部分缓存可能已清理',reply['error'])
+
     def test_settings_save_rolls_back_all_profiles_if_one_write_fails(self):
         from manager_service import ManagerService
         from window_store import WindowStore

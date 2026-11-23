@@ -10,15 +10,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
-import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
+sys.path.insert(0, str(ROOT / 'tests'))
+from retained_fixture import new_scope
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import engine_store
@@ -104,14 +104,6 @@ def windows_file_handle(path, share=0):
 class EnginePortabilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.area = ROOT / 'analysis/test-runs'
-        cls.area.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='engine-path-preflight-', dir=cls.area) as directory:
-            nested = Path(directory) / 'nested'
-            nested.mkdir()
-            (nested / '.owner').write_text('synthetic engine path preflight')
-        if Path(directory).exists():
-            raise RuntimeError('Test cleanup preflight failed')
         cls.vendor = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         cls.own = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key().public_bytes(
@@ -119,10 +111,7 @@ class EnginePortabilityTests(unittest.TestCase):
         cls.key_id = hashlib.sha256(cls.own).hexdigest()
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='engine-path-', dir=self.area)
-        self.base = Path(self.temporary.name)
-        (self.base / '.owner').write_text(uuid.uuid4().hex)
-        self.addCleanup(self.clean_owned)
+        self.base = new_scope(ROOT, prefix='engine-path-', purpose='synthetic-engine-paths')
         self.deep = self.base
         for number in range(6):
             self.deep /= '中文-deep-' + str(number) + '-' + 'x' * 24
@@ -158,15 +147,6 @@ class EnginePortabilityTests(unittest.TestCase):
         self.patches.enter_context(patch.object(local_engine, '_VENDOR_DER_SHA256', hashlib.sha256(self.vendor).hexdigest()))
         self.patches.enter_context(patch.object(engine_store, 'executable_major', return_value='140'))
         self.store = local_engine.LocalEngineStore(self.deep / 'deployed')
-
-    def clean_owned(self):
-        # No browser/process is created by these fixtures. The exact owned root
-        # is checked before allowing stdlib's temporary-directory cleanup.
-        self.assertEqual(self.base.parent.resolve(), self.area.resolve())
-        self.assertTrue((self.base / '.owner').is_file())
-        shutil.rmtree(io_path(self.base))
-        self.temporary.cleanup()
-        self.assertFalse(self.base.exists())
 
     def test_absolute_unc_prefixed_relative_and_case_identities(self):
         target = self.deep / 'stock/version/../BitBrowser.exe'
@@ -523,14 +503,13 @@ class EnginePortabilityTests(unittest.TestCase):
         target = self.base / 'junction-target'
         target.mkdir()
         result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(junction), str(target)],
-                                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                                cwd=self.base, env={**os.environ, 'TEMP': str(self.base), 'TMP': str(self.base)},
+                                timeout=10)
         self.assertEqual(result.returncode, 0)
-        try:
-            with self.assertRaises(LocalBrowserError) as linked:
-                local_engine.LocalEngineStore(junction / 'deployed')
-            self.assertEqual(linked.exception.code, 'engine_path_link')
-        finally:
-            os.rmdir(junction)
+        with self.assertRaises(LocalBrowserError) as linked:
+            local_engine.LocalEngineStore(junction / 'deployed')
+        self.assertEqual(linked.exception.code, 'engine_path_link')
 
     def test_access_failure_has_only_safe_stage_and_code(self):
         private = str(self.deep / 'private-name')

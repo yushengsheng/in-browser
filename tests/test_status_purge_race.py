@@ -2,14 +2,14 @@
 import os
 from pathlib import Path
 import sys
-import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'app'))
+sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tests')]
+from retained_fixture import retained_scope
 import browser_core
 from batch_operations import WindowLocks
 from profile_delete import _purge_runtime
@@ -17,14 +17,7 @@ from profile_delete import _purge_runtime
 
 class StatusPurgeRaceTests(unittest.TestCase):
     def test_purge_cannot_remove_profile_between_status_admission_and_read(self):
-        area = ROOT / 'analysis/test-runs'
-        area.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='status-purge-preflight-', dir=area) as check:
-            folder = Path(check) / 'nested'
-            folder.mkdir()
-            (folder / '.owner').write_text('synthetic')
-        self.assertFalse(Path(check).exists())
-        with tempfile.TemporaryDirectory(prefix='status-purge-', dir=area) as directory:
+        with retained_scope(ROOT, prefix='status-purge-', purpose='synthetic-status-purge') as directory:
             root = Path(directory)
             (root / '.owner').write_text('synthetic, no processes created')
             controller = browser_core.BrowserController.__new__(browser_core.BrowserController)
@@ -99,8 +92,6 @@ class StatusPurgeRaceTests(unittest.TestCase):
                 self.assertNotIn('a', controller.profiles)
                 self.assertTrue(controller.profiles['b']['marker'])
                 self.assertEqual([item['alias'] for item in controller.settings['windows']], ['b'])
-        self.assertFalse(root.exists())
-
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

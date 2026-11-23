@@ -182,6 +182,90 @@ class SyncReliabilityTests(unittest.TestCase):
         sync.start([items[1]['source_key']],preview_id=next_preview['preview_id'])
         self.assertEqual(self.wait(sync)['completed'],1)
 
+    def test_metadata_continuation_completes_551_sources_without_retrying_failures(self):
+        from api import dispatch
+        from bit_source import BitSource
+        import local_source
+        service,sync,_=fixture(self.root,count=1)
+        items=[dict(candidate(number),_needs_preparation=True) for number in range(1,552)]
+        before=copy.deepcopy(items);clock=[0];calls=[]
+        provider=BitSource(SimpleNamespace(independent=True,vendor_data=self.root/'synthetic-vendor'))
+        provider.discover=Mock(side_effect=lambda:copy.deepcopy(items))
+        sync.provider=provider;service.synchronizer=lambda:sync
+        def detail(identity,**kwargs):
+            self.assertGreater(kwargs['timeout'],0);self.assertLessEqual(kwargs['timeout'],3)
+            calls.append(identity);clock[0]+=1
+            if int(identity,16)<=3:raise LocalBrowserError('synthetic-private-only')
+            return {'id':identity,'name':'display-'+str(int(identity,16)),
+                    'seq':int(identity,16),'remark':'synthetic remark','password':'synthetic-private-only'}
+        reader=Mock();reader.source_detail.side_effect=detail
+        with patch.object(local_source,'_reader',return_value=reader), \
+                patch.object(window_sync.time,'monotonic',side_effect=lambda:clock[0]), \
+                patch.object(service,'_copy_profile',side_effect=AssertionError('Unexpected copy')):
+            initial=dispatch(service,'sync_preview')['data'];receipt=initial['preview_id'];created=sync.preview_created
+            self.assertEqual(initial['metadata_pending'],541)
+            displays={row['source_key']:row for row in initial['items']};remaining=initial['metadata_pending'];rounds=0
+            while remaining:
+                reply=dispatch(service,'sync_preview_metadata',{'preview_id':receipt})
+                self.assertTrue(reply['ok']);data=reply['data'];rounds+=1
+                self.assertEqual(data['preview_id'],receipt);self.assertLess(data['metadata_pending'],remaining)
+                self.assertLessEqual(len(data['items']),50);remaining=data['metadata_pending']
+                self.assertLessEqual(rounds,551)
+                for row in data['items']:
+                    self.assertEqual(set(row),{'source_key','name','seq','remark','metadata_note'})
+                    displays[row['source_key']].update(row)
+            self.assertEqual(len(calls),551);self.assertEqual(len(set(calls)),551)
+            self.assertEqual(displays[items[-1]['source_key']]['seq'],551)
+            self.assertTrue(all(displays[item['source_key']]['metadata_note'] for item in items[:3]))
+            self.assertNotIn('synthetic-private-only',json.dumps(displays))
+            self.assertEqual(sync.preview_created,created);self.assertEqual(sync.preview_id,receipt)
+            self.assertEqual(list(sync.candidates.values()),before);self.assertEqual(items,before)
+            provider.discover.assert_called_once();self.assertIsNone(sync.latest());self.assertEqual(service.store.all(),[])
+            empty=dispatch(service,'sync_preview_metadata',{'preview_id':receipt})
+            self.assertEqual(empty['data']['items'],[]);self.assertEqual(len(calls),551)
+            self.assertEqual(len(provider._preview_labels),548)
+
+    def test_metadata_continuation_rejects_expired_replaced_and_started_receipts(self):
+        from api import dispatch
+        service,sync,items=fixture(self.root,count=1);service.synchronizer=lambda:sync
+        key=items[0]['source_key']
+        sync.provider.preview_metadata=Mock(return_value={key:{'metadata_pending':True}})
+        first=sync.preview()['preview_id'];second=sync.preview()['preview_id']
+        sync.provider.preview_metadata.reset_mock()
+        for receipt in (None,'',first,'wrong'):
+            self.assertFalse(dispatch(service,'sync_preview_metadata',{'preview_id':receipt})['ok'])
+        with patch.object(window_sync.time,'monotonic',return_value=sync.preview_created+601):
+            self.assertFalse(dispatch(service,'sync_preview_metadata',{'preview_id':second})['ok'])
+        sync.provider.preview_metadata.assert_not_called()
+        sync.start([key],preview_id=second);self.assertEqual(self.wait(sync)['completed'],1)
+        self.assertFalse(dispatch(service,'sync_preview_metadata',{'preview_id':second})['ok'])
+        sync.provider.preview_metadata.assert_not_called()
+
+    def test_metadata_continuation_is_bounded_and_does_not_repeat_failed_rows(self):
+        service,sync,_=fixture(self.root,count=1)
+        items=[candidate(number) for number in range(1,122)]
+        sync.provider=Provider(items)
+        sync.provider.preview_metadata=Mock(return_value={row['source_key']:{'metadata_pending':True} for row in items})
+        receipt=sync.preview()['preview_id']
+        attempted=[]
+        def failed(batch,**kwargs):
+            self.assertTrue(kwargs['retain_cached']);self.assertLessEqual(len(batch),50)
+            attempted.extend(row['source_key'] for row in batch)
+            return {row['source_key']:{'metadata_note':'synthetic unavailable'} for row in batch}
+        sync.provider.preview_metadata.side_effect=failed
+        for expected in (71,21,0):
+            self.assertEqual(sync.preview_metadata(receipt)['metadata_pending'],expected)
+        self.assertEqual(attempted,[row['source_key'] for row in items])
+        self.assertIsNone(sync.latest());self.assertEqual(service.store.all(),[])
+
+    def test_metadata_continuation_without_budget_keeps_pending_queue_and_receipt(self):
+        _,sync,items=fixture(self.root,count=1);key=items[0]['source_key']
+        sync.provider.preview_metadata=Mock(return_value={key:{'metadata_pending':True}})
+        preview=sync.preview();created=sync.preview_created
+        reply=sync.preview_metadata(preview['preview_id'])
+        self.assertEqual(reply['items'],[]);self.assertEqual(reply['metadata_pending'],1)
+        self.assertEqual(sync.preview_created,created)
+
     def test_cancelled_confirmed_start_retry_preserves_cancelled_job(self):
         service,sync,items=fixture(self.root,count=1)
         preview=sync.preview();keys=[items[0]['source_key']]

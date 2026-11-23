@@ -225,6 +225,22 @@ class SourcePreparationTests(unittest.TestCase):
         reader.source_detail.assert_called_once_with(A,timeout=3)
         self.assertEqual(metadata[A]['name'],'same fixture name')
         self.assertTrue(metadata[B]['metadata_note'])
+        self.assertIs(metadata[B]['metadata_pending'],True)
+        self.assertNotIn('metadata_pending',metadata[A])
+
+    def test_metadata_continuation_keeps_earlier_labels_until_full_redetection(self):
+        provider=self.provider();reader=Mock()
+        reader.source_detail.side_effect=lambda identity,**_:full(identity)
+        candidates=[{'source_id':identity,'source_key':identity,'status':'ready','info':None,'_needs_preparation':True}
+                    for identity in (A,B)]
+        with patch.object(local_source,'_reader',return_value=reader):
+            provider.preview_metadata(candidates[:1])
+            provider.preview_metadata(candidates[1:],retain_cached=True)
+            provider.preview_metadata(candidates)
+            self.assertEqual(reader.source_detail.call_count,2)
+            self.assertEqual(set(provider._preview_labels),{A,B})
+            provider.preview_metadata(candidates[1:])
+            self.assertEqual(set(provider._preview_labels),{B})
 
     def test_one_unreadable_source_does_not_hide_later_window_labels(self):
         candidates=[{'source_id':identity,'source_key':identity,'status':'ready','info':None,'_needs_preparation':True}

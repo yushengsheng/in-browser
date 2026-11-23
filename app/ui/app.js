@@ -240,6 +240,7 @@ const state = {
   sync: {
     preview: [], names: new Map(), selected: new Set(), search: "", page: 1,
     previewRevision: 0, previewId: null,
+    metadataPending: 0, metadataRevision: 0, metadataTimer: null, metadataReading: false, metadataActive: false,
     loading: false, starting: false, jobId: null, status: null,
     timer: null, polling: false, pollErrors: 0, pollPaused: false, requestRevision: 0,
     cancelling: false, cancelRequested: false, finishedJobId: null,
@@ -624,6 +625,7 @@ function invalidateSyncStatus() {
 }
 function clearSyncJob() {
   const sync = state.sync;
+  invalidateSyncMetadata();
   invalidateSyncStatus();
   sync.jobId = null;
   sync.status = null;
@@ -675,6 +677,7 @@ function restoreSyncJob(status) {
   if (!status?.job_id || !["running", "interrupted"].includes(status.state) || sync.starting || sync.cancelling) return;
   const jobId = String(status.job_id);
   if (sync.jobId === jobId && ["completed", "failed", "cancelled"].includes(sync.status?.state)) return;
+  invalidateSyncMetadata();
   invalidateSyncStatus();
   sync.jobId = jobId;
   sync.status = boundedSyncStatus(status);
@@ -712,12 +715,71 @@ function openSyncDialog() {
   if (!state.sync.loading) loadSyncPreview();
 }
 function closeSyncDialog() {
+  invalidateSyncMetadata();
+  state.sync.previewRevision++;
+  state.sync.loading = false;
   $("#sync-dialog").close();
   state.sync.returnFocus?.focus();
+}
+function invalidateSyncMetadata() {
+  const sync = state.sync;
+  sync.metadataRevision++;
+  sync.metadataActive = false;
+  clearTimeout(sync.metadataTimer);
+  sync.metadataTimer = null;
+}
+function scheduleSyncMetadata() {
+  const sync = state.sync;
+  if (!sync.metadataActive || !sync.metadataPending || sync.metadataReading || sync.metadataTimer !== null ||
+      !$("#sync-dialog").open || sync.loading || sync.starting || sync.jobId || !sync.previewId) return;
+  const revision = sync.metadataRevision;
+  sync.metadataTimer = setTimeout(() => {
+    if (revision !== sync.metadataRevision) return;
+    sync.metadataTimer = null;
+    return loadSyncMetadata();
+  }, 0);
+}
+async function loadSyncMetadata() {
+  const sync = state.sync;
+  if (!sync.metadataActive || !sync.metadataPending || sync.metadataReading || !$("#sync-dialog").open ||
+      sync.loading || sync.starting || sync.jobId || !sync.previewId) return;
+  const revision = sync.metadataRevision, previewId = sync.previewId, pending = sync.metadataPending;
+  const current = () => revision === sync.metadataRevision && previewId === sync.previewId;
+  sync.metadataReading = true;
+  try {
+    const data = await api("sync_preview_metadata", { preview_id: previewId });
+    if (!current()) return;
+    if (data?.preview_id !== previewId || !Array.isArray(data.items) ||
+        !Number.isInteger(data.metadata_pending) || data.metadata_pending < 0 || data.metadata_pending >= pending) throw new Error();
+    const items = new Map(sync.preview.map((item) => [item.source_key, item]));
+    for (const update of data.items) {
+      const item = update && items.get(update.source_key);
+      if (!item) continue;
+      for (const field of ["name", "seq", "remark", "metadata_note"]) {
+        if (Object.prototype.hasOwnProperty.call(update, field)) item[field] = update[field];
+      }
+      sync.names.set(item.source_key, item.name || "未命名窗口");
+    }
+    sync.metadataPending = data.metadata_pending;
+    sync.metadataActive = sync.metadataPending > 0;
+    renderSyncPreview();
+  } catch {
+    if (current()) {
+      sync.metadataActive = false;
+      showSyncError("名称、编号和备注读取未完成或检测已过期，请重新检测。");
+      renderSyncPreview();
+    }
+  } finally {
+    sync.metadataReading = false;
+    // A newer preview waits for the old request to settle before starting its next batch.
+    scheduleSyncMetadata();
+  }
 }
 async function loadSyncPreview() {
   const sync = state.sync;
   if (sync.loading || syncRunning() || syncInterrupted()) return;
+  invalidateSyncMetadata();
+  sync.metadataPending = 0;
   const previewRevision = ++sync.previewRevision;
   sync.previewId = null;
   invalidateSyncStatus();
@@ -748,6 +810,8 @@ async function loadSyncPreview() {
     });
     sync.selected = new Set(sync.preview.filter(syncCanImport).slice(0, SYNC_BATCH_LIMIT).map((item) => item.source_key));
     sync.names = new Map(sync.preview.map((item) => [item.source_key, item.name || "未命名窗口"]));
+    sync.metadataPending = syncCount(data.metadata_pending);
+    sync.metadataActive = sync.metadataPending > 0;
   } catch (error) {
     if (previewRevision !== sync.previewRevision) return;
     showSyncError(error.message);
@@ -755,6 +819,7 @@ async function loadSyncPreview() {
     if (previewRevision === sync.previewRevision) {
       sync.loading = false;
       renderSync();
+      scheduleSyncMetadata();
     }
   }
 }
@@ -813,7 +878,7 @@ function renderSyncPreview() {
   const offset = (sync.page - 1) * 50;
   const rows = items.slice(offset, offset + 50);
   $("#sync-preview-summary").textContent = sync.loading ? guidance.previewLoading :
-    `本机候选 ${sync.preview.length} 个，可导入 ${ready.length} 个，已导入 ${imported} 个，暂不可导入 ${sync.preview.length - ready.length - imported} 个。${ready.length > SYNC_BATCH_LIMIT ? `每批最多 ${SYNC_BATCH_LIMIT} 个，剩余来源可在本批结束后重新预览同步。` : ""}`;
+    `本机候选 ${sync.preview.length} 个，可导入 ${ready.length} 个，已导入 ${imported} 个，暂不可导入 ${sync.preview.length - ready.length - imported} 个。${ready.length > SYNC_BATCH_LIMIT ? `每批最多 ${SYNC_BATCH_LIMIT} 个，剩余来源可在本批结束后重新预览同步。` : ""}${sync.metadataPending ? `名称、编号和备注尚有 ${sync.metadataPending} 个窗口待读取${sync.metadataActive ? "，正在继续读取…" : "，请重新检测。"}` : ""}`;
   $("#sync-preview-rows").innerHTML = rows.map(({ item, index }) => {
     const enabled = syncCanImport(item) && !sync.starting;
     const itemStatus = item.status === "ready" && item.has_local_data === false ? "missing_data" : item.status;
@@ -941,6 +1006,7 @@ async function startSync() {
     return;
   }
   sync.deferred = sync.preview.filter(syncCanImport).length - keys.length;
+  invalidateSyncMetadata();
   invalidateSyncStatus();
   sync.starting = true;
   showSyncError();
@@ -1387,6 +1453,7 @@ function renderProfiles() {
     : state.capabilities.create_windows ? "点击“新建窗口”创建本地窗口，或点击“同步窗口”导入本机来源" : sourceGuidance().listEmpty;
   $("#selected-count").textContent = state.selected.size;
   $("#bulk-proxy-button").disabled = !state.selected.size || state.batchBusy || state.deleteBusy;
+  $("#clear-cache-button").disabled = !state.selected.size || state.batchBusy || state.deleteBusy || state.saving || state.preparingSave || state.loading;
   $$("[data-batch]").forEach(
     (button) => (button.disabled = state.batchBusy || state.deleteBusy || state.selected.size === 0 || (button.dataset.batch === "open" && active.some((profile) => state.selected.has(String(profile.id)) && isDeletePending(profile)))),
   );
@@ -2225,7 +2292,7 @@ function prepareDraft(profile) {
   return profile;
 }
 async function saveProfile() {
-  if (state.saving || state.preparingSave || !state.draft || state.operationActions.get(String(state.draft.id)) === "delete") return;
+  if (state.saving || state.preparingSave || !state.draft || ["delete", "clear_cache"].includes(state.operationActions.get(String(state.draft.id)))) return;
   if (isDeletePending(state.draft) || isDeletePending(profileById(state.draft.id))) {
     showDrawerError("删除未完成，请关闭编辑并重新执行删除。");
     return;
@@ -2413,6 +2480,8 @@ function forgetDeletedProfiles(ids) {
   }
   $("#row-menu").hidden = true;
   $("#row-menu").innerHTML = "";
+  invalidateSyncMetadata();
+  state.sync.metadataPending = 0;
   state.sync.previewRevision++;
   state.sync.loading = false;
   state.sync.previewId = null;
@@ -2656,6 +2725,59 @@ async function batchAction(action, button, { recycle = false } = {}) {
       state.operationActions.delete(String(id));
     });
     button.textContent = label;
+    renderProfiles();
+  }
+}
+async function clearSelectedCache(button = $("#clear-cache-button")) {
+  if (state.batchBusy || state.deleteBusy || state.saving || state.preparingSave || state.loading) return;
+  const ids = [...new Set(Array.from(state.selected, String))];
+  if (!ids.length) return;
+  if (ids.some((id) => {
+    const profile = profileById(id);
+    return !profile || isArchived(profile) || isDeletePending(profile) || state.deletedIds.has(id) || state.operationIds.has(id);
+  })) {
+    toast("所选窗口状态已变化或正在操作，请稍后重新选择。", "error");
+    return;
+  }
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "正在清理缓存…";
+  state.batchBusy = true;
+  state.statusRevision++;
+  ids.forEach((id) => { state.operationIds.add(id); state.operationActions.set(id, "clear_cache"); });
+  renderProfiles();
+  let completed = 0, skipped = 0, failed = 0, removedBytes = 0, processed = 0;
+  const summary = () => `已清理 ${completed} 个，跳过 ${skipped} 个，失败 ${failed} 个，已清理缓存 ${syncProgressBytes(removedBytes)}。`;
+  const guidance = "仅清理临时缓存，保留登录和已打开网页；运行中或占用无法确认的窗口跳过。";
+  try {
+    for (let offset = 0; offset < ids.length; offset += 100) {
+      const chunk = ids.slice(offset, offset + 100);
+      const result = await api("clear_cache", { ids: chunk });
+      if (!Array.isArray(result?.results) || result.results.length !== chunk.length) throw new Error();
+      const results = chunk.map((id) => {
+        const matches = result.results.filter((item) => item?.id === id);
+        const item = matches.length === 1 ? matches[0] : null;
+        if (!item || !["cleaned", "skipped", "failed"].includes(item.status) ||
+            !Number.isSafeInteger(item.removed_files) || item.removed_files < 0 ||
+            !Number.isSafeInteger(item.removed_bytes) || item.removed_bytes < 0) throw new Error();
+        return item;
+      });
+      for (const item of results) {
+        if (item.status === "cleaned") completed++;
+        else if (item.status === "skipped") skipped++;
+        else failed++;
+        removedBytes += item.removed_bytes;
+      }
+      processed += chunk.length;
+    }
+    toast(`缓存清理结束：${summary()}${guidance}`, failed ? "error" : "success");
+  } catch {
+    toast(`缓存清理中断：${summary()}另有 ${ids.length - processed} 个结果未确认，后续批次已停止。${guidance}`, "error");
+  } finally {
+    state.batchBusy = false;
+    ids.forEach((id) => { state.operationIds.delete(id); state.operationActions.delete(id); });
+    button.textContent = label;
+    button.disabled = false;
     renderProfiles();
   }
 }
@@ -3134,6 +3256,7 @@ function bindEvents() {
     state.selected.clear();
     renderProfiles();
   };
+  $("#clear-cache-button").onclick = () => clearSelectedCache();
   $$("[data-batch]").forEach(
     (button) =>
       (button.onclick = () => batchAction(button.dataset.batch, button)),

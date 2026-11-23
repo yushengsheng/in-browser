@@ -91,6 +91,10 @@ class ManagerService:
         from profile_delete import delete_profiles
         return delete_profiles(self,identities)
 
+    def clear_cache(self,identities):
+        from profile_cache import clear_cache
+        return clear_cache(self,identities)
+
     def synchronizer(self):
         if self._synchronizer is not None:return self._synchronizer
         with self.operations:
