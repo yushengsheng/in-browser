@@ -11,7 +11,6 @@ import secrets
 import stat
 import threading
 import time
-import traceback
 import uuid
 from urllib.parse import unquote
 
@@ -27,6 +26,7 @@ from sync_state import SyncState,WorkerLease
 from sync_executor import run_bounded
 from engine_validation import verification_scope
 from import_progress import ImportProgress,observe,emit
+from import_diagnostics import failure_record,persist_failure
 
 MAX_SYNC_SOURCES=9999
 MAX_SYNC_WORKERS=5
@@ -239,6 +239,15 @@ class WindowSynchronizer:
             entries.append(value)
             del entries[:-100]
 
+    def _failure_diagnostic(self,identity,index,progress,error):
+        try:
+            phase=(progress.snapshot(identity) or {}).get('phase')
+            record=failure_record(identity,index,phase,error)
+            self._diagnostic(identity,record)
+            persist_failure(self.service.store,record)
+        except Exception:
+            pass  # Diagnostic storage cannot replace the original import outcome.
+
     def _run_item(self,identity,index,candidate,*,preflight_error=None):
         position=self.state.begin_item(identity,index)
         if position is None:return
@@ -255,11 +264,12 @@ class WindowSynchronizer:
                 else:
                     imported=self._import(candidate,emit)
                     result.update(status='skipped' if imported is False else 'completed',message='该来源已经同步，保留原有副本。' if imported is False else '完整独立副本已保存。')
-        except LocalBrowserError as exc:result.update(status='failed',message=str(exc))
+        except LocalBrowserError as exc:
+            result.update(status='failed',message=str(exc))
+            if not preflight_error:self._failure_diagnostic(identity,index,progress,exc)
         except Exception as exc:
-            self._diagnostic(identity,{'ordinal':index,'type':type(exc).__name__,'errno':getattr(exc,'errno',None),'winerror':getattr(exc,'winerror',None),
-                'frames':[{'file':Path(f.filename).name,'line':f.lineno} for f in traceback.extract_tb(exc.__traceback__)]})
             result.update(status='failed',message='本次同步未完成，来源和已有本地窗口未修改。请检查磁盘、文件占用或授权。')
+            self._failure_diagnostic(identity,index,progress,exc)
         finally:
             timing=progress.finish()
             if timing:self._diagnostic(identity,timing)
@@ -288,11 +298,14 @@ class WindowSynchronizer:
                 preflight_error=None
                 if not self.state.cancelled(identity):
                     try:self._prepare_roots()
-                    except LocalBrowserError as exc:preflight_error=str(exc)
+                    except LocalBrowserError as exc:
+                        preflight_error=str(exc)
+                        self._failure_diagnostic(identity,0,self.progress,exc)
                 run_bounded(self.state.pending(identity),lambda index,candidate:self._run_item(identity,index,candidate,preflight_error=preflight_error),
                             lambda:self.state.cancelled(identity),max_workers=MAX_SYNC_WORKERS)
             self._update(identity,state='cancelled' if self.state.cancelled(identity) else 'completed',phase='finished')
-        except Exception:
+        except Exception as exc:
+            self._failure_diagnostic(identity,0,self.progress,exc)
             try:self._update(identity,state='interrupted',phase='finished',message='同步任务中止，已完成的副本仍保留，可继续剩余项。')
             except Exception:pass
         finally:
@@ -448,7 +461,12 @@ class WindowSynchronizer:
         # Windows rename rejects existing files and directories atomically and
         # also works on removable filesystems without hard-link support.
         if target.exists():raise LocalBrowserError('本地目标已存在，未覆盖。')
-        if os.name=='nt' or source.is_dir():os.rename(source,target)
+        if os.name=='nt' or source.is_dir():
+            try:os.rename(source,target)
+            except OSError as error:
+                if os.name=='nt' and getattr(error,'winerror',None) in (5,32,33):
+                    error._sync_publish_retryable=True
+                raise
         else:
             os.link(source,target)
             source.unlink()
@@ -464,6 +482,14 @@ class WindowSynchronizer:
             if changed:path.chmod(previous)
 
     def _complete_intent(self,intent):
+        for attempt in range(3):
+            try:return self._complete_intent_once(intent)
+            except OSError as error:
+                if (getattr(error,'_sync_publish_retryable',False) is not True or
+                        getattr(error,'winerror',None) not in (5,32,33) or attempt==2):raise
+                time.sleep(.05*(attempt+1))
+
+    def _complete_intent_once(self,intent):
         store=self.service.store;work,final,config=self._intent_paths(intent)
         bound=store.source_binding(intent['source_key'])
         if bound:

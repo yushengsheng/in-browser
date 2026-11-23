@@ -5,6 +5,8 @@ __pycache__/
 /app/engines/
 /app/local-engines/
 /runtime/
+/测试文件夹/
+/便携包/
 /.playwright-cli/
 /dist/
 /release-manifest.json
