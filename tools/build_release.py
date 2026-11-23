@@ -30,7 +30,8 @@ RUNTIME_EXECUTABLES=('python/python.exe','python/pythonw.exe','node/node.exe','w
 UPDATE_POLICY={'format':1,'data_format':1,'from_versions':{
     '0.2.7':'d2d219a3fa3006b062e3dae84e40555c69ef6d438de71cf79f379e3b7cfd7429',
     '0.2.8':'d55eb735872ee52883222b98fb5b6272c01b33970b4ad120be1b049d613d84d3',
-    '0.2.9':'9a9dae8b412cb893239cfb271f573abb8b29b43eed5449e7d7135dd4881c1f81'}}
+    '0.2.9':'9a9dae8b412cb893239cfb271f573abb8b29b43eed5449e7d7135dd4881c1f81',
+    '0.2.10':'604c4380e30d04ad33f6f6bd31ca860812b660a2439dccb20ed7f29678dc4189'}}
 
 
 def ordinary(path):

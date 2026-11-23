@@ -376,6 +376,27 @@ def _profile_digest(path,expected,deadline):
     return digest.hexdigest()
 
 
+def _profile_inventory_changes(before,after):
+    fields=('dev','ino','size','mtime','ctime');changes=[]
+    # files mirrors legacy/critical and must not duplicate their evidence.
+    for group in ('legacy','directories','critical'):
+        previous=before[group];current=after[group];changed={'directory':set(),'file':set()}
+        for name in previous.keys()|current.keys():
+            kind='directory' if group=='directories' or (group=='legacy' and name in ('','Default')) else 'file'
+            selected=changed[kind]
+            if name not in previous or name not in current:
+                selected.add('members');continue
+            left=previous[name];right=current[name]
+            if (left is None)!=(right is None):selected.add('presence')
+            elif left is not None and right is not None:
+                selected.update(field for index,field in enumerate(fields) if left[index]!=right[index])
+        for kind,selected in changed.items():
+            if selected:
+                changes.append({'check':'source_inventory','group':group,'kind':kind,
+                                'fields':[field for field in ('members','presence',*fields) if field in selected]})
+    return changes
+
+
 def profile_identity(configuration,identity):
     """Bind preparation to bounded, twice-read closed-source configuration inputs."""
     identity=_identity(identity);deadline=time.monotonic()+_PROFILE_IDENTITY_SECONDS
@@ -386,7 +407,12 @@ def profile_identity(configuration,identity):
             observed={relative:_profile_digest(folder/relative,value,deadline)
                       for relative,value in sorted(before['files'].items())}
             if hashes is not None and hashes!=observed:raise ValueError()
-            if _profile_inventory(root,folder,deadline)!=before:raise ValueError()
+            after=_profile_inventory(root,folder,deadline)
+            if after!=before:
+                error=ValueError()
+                try:error._import_changes=_profile_inventory_changes(before,after)
+                except Exception:pass
+                raise error
             hashes=observed
         output=[value+([hashes[relative]] if relative in hashes else [])
                 for relative,value in before['legacy'].items()]

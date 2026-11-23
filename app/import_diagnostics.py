@@ -12,6 +12,8 @@ from import_progress import PHASES
 
 SETTING_KEY = 'sync_failure_diagnostics_v1'
 MAX_RECORDS = 100
+_INVENTORY_FIELDS = ('members', 'presence', 'dev', 'ino', 'size', 'mtime', 'ctime')
+_MEMBER_FIELDS = ('dev', 'ino', 'type', 'size', 'mtime', 'created', 'ctime', 'mode', 'attributes')
 _TYPES = frozenset(('Exception', 'LocalBrowserError', 'OSError', 'PermissionError',
     'FileNotFoundError', 'FileExistsError', 'NotADirectoryError', 'IsADirectoryError',
     'TimeoutError', 'ConnectionError', 'ConnectionResetError', 'ConnectionAbortedError',
@@ -86,6 +88,57 @@ def _number(value):
     return value if type(value) is int and -(2**31) <= value < 2**32 else None
 
 
+def _changes(error, limit):
+    if limit <= 0:
+        return []
+    try:
+        value = getattr(error, '_import_changes', None)
+    except Exception:
+        return []
+    if type(value) is not list:
+        return []
+    result = []
+    for item in value[:8]:
+        if len(result) >= limit:
+            break
+        if type(item) is not dict or not 4 <= len(item) <= 6 or any(type(key) is not str for key in item):
+            continue
+        check = item.get('check'); kind = item.get('kind'); fields = item.get('fields')
+        if type(check) is not str or type(kind) is not str or kind not in ('directory', 'file'):
+            continue
+        if check == 'source_inventory':
+            if set(item) != {'check', 'kind', 'group', 'fields'}:
+                continue
+            group = item['group']
+            if (type(group) is not str or group not in ('legacy', 'directories', 'critical') or
+                    (group == 'directories' and kind != 'directory') or (group == 'critical' and kind != 'file')):
+                continue
+            allowed = _INVENTORY_FIELDS
+            safe = {'check': check, 'kind': kind, 'group': group}
+        elif check == 'copy_member':
+            required = {'check', 'kind', 'relation', 'fields'}
+            optional = {'ino_zero_before', 'ino_zero_after'}
+            if not required <= set(item) or set(item) - required - optional:
+                continue
+            relation = item['relation']
+            if type(relation) is not str or relation not in ('parent', 'member'):
+                continue
+            if any(type(item[key]) is not bool for key in optional if key in item):
+                continue
+            allowed = _MEMBER_FIELDS
+            safe = {'check': check, 'kind': kind, 'relation': relation}
+            safe.update((key, item[key]) for key in ('ino_zero_before', 'ino_zero_after') if key in item)
+        else:
+            continue
+        if (type(fields) is not list or not 1 <= len(fields) <= len(allowed) or
+                any(type(field) is not str or field not in allowed for field in fields) or
+                len(set(fields)) != len(fields)):
+            continue
+        safe['fields'] = [field for field in allowed if field in fields]
+        result.append(safe)
+    return result
+
+
 def failure_record(job_id, ordinal, phase, error):
     """Copy only fixed fields; never format an exception or inspect frame locals."""
     if not isinstance(job_id, str) or not re.fullmatch(r'[0-9a-f]{32}', job_id):
@@ -96,6 +149,7 @@ def failure_record(job_id, ordinal, phase, error):
     errors = []
     seen = set()
     frame_budget = 12
+    change_budget = 8
     while error is not None and id(error) not in seen and len(errors) < 4:
         seen.add(id(error))
         name = type(error).__name__
@@ -107,6 +161,10 @@ def failure_record(job_id, ordinal, phase, error):
                        'winerror': _number(getattr(error, 'winerror', None)),
                        'code': code if type(code) is str and code in _CODES else None,
                        'frames': frames})
+        changes = _changes(error, change_budget)
+        if changes:
+            errors[-1]['changes'] = changes
+            change_budget -= len(changes)
         # from None hides display but retains useful, safely filtered context.
         error = error.__cause__ if error.__cause__ is not None else error.__context__
     if not errors:

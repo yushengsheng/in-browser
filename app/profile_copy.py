@@ -82,13 +82,32 @@ def _same_inventory(before,after):
     return before.keys()==after.keys() and all(_state(info)==_state(after[name]) for name,info in before.items())
 
 
+def _member_change(before,after,*,stable,relation,created_field):
+    previous=before[0] if stable else before;current=after[0] if stable else after
+    fields=('dev','ino','type')
+    if stable:
+        fields+=('size','mtime',created_field,'mode','attributes')
+        before=(*previous,*before[1:]);after=(*current,*after[1:])
+    return {'check':'copy_member','kind':'directory' if stat.S_ISDIR(previous[2]) else 'file',
+            'relation':relation,'fields':[field for index,field in enumerate(fields) if before[index]!=after[index]],
+            'ino_zero_before':previous[1]==0,'ino_zero_after':current[1]==0}
+
+
 def _member(root,name,inventory,*,stable=True):
     # An unchanged immediate directory identity keeps each access in its recorded
     # directory. Full ancestor/link checks bracket each phase and publication.
     for relative in ((name.parent,name) if name!=Path('.') else (name,)):
         expected=inventory[relative];actual=_info(root/relative)
-        if (_state(actual) if stable else _identity(actual))!=(_state(expected) if stable else _identity(expected)):
-            raise LocalBrowserError('资料在复制时发生变化，未将副本标记为完成。')
+        after=_state(actual) if stable else _identity(actual)
+        before=_state(expected) if stable else _identity(expected)
+        if after!=before:
+            error=LocalBrowserError('资料在复制时发生变化，未将副本标记为完成。')
+            try:
+                created='created' if os.name=='nt' and hasattr(expected,'st_birthtime_ns') and hasattr(actual,'st_birthtime_ns') else 'ctime'
+                error._import_changes=[_member_change(before,after,stable=stable,
+                    relation='member' if relative==name else 'parent',created_field=created)]
+            except Exception:pass
+            raise error
 
 
 def _hashes(root,inventory,parents,phase=None):

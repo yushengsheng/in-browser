@@ -1,9 +1,11 @@
 """Synthetic encrypted failure evidence; fixtures are retained for manual removal."""
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import json
 import os
 from pathlib import Path
 import sys
+import stat
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'app'), str(ROOT / 'tests')]
 
 import import_diagnostics
+import local_source
 from import_diagnostics import SETTING_KEY, failure_record, persist_failure
 from import_progress import emit
 from local_state import LocalBrowserError
@@ -186,6 +189,136 @@ class ImportDiagnosticsTests(unittest.TestCase):
         records = service.store.setting(SETTING_KEY)
         self.assertEqual([item['ordinal'] for item in records], [0])
         self.assertTrue(all(item['type'] == 'LocalBrowserError' for item in records))
+
+    def test_inventory_failure_reports_grouped_fields_without_repeated_files_or_io(self):
+        stamp = [11, 22, 33, 44, 55]
+        before = {'legacy': {'': stamp[:], 'Default': stamp[:], 'Local State': stamp[:]},
+                  'directories': {'Default/Sessions': stamp[:]},
+                  'critical': {SECRET + '-removed': stamp[:], SECRET + '-optional': None,
+                               SECRET + '-changed': stamp[:]},
+                  'files': {'Local State': stamp[:], SECRET + '-removed': stamp[:],
+                            SECRET + '-changed': stamp[:]}}
+        after = copy.deepcopy(before)
+        after['legacy']['Default'][3] += 1
+        after['legacy']['Local State'] = [value + 1 for value in stamp]
+        after['directories']['Default/Sessions'][1] += 1
+        del after['critical'][SECRET + '-removed']
+        after['critical'][SECRET + '-optional'] = stamp[:]
+        after['critical'][SECRET + '-changed'][2] += 1
+        after['files'] = {'Local State': after['legacy']['Local State'],
+                         **{name: value for name, value in after['critical'].items() if value is not None}}
+        with patch.object(local_source, 'profile_root', return_value=self.root), \
+                patch.object(local_source, '_profile_inventory', side_effect=[before, after]) as inventory, \
+                patch.object(local_source, '_profile_digest', return_value='synthetic-digest') as digest:
+            with self.assertRaises(LocalBrowserError) as captured:
+                local_source.profile_identity(SimpleNamespace(), JOB)
+        self.assertEqual(inventory.call_count, 2)
+        self.assertEqual(digest.call_count, len(before['files']))
+        self.assertEqual(str(captured.exception),
+                         '来源关键资料正在变化、超出安全检查范围或不能安全读取，请正常关闭后重新准备。')
+        record = failure_record(JOB, 1, 'preparing', captured.exception)
+        self.assertNotIn('changes', record)
+        changes = record['contexts'][0]['changes']
+        self.assertEqual(changes, [
+            {'check': 'source_inventory', 'kind': 'directory', 'group': 'legacy', 'fields': ['mtime']},
+            {'check': 'source_inventory', 'kind': 'file', 'group': 'legacy',
+             'fields': ['dev', 'ino', 'size', 'mtime', 'ctime']},
+            {'check': 'source_inventory', 'kind': 'directory', 'group': 'directories', 'fields': ['ino']},
+            {'check': 'source_inventory', 'kind': 'file', 'group': 'critical',
+             'fields': ['members', 'presence', 'size']}])
+        self.assertNotIn(SECRET, json.dumps(record))
+        persist_failure(self.store, record)
+        self.assertEqual(WindowStore(SimpleNamespace(), self.root).setting(SETTING_KEY), [record])
+        for path in self.root.glob('windows.sqlite*'):
+            self.assertNotIn(SECRET.encode(), path.read_bytes())
+
+    def test_member_comparison_reports_only_compared_fields_and_no_extra_reads(self):
+        expected = SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFDIR | 0o700,
+            st_size=3, st_mtime_ns=4, st_ctime_ns=5, st_birthtime_ns=6, st_file_attributes=0)
+        name = Path(SECRET) / 'child'
+        for stable, relation in ((True, 'parent'), (True, 'member'), (False, 'member')):
+            with self.subTest(stable=stable, relation=relation):
+                actual = copy.copy(expected)
+                actual.st_dev = 7; actual.st_ino = 0; actual.st_mode = stat.S_IFREG | 0o400
+                actual.st_size = 8; actual.st_mtime_ns = 9; actual.st_ctime_ns = 10
+                actual.st_birthtime_ns = 11; actual.st_file_attributes = 2
+                observed = [actual] if relation == 'parent' else [expected, actual]
+                with patch.object(profile_copy, '_info', side_effect=observed) as info:
+                    with self.assertRaises(LocalBrowserError) as captured:
+                        profile_copy._member(self.root, name,
+                            {name.parent: expected, name: expected}, stable=stable)
+                self.assertEqual(info.call_count, len(observed))
+                self.assertEqual(str(captured.exception), '资料在复制时发生变化，未将副本标记为完成。')
+                record = failure_record(JOB, 1, 'source_hash', captured.exception)
+                fields = ['dev', 'ino', 'type']
+                if stable:
+                    fields += ['size', 'mtime', 'created' if os.name == 'nt' else 'ctime', 'mode', 'attributes']
+                self.assertEqual(record['changes'], [{'check': 'copy_member', 'kind': 'directory',
+                    'relation': relation, 'fields': fields, 'ino_zero_before': False, 'ino_zero_after': True}])
+                self.assertNotIn(SECRET, json.dumps(record))
+
+    def test_field_diagnostic_collection_failures_preserve_original_outcomes(self):
+        before = {'files': {}}
+        after = {'files': {SECRET: []}}
+        with patch.object(local_source, 'profile_root', return_value=self.root), \
+                patch.object(local_source, '_profile_inventory', side_effect=[before, after]), \
+                patch.object(local_source, '_profile_inventory_changes', side_effect=RuntimeError(SECRET)):
+            with self.assertRaises(LocalBrowserError) as source_error:
+                local_source.profile_identity(SimpleNamespace(), JOB)
+        self.assertIs(type(source_error.exception.__context__), ValueError)
+        self.assertNotIn('changes', failure_record(JOB, 1, 'preparing', source_error.exception)['contexts'][0])
+        expected = SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFDIR)
+        actual = SimpleNamespace(st_dev=1, st_ino=3, st_mode=stat.S_IFDIR)
+        with patch.object(profile_copy, '_info', return_value=actual), \
+                patch.object(profile_copy, '_member_change', side_effect=RuntimeError(SECRET)):
+            with self.assertRaises(LocalBrowserError) as member_error:
+                profile_copy._member(self.root, Path('.'), {Path('.'): expected}, stable=False)
+        self.assertEqual(str(member_error.exception), '资料在复制时发生变化，未将副本标记为完成。')
+        self.assertNotIn('changes', failure_record(JOB, 1, 'source_hash', member_error.exception))
+
+    def test_change_evidence_rejects_private_values_extra_keys_and_nonbuiltin_types(self):
+        class PrivateList(list):
+            pass
+        class PrivateString(str):
+            pass
+        class PrivateDict(dict):
+            pass
+        valid = {'check': 'copy_member', 'kind': 'file', 'relation': 'member',
+                 'fields': ['ino'], 'ino_zero_before': False, 'ino_zero_after': True}
+        invalid = [dict(valid, path=SECRET), dict(valid, fields=[SECRET]), dict(valid, kind=SECRET),
+                   dict(valid, relation=SECRET), dict(valid, check=SECRET), dict(valid, ino_zero_before=SECRET),
+                   dict(valid, ino_zero_after=1), dict(valid, fields=PrivateList(['ino'])),
+                   dict(valid, fields=[PrivateString('ino')]), dict(valid, fields=['ino', 'ino']),
+                   PrivateDict(valid), {'check': 'source_inventory', 'kind': 'file',
+                                       'group': SECRET, 'fields': ['size']}]
+        baseline = failure_record(JOB, 1, 'checking', ValueError())
+        for value in invalid:
+            error = ValueError(SECRET)
+            error._import_changes = [value]
+            self.assertEqual(failure_record(JOB, 1, 'checking', error), baseline)
+        error._import_changes = PrivateList([valid])
+        self.assertEqual(failure_record(JOB, 1, 'checking', error), baseline)
+        class BrokenEvidence(ValueError):
+            @property
+            def _import_changes(self):
+                raise RuntimeError(SECRET)
+        record = failure_record(JOB, 1, 'checking', BrokenEvidence())
+        self.assertNotIn('changes', record)
+        self.assertNotIn(SECRET, json.dumps(record))
+
+    def test_change_evidence_is_rebuilt_and_bounded_across_exception_chain(self):
+        evidence = {'check': 'source_inventory', 'kind': 'file', 'group': 'critical', 'fields': ['size']}
+        inner = ValueError(SECRET)
+        inner._import_changes = [evidence] * 8
+        outer = LocalBrowserError(SECRET)
+        outer.__context__ = inner
+        outer._import_changes = [evidence] * 10
+        record = failure_record(JOB, 1, 'checking', outer)
+        self.assertEqual(len(record['changes']), 8)
+        self.assertNotIn('changes', record['contexts'][0])
+        evidence['fields'].append(SECRET)
+        self.assertTrue(all(item['fields'] == ['size'] for item in record['changes']))
+        self.assertNotIn(SECRET, json.dumps(record))
 
 
 if __name__ == '__main__':
