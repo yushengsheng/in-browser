@@ -449,9 +449,22 @@ def stage(base, target, work, old_files, new_files, operations, deadline):
 
 def finish_directory(target, work, identity):
     destination = target / ('.program-update-backup-' + identity)
-    require(not _exists(destination), 'backup_collision')
-    os.rename(work, destination)
-    return destination
+    directory = _identity(_ordinary(work, directory=True))
+    owner_path = work / 'owner.json'
+    owner = _json_file(owner_path, 4096)
+    for attempt in range(5):
+        if attempt:
+            require(_identity(_ordinary(work, directory=True)) == directory
+                    and _json_file(owner_path, 4096) == owner, 'changed_after_interruption')
+        require(not _exists(destination), 'backup_collision')
+        try:
+            # Windows rename refuses to replace a destination created after the check.
+            os.rename(work, destination)
+            return destination
+        except OSError as error:
+            if getattr(error, 'winerror', None) not in (5, 32, 33) or attempt == 4:
+                raise
+            time.sleep(0.05 * 2 ** attempt)
 
 
 def _context(base, target, work):

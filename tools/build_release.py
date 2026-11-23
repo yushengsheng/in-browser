@@ -5,6 +5,7 @@ reports never enter either output. A runtime build contains the original 148
 engine; other supported engines are deployed when importing their sources.
 """
 import argparse
+from email.parser import BytesHeaderParser
 import hashlib
 import json
 from pathlib import Path
@@ -27,13 +28,58 @@ TOP=('README.md','AGENTS.md','本地浏览器说明.md','开发说明.md','启�
      'requirements.txt','THIRD_PARTY_NOTICES.md','.gitignore')
 RUNTIME_EXECUTABLES=('python/python.exe','python/pythonw.exe','node/node.exe','webview2/msedgewebview2.exe')
 UPDATE_POLICY={'format':1,'data_format':1,'from_versions':{
-    '0.2.7':'d2d219a3fa3006b062e3dae84e40555c69ef6d438de71cf79f379e3b7cfd7429'}}
+    '0.2.7':'d2d219a3fa3006b062e3dae84e40555c69ef6d438de71cf79f379e3b7cfd7429',
+    '0.2.8':'d55eb735872ee52883222b98fb5b6272c01b33970b4ad120be1b049d613d84d3'}}
 
 
 def ordinary(path):
     info=path.lstat()
     if stat.S_ISLNK(info.st_mode) or getattr(info,'st_file_attributes',0)&0x400:raise ValueError('Special path')
     if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):raise ValueError('Special file')
+
+
+def distribution_name(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def verify_runtime_requirements(runtime, requirements):
+    ordinary(requirements)
+    expected = {}
+    for line in requirements.read_text('utf-8-sig').splitlines():
+        pin = line.partition('#')[0].strip()
+        if not pin:
+            continue
+        match = re.fullmatch(r'([A-Za-z0-9]+(?:[-_.]+[A-Za-z0-9]+)*)\s*==\s*([A-Za-z0-9][A-Za-z0-9._+!-]*)', pin)
+        if not match or distribution_name(match[1]) in expected:
+            raise ValueError('Invalid pinned runtime requirement')
+        expected[distribution_name(match[1])] = match[2]
+    if not expected:
+        raise ValueError('Empty runtime requirements')
+
+    site = runtime / 'python' / 'site-packages'
+    ordinary(site.parent)
+    ordinary(site)
+    found = set()
+    for info in site.glob('*.dist-info'):
+        ordinary(info)
+        metadata = info / 'METADATA'
+        ordinary(metadata)
+        with metadata.open('rb') as stream:
+            message = BytesHeaderParser().parse(stream)
+        names = message.get_all('Name', [])
+        versions = message.get_all('Version', [])
+        if len(names) != 1 or len(versions) != 1:
+            raise ValueError('Invalid runtime distribution metadata')
+        name = distribution_name(names[0])
+        directory_name, _, directory_version = info.stem.rpartition('-')
+        if distribution_name(directory_name) != name or directory_version != versions[0]:
+            raise ValueError('Inconsistent runtime distribution metadata')
+        if name in expected:
+            if name in found or versions[0] != expected[name]:
+                raise ValueError('Ambiguous or incorrect runtime dependency')
+            found.add(name)
+    if expected.keys() != found:
+        raise ValueError('Missing runtime dependency')
 
 
 def source_files(root=ROOT):
@@ -104,6 +150,7 @@ def main():
             ordinary(runtime)
             for name in RUNTIME_EXECUTABLES:
                 ordinary((runtime/name).parent);ordinary(runtime/name)
+            verify_runtime_requirements(runtime, ROOT / 'requirements.txt')
         overlay=bool(runtime)
         package_id=uuid.uuid4().hex if overlay else None
         program=target/PACKAGE_DIRECTORY/package_id if overlay else target

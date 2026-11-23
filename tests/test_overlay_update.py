@@ -40,6 +40,13 @@ def interrupt_at(phase, name=None):
     return stop
 
 
+def pending_directory(target):
+    work = target / updater.PENDING
+    owner = {'format': 1, 'id': PACKAGE_ID, 'purpose': 'program-update', 'overlay_package': PACKAGE_ID}
+    write(work / 'owner.json', json.dumps(owner).encode())
+    return work, target / ('.program-update-backup-' + PACKAGE_ID)
+
+
 class OverlayUpdate(unittest.TestCase):
     setUpClass = classmethod(InplaceUpdate.setUpClass.__func__)
     protected = InplaceUpdate.protected
@@ -60,6 +67,101 @@ class OverlayUpdate(unittest.TestCase):
         new_files, _ = updater.compatible_source(source)
         effective = updater.effective_old_files(target, old_files, new_files)
         updater.verify_old_release(target, effective)
+
+    def test_commit_directory_retries_only_windows_lock_errors_and_renames_once(self):
+        with fixture() as target:
+            work, backup = pending_directory(target)
+            initial = snapshot(work)
+            real_rename = os.rename
+            attempted = []
+            def rename(source, destination):
+                self.assertEqual((source, destination), (work, backup))
+                self.assertTrue(work.is_dir())
+                self.assertFalse(backup.exists())
+                attempted.append(source)
+                if len(attempted) <= 3:
+                    error = PermissionError('synthetic sharing conflict')
+                    error.winerror = (5, 32, 33)[len(attempted) - 1]
+                    raise error
+                real_rename(source, destination)
+            with patch.object(updater.os, 'rename', side_effect=rename), patch.object(updater.time, 'sleep') as delay:
+                self.assertEqual(updater.finish_directory(target, work, PACKAGE_ID), backup)
+            self.assertEqual(len(attempted), 4)
+            self.assertEqual([call.args[0] for call in delay.call_args_list], [.05, .1, .2])
+            self.assertFalse(work.exists())
+            self.assertEqual(snapshot(backup), initial)
+
+    def test_commit_directory_refuses_a_replaced_transaction_owner_or_backup_after_waiting(self):
+        for change in ('directory', 'owner', 'backup'):
+            with self.subTest(change=change), fixture() as target:
+                work, backup = pending_directory(target)
+                original_owner = (work / 'owner.json').read_bytes()
+                displaced = target / 'displaced'
+                real_rename = os.rename
+                def change_during_wait(_seconds):
+                    if change == 'directory':
+                        self.assertEqual(work.resolve().parent, target.resolve())
+                        self.assertEqual(displaced.resolve().parent, target.resolve())
+                        real_rename(work, displaced)
+                        write(work / 'owner.json', original_owner)
+                    elif change == 'owner':
+                        write(work / 'owner.json', b'{"different":"owner"}')
+                    else:
+                        write(backup / 'previous', b'keep existing backup')
+                busy = PermissionError('synthetic sharing conflict')
+                busy.winerror = 32
+                with patch.object(updater.os, 'rename', side_effect=busy) as rename, \
+                        patch.object(updater.time, 'sleep', side_effect=change_during_wait), \
+                        self.assertRaises(updater.UpdateError) as caught:
+                    updater.finish_directory(target, work, PACKAGE_ID)
+                self.assertEqual(caught.exception.code, 'backup_collision' if change == 'backup' else 'changed_after_interruption')
+                rename.assert_called_once_with(work, backup)
+                self.assertTrue(work.is_dir())
+                if change == 'backup':
+                    self.assertEqual((backup / 'previous').read_bytes(), b'keep existing backup')
+                else:
+                    self.assertFalse(backup.exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows directory sharing')
+    def test_commit_directory_keeps_the_transaction_when_a_real_handle_denies_rename(self):
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        with fixture() as target:
+            work, backup = pending_directory(target)
+            original = snapshot(work)
+            # Open the actual directory without FILE_SHARE_DELETE.
+            handle = kernel.CreateFileW(str(work), 0x80000000, 1 | 2, None, 3, 0x02000000, None)
+            self.assertNotIn(handle, (None, ctypes.c_void_p(-1).value))
+            try:
+                with patch.object(updater.time, 'sleep') as delay, self.assertRaises(OSError) as caught:
+                    updater.finish_directory(target, work, PACKAGE_ID)
+                self.assertIn(caught.exception.winerror, (5, 32, 33))
+                self.assertEqual([call.args[0] for call in delay.call_args_list], [.05, .1, .2, .4])
+                self.assertEqual(snapshot(work), original)
+                self.assertFalse(backup.exists())
+            finally:
+                kernel.CloseHandle(handle)
+            self.assertEqual(updater.finish_directory(target, work, PACKAGE_ID), backup)
+            self.assertEqual(snapshot(backup), original)
+
+    def test_commit_directory_propagates_unrelated_errors_without_retry(self):
+        with fixture() as target:
+            work, backup = pending_directory(target)
+            failure = OSError('synthetic device unavailable')
+            failure.winerror = 19
+            with patch.object(updater.os, 'rename', side_effect=failure) as rename, \
+                    patch.object(updater.time, 'sleep') as delay, self.assertRaises(OSError) as caught:
+                updater.finish_directory(target, work, PACKAGE_ID)
+            self.assertIs(caught.exception, failure)
+            rename.assert_called_once_with(work, backup)
+            delay.assert_not_called()
+            self.assertTrue(work.is_dir())
+            self.assertFalse(backup.exists())
 
     def test_overlay_success_preserves_private_engine_and_payload_identities(self):
         with fixture() as scope:

@@ -41,6 +41,12 @@ class ReleaseBuilderTests(unittest.TestCase):
             path = self.runtime / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'synthetic executable')
+        (self.root / 'requirements.txt').write_text('Example_Pkg==1.2.3\n', encoding='utf-8')
+        self.site = self.runtime / 'python/site-packages'
+        self.info = self.site / 'example_pkg-1.2.3.dist-info'
+        self.info.mkdir(parents=True)
+        self.metadata = 'Name: Example.Pkg\nVersion: 1.2.3\n\n'
+        (self.info / 'METADATA').write_text(self.metadata, encoding='utf-8')
         self.target = self.base / 'InBrowser-v0.2.3-windows-x64'
 
     def build(self, *arguments):
@@ -65,6 +71,40 @@ class ReleaseBuilderTests(unittest.TestCase):
                     self.assertFalse(self.target.with_name(self.target.name + '.zip').exists())
                 finally:
                     path.write_bytes(b'synthetic executable')
+
+    def test_incorrect_runtime_requirements_refuse_before_output_creation(self):
+        requirements = self.root / 'requirements.txt'
+        for pin in ('missing==1.2.3', 'example-pkg==1.2.4', 'example-pkg>=1.2',
+                    'example-pkg==1.2.*', 'example-pkg==1.2.3\nExample_Pkg==1.2.3'):
+            with self.subTest(pin=pin):
+                requirements.write_text(pin, encoding='utf-8')
+                status, report = self.build('--runtime-from', str(self.runtime), '--zip')
+                self.assertEqual(status, 1)
+                self.assertFalse(report['success'])
+                self.assertFalse(self.target.exists())
+                self.assertFalse(self.target.with_name(self.target.name + '.zip').exists())
+
+    def test_ambiguous_and_inconsistent_distribution_metadata_refuses_before_build(self):
+        duplicate = self.site / 'example.pkg-1.2.3.dist-info'
+        duplicate.mkdir()
+        (duplicate / 'METADATA').write_text(self.metadata, encoding='utf-8')
+        status, _ = self.build('--runtime-from', str(self.runtime))
+        self.assertEqual(status, 1)
+        self.assertFalse(self.target.exists())
+        (duplicate / 'METADATA').unlink()
+        duplicate.rmdir()
+        metadata = self.info / 'METADATA'
+        for contents in ('Name: Example.Pkg\nVersion: 1.2.2\n', 'Name: other\nVersion: 1.2.3\n',
+                         'Name: Example.Pkg\nVersion: 1.2.3\nVersion: 1.2.3\n'):
+            with self.subTest(contents=contents):
+                metadata.write_text(contents, encoding='utf-8')
+                status, _ = self.build('--runtime-from', str(self.runtime))
+                self.assertEqual(status, 1)
+                self.assertFalse(self.target.exists())
+        metadata.unlink()
+        status, _ = self.build('--runtime-from', str(self.runtime))
+        self.assertEqual(status, 1)
+        self.assertFalse(self.target.exists())
 
     def test_complete_runtime_and_versioned_zip_name_are_preserved(self):
         status, report = self.build('--runtime-from', str(self.runtime), '--zip')
@@ -101,11 +141,17 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertFalse((self.target / 'runtime').exists())
 
     def test_source_only_build_keeps_flat_layout(self):
+        (self.info / 'METADATA').unlink()
         status, report = self.build()
         self.assertEqual(status, 0)
         self.assertEqual(report['layout'], 'flat')
         self.assertNotIn('package_id', report)
         self.assertTrue((self.target / 'release-manifest.json').is_file())
+        policy = json.loads((self.target / 'update-policy.json').read_text('utf-8'))
+        self.assertEqual(policy['from_versions']['0.2.7'],
+                         'd2d219a3fa3006b062e3dae84e40555c69ef6d438de71cf79f379e3b7cfd7429')
+        self.assertEqual(policy['from_versions']['0.2.8'],
+                         'd55eb735872ee52883222b98fb5b6272c01b33970b4ad120be1b049d613d84d3')
         self.assertFalse((self.target / overlay_layout.PACKAGE_DIRECTORY).exists())
         self.assertEqual((self.target / overlay_layout.LAUNCHER).read_bytes(), b'legacy launcher')
         for name in overlay_layout.RETIRED_LAUNCHERS:

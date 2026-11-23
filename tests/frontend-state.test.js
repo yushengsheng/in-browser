@@ -501,6 +501,271 @@ function fixture() {
   return { context, state, element, nodes, timers, toasts, confirmations, serviceErrors, setting, renderProfiles, refreshProfiles, nativeConfirmAction };
 }
 
+test("bulk IP import freezes a numeric sequence across pages independently of the active column sort", async () => {
+  const h = fixture(), requests = [];
+  h.state.profiles = Array.from({ length: 105 }, (_, i) => ({
+    id: "row-" + (i + 1), seq: i + 1, name: i === 102 ? "<fixture>" : "窗口 " + (i + 1),
+  }));
+  h.state.pageSize = 100;
+  h.state.sort = "name";
+  h.state.direction = -1;
+  h.state.page = 2;
+  h.renderProfiles();
+  assert.equal(h.element("#bulk-proxy-button").disabled, true);
+  const pageTwo = h.context.filteredProfiles().slice(100);
+  const manual = pageTwo.find(p => p.seq > 1);
+  h.element("#profile-rows").listeners.get("change")({
+    target: { matches: () => true, checked: true, dataset: { id: manual.id } },
+  });
+  h.element("#select-all").onchange({ target: { checked: true } });
+  h.state.page = 1;
+  h.element("#select-all").onchange({ target: { checked: true } });
+  h.renderProfiles();
+  assert.equal(h.element("#bulk-proxy-button").disabled, false);
+  h.element("#bulk-proxy-button").onclick();
+  const preview = h.element("#bulk-proxy-targets").innerHTML;
+  assert.equal((preview.match(/<li>/g) || []).length, 105);
+  assert.match(preview, /第 1 条<\/span><span>序号 1 · 窗口 1/);
+  assert.match(preview, /第 103 条<\/span><span>序号 103 · &lt;fixture&gt;/);
+  h.state.selected.clear();
+  h.state.selected.add("row-1");
+  const input = h.element("#bulk-proxy-text");
+  input.value = Array.from({ length: 105 }, (_, i) => "row" + i + ".invalid|9|||date").join("\r\n");
+  input.oninput();
+  assert.match(h.element("#bulk-proxy-count").textContent, /105 个窗口，已输入 105 条/);
+  assert.equal(h.element("#bulk-proxy-protocol").value, "socks5");
+  h.element("#bulk-proxy-protocol").value = "https";
+  h.context.api = async (action, payload) => { requests.push({ action, payload }); return { updated: 105 }; };
+  await h.element("#bulk-proxy-submit").onclick();
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].action, "bulk_import_proxies");
+  assert.equal(requests[0].payload.protocol, "https");
+  assert.deepEqual(Array.from(requests[0].payload.ids), h.state.profiles.map(p => p.id));
+  assert.equal(h.element("#bulk-proxy-dialog").open, false);
+  assert.equal(input.value, "");
+});
+
+test("bulk proxy rows follow numeric window numbers, breaking ties and missing numbers by ASCII ID", async () => {
+  const cases = [
+    {
+      selected: [["one", 1], ["four", 4], ["two", 2], ["five", 5]],
+      expected: ["one", "two", "four", "five"],
+    },
+    {
+      selected: [["z-missing", null], ["ten", "10"], ["z-two", 2], ["bad", "x"], ["B-two", "002"], ["zero", 0], ["A-missing"]],
+      expected: ["zero", "B-two", "z-two", "ten", "A-missing", "bad", "z-missing"],
+    },
+  ];
+  for (const { selected, expected } of cases) {
+    const h = fixture();
+    h.state.profiles = selected.map(([id, seq]) => ({ id, seq, name: "name-" + id }));
+    for (const [id] of selected) {
+      h.element("#profile-rows").listeners.get("change")({
+        target: { matches: () => true, checked: true, dataset: { id } },
+      });
+    }
+    h.element("#bulk-proxy-button").onclick();
+    const preview = h.element("#bulk-proxy-targets").innerHTML;
+    assert.deepEqual([...preview.matchAll(/ · name-([\w-]+)/g)].map(m => m[1]), expected);
+    h.element("#bulk-proxy-text").value = selected.map(() => "fixture.invalid|9|||date").join("\n");
+    let sent;
+    h.context.api = async (_action, payload) => { sent = Array.from(payload.ids); return { updated: sent.length }; };
+    await h.element("#bulk-proxy-submit").onclick();
+    assert.deepEqual(sent, expected);
+  }
+});
+
+test("bulk IP import counts pasted formats, preserves credential backslashes and locks pending submission", async () => {
+  const h = fixture(), pending = deferred();
+  h.state.profiles = [{ id: "a" }, { id: "b" }];
+  h.state.selected = new Set(["b", "a"]);
+  h.element("#bulk-proxy-button").onclick();
+  const input = h.element("#bulk-proxy-text"), submit = h.element("#bulk-proxy-submit");
+  const row = "fixture.invalid|9|group\\name|part\\end|date";
+  let submissions = 0, sent = "";
+  let expected = 0;
+  h.context.api = async (action, payload) => {
+    if (action === "bulk_proxy_count") return { count: expected };
+    assert.equal(action, "bulk_import_proxies");
+    submissions++;
+    sent = payload.text;
+    return pending.promise;
+  };
+  const paste = async (value, count) => {
+    expected = count;
+    input.value = value;
+    input.oninput();
+    if (h.state.bulkProxyCount.timer !== null) {
+      assert.equal(submit.disabled, true);
+      await h.timers.get(h.state.bulkProxyCount.timer).callback();
+    }
+  };
+  for (const [value, count] of [["", 0], [row, 1], [[row, row, row].join("\r\n"), 3]]) {
+    await paste(value, count);
+    assert.equal(submit.disabled, true);
+    await submit.onclick();
+  }
+  assert.equal(submissions, 0);
+  for (const separator of ["\n", "\r", "\r\n", "\\", "\\\r\n", "\r\n\\\r\n", "\\ \\ \\ ", "\r\n\\\\\r\n"]) {
+    await paste("\\ " + row + separator + row + "\\ \\", 2);
+    assert.equal(submit.disabled, false);
+  }
+  await paste("fixture.invalid|9||ending\\\n" + row + "\\", 2);
+  assert.equal(submit.disabled, false);
+  const saving = submit.onclick();
+  await submit.onclick();
+  h.element("#bulk-proxy-clear").onclick();
+  h.element("#bulk-proxy-dialog").listeners.get("cancel")({ preventDefault() {} });
+  assert.equal(submissions, 1);
+  assert.equal(sent, input.value);
+  assert.equal(input.disabled, true);
+  assert.equal(h.element("#bulk-proxy-dialog").open, true);
+  pending.resolve({ updated: 2 });
+  await saving;
+  assert.equal(input.value, "");
+  assert.equal(h.state.batchBusy, false);
+});
+
+test("one large multiline paste counts mixed two, four and five column records immediately", async () => {
+  const h = fixture(), calls = [];
+  const separators = ["|", "｜", ":", "：", ",", "，", "----", "\t"];
+  const rows = Array.from({ length: 1200 }, (_, i) => {
+    const separator = separators[i % separators.length];
+    const host = "node-" + i + ".invalid";
+    const account = "fixture-" + i;
+    switch (Math.floor(i / separators.length) % 5) {
+      case 0: return [host, "80"].join(separator);
+      case 1: return [host, "443", account, "synthetic"].join(separator);
+      case 2: return [host, "443", account, "synthetic", ""].join(separator);
+      case 3: return [host, "443", account, "synthetic", "2030-06-30"].join(separator);
+      default: return host + ":443|" + account + "|synthetic";
+    }
+  });
+  h.state.profiles = rows.map((_, i) => ({ id: "target-" + i, seq: i + 1 }));
+  h.state.selected = new Set(h.state.profiles.map(profile => profile.id).reverse());
+  h.element("#bulk-proxy-button").onclick();
+  const input = h.element("#bulk-proxy-text");
+  const pasted = rows.map((row, i) => row + ["\n", "\r\n", "\r", "\n \t\n"][i % 4]).join("");
+  h.context.api = async (action, payload) => {
+    calls.push(action);
+    assert.ok(payload.text === pasted);
+    return { updated: rows.length };
+  };
+  input.value = pasted;
+  input.oninput();
+  assert.equal(h.state.bulkProxyCount.timer, null);
+  assert.deepEqual(calls, []);
+  assert.match(h.element("#bulk-proxy-count").textContent, /1200 个窗口，已输入 1200 条代理/);
+  assert.equal(h.element("#bulk-proxy-submit").disabled, false);
+  await h.element("#bulk-proxy-submit").onclick();
+  assert.deepEqual(calls, ["bulk_import_proxies"]);
+});
+
+test("backend row counts cannot unlock stale drafts, survive an undo or leak across dialog sessions", async () => {
+  const h = fixture(), reads = [], saves = [];
+  h.state.profiles = [{ id: "row", seq: 1 }];
+  h.state.selected.add("row");
+  h.context.api = async (action, payload) => {
+    if (action === "bulk_proxy_count") {
+      const pending = deferred();
+      reads.push(pending);
+      return pending.promise;
+    }
+    assert.equal(action, "bulk_import_proxies");
+    saves.push(payload.text);
+    return { updated: 1 };
+  };
+  const open = h.element("#bulk-proxy-button"), input = h.element("#bulk-proxy-text");
+  const submit = h.element("#bulk-proxy-submit"), status = h.element("#bulk-proxy-count");
+  const paste = value => { input.value = value; input.oninput(); };
+  const fire = () => h.timers.get(h.state.bulkProxyCount.timer).callback();
+  const first = "fixture.invalid|443|realm\\user|synthetic";
+  const second = first + "\n" + first;
+  open.onclick();
+  paste(first);
+  const staleTimer = h.timers.get(h.state.bulkProxyCount.timer);
+  paste(second);
+  await staleTimer.callback();
+  assert.equal(reads.length, 0);
+  const old = fire();
+  input.oninput();
+  await submit.onclick();
+  assert.equal(reads.length, 1);
+  assert.equal(h.state.bulkProxyCount.timer, null);
+  assert.deepEqual(saves, []);
+  paste(first);
+  const changed = fire();
+  paste(second);
+  const undone = fire();
+  reads[0].resolve({ count: 1 });
+  reads[1].reject(new Error("stale"));
+  await Promise.all([old, changed]);
+  assert.equal(submit.disabled, true);
+  assert.match(status.textContent, /正在核对/);
+  reads[2].reject(new Error("offline"));
+  await undone;
+  assert.equal(submit.textContent, "重新核对条数");
+  await submit.onclick();
+  const retry = fire();
+  reads[3].resolve({ count: 2 });
+  await retry;
+  assert.match(status.textContent, /已输入 2 条/);
+  assert.equal(submit.disabled, true);
+  paste(first);
+  const closing = fire();
+  h.element("#bulk-proxy-cancel").onclick();
+  assert.equal(h.state.bulkProxyCount.text, "");
+  open.onclick();
+  paste("fixture.invalid:443");
+  reads[4].resolve({ count: 9 });
+  await closing;
+  assert.equal(submit.disabled, false);
+  assert.match(status.textContent, /已输入 1 条/);
+  await submit.onclick();
+  assert.deepEqual(saves, ["fixture.invalid:443"]);
+});
+
+test("bulk IP import preserves a rejected draft, clears on cancel and distinguishes a refresh failure after saving", async () => {
+  const h = fixture();
+  h.state.profiles = [{ id: "a" }];
+  h.state.selected.add("a");
+  const open = h.element("#bulk-proxy-button"), input = h.element("#bulk-proxy-text");
+  const submit = h.element("#bulk-proxy-submit"), dialog = h.element("#bulk-proxy-dialog");
+  const row = "fixture.invalid|9|||date";
+  open.onclick();
+  input.value = row;
+  input.oninput();
+  h.context.api = async () => { throw new Error("窗口仍在运行"); };
+  await submit.onclick();
+  assert.equal(dialog.open, true);
+  assert.equal(input.value, row);
+  assert.equal(input.disabled, false);
+  assert.equal(h.element("#bulk-proxy-error").textContent, "窗口仍在运行");
+  h.element("#bulk-proxy-clear").onclick();
+  assert.equal(submit.disabled, true);
+  assert.equal(input.value, "");
+  input.value = row;
+  h.element("#bulk-proxy-protocol").value = "http";
+  h.element("#bulk-proxy-cancel").onclick();
+  assert.equal(input.value, "");
+  assert.equal(h.element("#bulk-proxy-targets").innerHTML, "");
+  open.onclick();
+  assert.equal(h.element("#bulk-proxy-protocol").value, "socks5");
+  assert.equal(h.element("#bulk-proxy-error").hidden, true);
+  input.value = row;
+  input.oninput();
+  let saves = 0;
+  h.context.api = async () => { saves++; return { updated: 1 }; };
+  h.context.refreshProfiles = async () => { throw new Error("refresh failed"); };
+  await submit.onclick();
+  await submit.onclick();
+  assert.equal(saves, 1);
+  assert.equal(dialog.open, false);
+  assert.equal(input.value, "");
+  assert.equal(h.toasts.at(-1).type, "success");
+  assert.match(h.serviceErrors.at(-1), /窗口列表刷新失败/);
+});
+
 function windowLayoutData(settings = {}) {
   return {
     settings: { mode: "auto", monitor: "primary", start_x: 0, start_y: 0, width: 640, height: 600,

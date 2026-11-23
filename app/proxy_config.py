@@ -1,4 +1,5 @@
 """Single proxy text grammar shared by forms, imports and launch validation."""
+from datetime import datetime
 import ipaddress
 import re
 from urllib.parse import unquote,urlsplit
@@ -51,6 +52,132 @@ def parse_proxy(text,default_type='socks5'):
             if len(parts)!=2 and len(parts)<4: raise LocalBrowserError('支持主机:端口、主机:端口:用户名:密码，或用竖线分隔。')
             host,port=parts[:2];username=parts[2] if len(parts)>2 else '';password=parts[3] if len(parts)>3 else '';ignored=max(0,len(parts)-4);format='fields'
     return {'proxy':_fields(kind,host,port,username,password),'format':format,'ignored_metadata':ignored}
+
+
+_BULK_SCHEME=r'(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)[:：]//)?'
+_BULK_PORT=(
+    r'(?:[ \u3000]*(?P<token>[:：][|｜]|[|｜][:：]|----|[,，:：|｜;；、\t])[ \u3000]*|(?P<space>[ \u3000]+))'
+    r'(?P<port>[0-9]+)')
+_BULK_HEAD=re.compile(_BULK_SCHEME+r'(?P<host>\[[^\[\]\\\r\n]+\]|(?:(?!----)[^\s\\/@?#\[\],，:：|｜;；、])+)'+_BULK_PORT)
+_BULK_BARE_IPV6=re.compile(_BULK_SCHEME+r'(?P<host>[0-9a-fA-F.:]+(?:%[\w.-]+)?)(?=[ \u3000]*[|｜])'+_BULK_PORT)
+_BULK_SPACES=re.compile(r'[ \u3000]+')
+_BULK_PIPE_AFTER_PORT=re.compile(r'[ \u3000]*([|｜])')
+_BULK_LEADING=re.compile(r'[\s\\]*')
+_BULK_END_PORT=re.compile(r'[ \u3000]*\\')
+_BULK_FORMAT='请使用同一种分隔符填写主机、端口，可再填写账号、密码及一栏到期日期。'
+
+
+def _bulk_head(line,start=0):
+    limit=min(len(line),start+8192)
+    head=_BULK_HEAD.match(line,start,limit)
+    if not head or head['token'] in (':','：'):
+        bare=_BULK_BARE_IPV6.match(line,start,limit)
+        if bare and _is_ipv6(bare['host']):
+            return bare
+    return head
+
+
+def _bulk_separator(head):
+    token=head['token']
+    if token is None:
+        return _BULK_SPACES
+    if token in (':','：'):
+        # Suppliers also use host:port|account|password.
+        mixed=_BULK_PIPE_AFTER_PORT.match(head.string,head.end())
+        if mixed:
+            token=mixed[1]
+    return re.compile(re.escape(token))
+
+
+def _bulk_proxy_rows(text):
+    for line in re.split(r'[\r\n]+',text):
+        start=0
+        while (start:=_BULK_LEADING.match(line,start).end())<len(line):
+            end=len(line)
+            if line.find('\\',start)>=0 and (head:=_bulk_head(line,start)):
+                after_port=head.end()
+                if marker:=_BULK_END_PORT.match(line,after_port):
+                    end=marker.end()-1
+                else:
+                    # Only the third separator after the port opens metadata.
+                    # All preceding backslashes belong to the credentials.
+                    separator=_bulk_separator(head)
+                    for number,mark in enumerate(separator.finditer(line,after_port),1):
+                        if number==3:
+                            slash=line.find('\\',mark.end())
+                            if slash>=0:
+                                end=slash
+                            break
+            yield line[start:end].strip()
+            start=end+1
+            if start>=len(line):
+                break
+
+
+def bulk_proxy_count(text):
+    return sum(1 for _ in _bulk_proxy_rows(text)) if isinstance(text,str) else 0
+
+
+def _bulk_expiry(value):
+    value=value.replace('年','-').replace('月','-').replace('日','').replace('：',':')
+    date=re.fullmatch(r'([0-9]{4})([-./])([0-9]{1,2})\2([0-9]{1,2})([T ].+)?',value)
+    if date:
+        value=f'{date[1]}-{int(date[3]):02d}-{int(date[4]):02d}'+(date[5] or '')
+    elif not re.fullmatch('[0-9]{8}',value):
+        return False
+    try:
+        datetime.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_bulk_row(row,protocol):
+    if len(row)>8192 or '\x00' in row:
+        raise LocalBrowserError('代理含无效字符或超过8192字符。')
+    head=_bulk_head(row)
+    if not head:
+        raise LocalBrowserError(_BULK_FORMAT)
+    if head['scheme'] and PROTOCOLS.get(head['scheme'].lower())!=protocol:
+        raise LocalBrowserError('代理与所选协议不一致。')
+    separator=_bulk_separator(head)
+    fields=[part.strip() for part in separator.split(row[head.end():],maxsplit=3)]
+    if fields[0]:
+        raise LocalBrowserError(_BULK_FORMAT)
+    extra=fields[1:]
+    username=password=''
+    if len(extra)==1:
+        if extra[0] and not re.fullmatch(r'[\\\s]+',extra[0]):
+            raise LocalBrowserError(_BULK_FORMAT)
+    elif extra:
+        username,password=extra[:2]
+        if bool(username)!=bool(password):
+            raise LocalBrowserError('代理账号与密码须同时填写或同时留空。')
+        if len(extra)==3:
+            expiry=re.sub('(?:'+separator.pattern+r')\Z','',extra[2],count=1).strip()
+            if expiry and not _bulk_expiry(expiry):
+                raise LocalBrowserError('第五栏须为到期日期。如果账号或密码含有此次使用的分隔符，请换一种分隔符。')
+    return _fields(protocol,head['host'].replace('：',':'),head['port'],username,password)
+
+
+def parse_bulk_proxies(text,protocol,count):
+    if protocol not in ('socks5','http','https','ssh'):
+        raise LocalBrowserError('请选择有效的代理协议。')
+    if not isinstance(text,str):
+        raise LocalBrowserError('请粘贴代理文本。')
+    proxies=[]
+    for number,row in enumerate(_bulk_proxy_rows(text),1):
+        if number>count:
+            raise LocalBrowserError(f'代理条数超过所选窗口数（{count}），请核对后重试。')
+        try:
+            proxy=_parse_bulk_row(row,protocol)
+        except LocalBrowserError as exc:
+            raise LocalBrowserError(f'第 {number} 条代理：{exc}') from None
+        proxies.append(proxy)
+    if len(proxies)!=count:
+        raise LocalBrowserError(f'已选择 {count} 个窗口，识别到 {len(proxies)} 条代理，请核对后重试。')
+    return proxies
+
 
 def normalize_proxy(value):
     if not isinstance(value,dict): raise LocalBrowserError('代理配置格式不正确。')

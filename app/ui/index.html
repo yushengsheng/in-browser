@@ -82,6 +82,7 @@
               ><button id="export-button" class="button">
                 <span data-icon="export"></span>导出配置
               </button>
+              <button id="bulk-proxy-button" class="button" title="勾选窗口后批量导入代理" disabled><span data-icon="import"></span>批量导入 IP</button>
               <div class="toolbar-spacer"></div>
               <span class="total-label"
                 >共 <strong id="total-count">0</strong> 个窗口</span
@@ -361,6 +362,32 @@
         </div>
       </footer>
     </section>
+    <dialog id="bulk-proxy-dialog" class="sync-dialog bulk-proxy-dialog" aria-labelledby="bulk-proxy-title">
+      <header class="sync-header">
+        <div><h2 id="bulk-proxy-title">批量导入 IP</h2><p>导入将替换所选窗口的代理，请先关闭这些浏览器窗口。</p></div>
+        <button id="bulk-proxy-close" class="icon-button close-button" aria-label="关闭批量导入 IP">×</button>
+      </header>
+      <div class="sync-body">
+        <div class="field">
+          <label class="field-label" for="bulk-proxy-protocol">统一代理协议</label>
+          <select id="bulk-proxy-protocol"><option value="socks5">SOCKS5</option><option value="http">HTTP</option><option value="https">HTTPS</option><option value="ssh">SSH</option></select>
+        </div>
+        <div class="field">
+          <div class="bulk-proxy-heading"><label class="field-label" for="bulk-proxy-text">代理列表</label><button id="bulk-proxy-clear" class="text-button" type="button">清空输入</button></div>
+          <textarea id="bulk-proxy-text" rows="5" spellcheck="false" autocomplete="off" wrap="off" aria-describedby="bulk-proxy-format bulk-proxy-count" placeholder="IP:端口&#10;IP|端口|账号|密码&#10;IP|端口|账号|密码|日期"></textarea>
+          <p id="bulk-proxy-format" class="field-hint">一次粘贴整段，每行一条。可用竖线、冒号、逗号、Tab 或四个连字符（----）分栏。带日期的五栏记录也可用反斜杠（&#92;）连接。</p>
+        </div>
+        <section aria-labelledby="bulk-proxy-order">
+          <h3 id="bulk-proxy-order" class="field-label">按窗口序号从小到大分配</h3>
+          <ol id="bulk-proxy-targets" aria-label="代理条目与目标窗口"></ol>
+        </section>
+        <div id="bulk-proxy-error" class="inline-error" role="alert" hidden></div>
+      </div>
+      <footer class="sync-footer">
+        <span id="bulk-proxy-count" class="muted" role="status"></span>
+        <div class="footer-buttons"><button id="bulk-proxy-cancel" class="button">取消</button><button id="bulk-proxy-submit" class="button primary" disabled>确认导入</button></div>
+      </footer>
+    </dialog>
     <dialog id="window-layout-dialog" class="sync-dialog window-layout-dialog" aria-labelledby="window-layout-title">
       <header class="sync-header">
         <div><h2 id="window-layout-title">排列设置</h2><p>应用于本包全部已打开的浏览器窗口</p></div>

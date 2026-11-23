@@ -334,6 +334,7 @@ a {
 }
 .card-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 9px;
   padding: 23px 23px 17px;
@@ -1742,6 +1743,17 @@ a {
 }
 .sync-dialog[open] { display: flex; flex-direction: column; }
 .sync-dialog::backdrop { background: #1c2b465b; }
+.bulk-proxy-dialog { width: min(620px, calc(100vw - 40px)); }
+.bulk-proxy-dialog .sync-body { display: grid; gap: 18px; }
+.bulk-proxy-dialog .field-hint { margin: 4px 0 0; }
+.bulk-proxy-dialog .sync-footer { flex-wrap: wrap; }
+.bulk-proxy-dialog .footer-buttons { margin-left: auto; }
+.bulk-proxy-heading { display: flex; justify-content: space-between; align-items: baseline; }
+#bulk-proxy-protocol { max-width: 190px; }
+#bulk-proxy-targets { margin: 0; padding: 0; max-height: 175px; overflow: auto; border: 1px solid var(--border); border-radius: 5px; list-style: none; }
+#bulk-proxy-targets li { display: flex; gap: 14px; padding: 7px 12px; font-size: 12px; overflow-wrap: anywhere; }
+#bulk-proxy-targets li + li { border-top: 1px solid var(--border); }
+#bulk-proxy-targets li > :first-child { flex: none; min-width: 5em; color: #71809a; }
 .window-layout-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .window-layout-actions .button, .window-layout-actions .text-button { white-space: nowrap; }
 .window-layout-dialog { width: min(620px, calc(100vw - 40px)); }

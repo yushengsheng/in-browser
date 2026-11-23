@@ -1,5 +1,6 @@
 """Local window CRUD, real signing, and owned browser lifecycle operations."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,9 +10,10 @@ import uuid
 from app_paths import DATA_ROOT
 from browser_core import BrowserController,CDP,sha256
 from local_state import LocalBrowserError,read_encrypted,write_encrypted
-from browser_processes import profile_processes
+from browser_processes import ProfileProcessSnapshot,profile_processes
 from configuration import Configuration
 from profile_model import defaults,sanitize,parse_cookies
+from proxy_config import normalize_proxy,parse_bulk_proxies
 from window_store import WindowStore,now,fingerprint_unreferenced
 from engine_store import EngineStore,executable_major
 from engine_validation import verification_scope
@@ -19,6 +21,14 @@ from proxy_runtime import ProxyRuntime
 from signature_lifetime import require_current_signature,runtime_signature_options
 from signature_status import SignatureStatusCache
 from batch_operations import Operations
+
+
+def _sequence_digits(value):
+    if type(value) is int and value>=0:
+        return str(value)
+    if isinstance(value,str) and value.isascii() and value.isdecimal():
+        return value.lstrip('0') or '0'
+    return ''
 
 
 class ManagerService:
@@ -185,8 +195,103 @@ class ManagerService:
             return {'settings':settings}
 
     def _closed(self,p):
-        if profile_processes(Path(p['_runtime']['profile_path'])):
-            raise LocalBrowserError('请先正常关闭该窗口，再修改代理或指纹配置。')
+        runtime=p['_runtime']
+        core=Path(runtime.get('core_path') or '').name
+        snapshot=ProfileProcessSnapshot(browser_names=(core,) if core else ())
+        # Portable relocation checks profiles before the controller is initialized.
+        controller=getattr(self,'controller',None)
+        pid=(controller.state.get(p['id']) or {}).get('pid') if controller is not None else None
+        path=runtime['profile_path']
+        if snapshot.occupied(path) or snapshot.uncertain(path,pid=pid):
+            raise LocalBrowserError('请先确认该窗口已正常关闭，再重试此操作。')
+
+    def bulk_import_proxies(self,identities,text,protocol):
+        if (not isinstance(identities,list) or not identities or
+                any(not isinstance(value,str) or not re.fullmatch('[A-Za-z0-9_-]{1,80}',value) for value in identities) or
+                len(set(identities))!=len(identities)):
+            raise LocalBrowserError('请选择有效且不重复的窗口，再批量导入代理。')
+        proxies=parse_bulk_proxies(text,protocol,len(identities))
+        from profile_delete import get_pending_ids
+        with self.operations:
+            pending=get_pending_ids(self.root)
+            paths={}; cores=set(); versions={}; changed={}
+            with self.store.lock,self.store.connect() as con:
+                con.execute('BEGIN')
+                # The catalog sequence determines the mapping even when a
+                # caller supplies IDs in click order or on different pages.
+                sequences={}; ordered=[]
+                for identity in identities:
+                    row=con.execute('SELECT seq FROM profiles WHERE id=?',(identity,)).fetchone()
+                    if row is None:
+                        raise LocalBrowserError('所选窗口中有记录已不存在，请刷新列表后重试。')
+                    sequences[identity]=row[0]
+                    digits=_sequence_digits(row[0])
+                    ordered.append((not digits,len(digits),digits,identity))
+                identities=[entry[-1] for entry in sorted(ordered)]
+                for number,(identity,proxy) in enumerate(zip(identities,proxies),1):
+                    if identity in pending:
+                        raise LocalBrowserError(f'第 {number} 个窗口正在永久删除，请刷新列表后重试。')
+                    row=con.execute('SELECT archived,data FROM profiles WHERE id=?',(identity,)).fetchone()
+                    if not row:
+                        raise LocalBrowserError(f'第 {number} 个窗口已不存在，请刷新列表后重试。')
+                    archived,blob=row
+                    record=self.store.unpack(blob)
+                    if record['id']!=identity:
+                        raise LocalBrowserError(f'第 {number} 个窗口的资料标识不一致，无法导入。')
+                    if _sequence_digits(record.get('seq'))!=_sequence_digits(sequences[identity]):
+                        raise LocalBrowserError(f'第 {number} 个窗口的编号与目录不一致，请刷新列表并核对资料。')
+                    if archived or record.get('archived'):
+                        raise LocalBrowserError(f'第 {number} 个窗口已在回收站，请先恢复。')
+                    if record.get('created_locally') and (record.get('created_options') or {}).get('dynamic_proxy_url'):
+                        raise LocalBrowserError(f'第 {number} 个窗口已启用动态代理，请先关闭动态提取再导入。')
+                    runtime=record['_runtime']
+                    if (runtime.get('alias',identity)!=identity or not Path(runtime['profile_path']).is_absolute() or
+                            not Path(runtime['core_path']).is_absolute()):
+                        raise LocalBrowserError(f'第 {number} 个窗口的运行配置无效，无法核对关闭状态。')
+                    paths[identity]=runtime['profile_path']
+                    cores.add(Path(runtime['core_path']).name)
+                    versions[identity]=hashlib.sha256(blob).digest()
+                    try:
+                        old_proxy=normalize_proxy(record.get('proxy'))
+                    except LocalBrowserError:
+                        old_proxy=None
+                    if old_proxy!=proxy:
+                        changed[identity]=proxy
+
+            snapshot=ProfileProcessSnapshot(browser_names=cores)
+            for number,(identity,path) in enumerate(paths.items(),1):
+                pid=(self.controller.state.get(identity) or {}).get('pid')
+                if snapshot.occupied(path) or snapshot.uncertain(path,pid=pid):
+                    raise LocalBrowserError(f'请先确认第 {number} 个窗口已正常关闭，再批量导入代理。')
+            for identity in changed:
+                self.proxy_runtime.stop_if_unused(identity)
+
+            # Recheck all selected rows inside the write transaction after the
+            # worker checks. Keep only small digests across the two passes.
+            runtimes={}
+            with self.store.lock,self.store.connect() as con:
+                con.execute('BEGIN IMMEDIATE')
+                pending=get_pending_ids(self.root)
+                for number,identity in enumerate(identities,1):
+                    row=con.execute('SELECT archived,data,seq FROM profiles WHERE id=?',(identity,)).fetchone()
+                    if (identity in pending or not row or row[0] or row[2]!=sequences[identity] or
+                            hashlib.sha256(row[1]).digest()!=versions[identity]):
+                        raise LocalBrowserError(f'第 {number} 个窗口的配置已发生变化，请刷新列表后重试。')
+                    if identity in changed:
+                        record=self.store.unpack(row[1])
+                        record['proxy']=changed[identity]
+                        record['updated_at']=now()
+                        record['_runtime'].pop('local_proxy_port',None)
+                        con.execute('UPDATE profiles SET data=? WHERE id=?',(self.store.pack(record),identity))
+                        runtimes[identity]=record['_runtime']
+            for identity,runtime in runtimes.items():
+                try:
+                    self.controller.set_profile(identity,runtime)
+                except Exception:
+                    # The database commit is authoritative. A closed window
+                    # reloads and synchronizes its runtime before its next launch.
+                    pass
+            return {'updated':len(identities)}
 
     def _check_duplicate(self,p):
         if p.get('duplicate_check') and p.get('username'):
@@ -253,10 +358,19 @@ class ManagerService:
                 p['created_options']=normalize_options(incoming['created_options'])
             # Imported fields may use numeric strings or spaced resolutions.
             # Normalization alone must not turn a metadata edit into re-signing.
-            baseline=sanitize(self.store.public(old))
-            for key in ['fingerprint','proxy','preferences']:
+            old_public=self.store.public(old)
+            old_proxy=old_public.pop('proxy',None)
+            try:
+                previous_proxy=normalize_proxy(old_proxy)
+            except LocalBrowserError:
+                if 'proxy' not in incoming: raise
+                previous_proxy=None
+            baseline=sanitize(old_public)
+            for key in ['fingerprint','preferences']:
                 candidate=sanitize({key:p[key]})[key]
                 if candidate==baseline[key]: p[key]=copy.deepcopy(old[key])
+            if 'proxy' in incoming and p['proxy']==previous_proxy:
+                p['proxy']=copy.deepcopy(old_proxy)
             if not allow_fingerprint and p['fingerprint']!=old['fingerprint']:raise LocalBrowserError('此版本的指纹配置只读，不能在本地更换。')
             p['name']=p['name'].strip() or '窗口 '+str(p['seq'])
             cookies=parse_cookies(p.get('cookie_text',''),p)
@@ -266,7 +380,7 @@ class ManagerService:
                 needs_config=True
             if old['_runtime'].get('signature_provider')=='local-v1' and p['fingerprint']!=old['fingerprint']:
                 raise LocalBrowserError('独立本地窗口保留迁移时的原指纹，不重新生成或更换指纹。')
-            proxy_changed=p['proxy']!=old['proxy']
+            proxy_changed=p['proxy']!=old.get('proxy')
             if p['proxy'].get('enable_socks5_udp'):raise LocalBrowserError('本地独立代理目前支持TCP，不支持SOCKS5 UDP；请关闭UDP选项。')
             if needs_config or proxy_changed: self._closed(old)
             if proxy_changed:self.proxy_runtime.stop_if_unused(p['id'])

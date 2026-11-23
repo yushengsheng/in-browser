@@ -224,6 +224,8 @@ const state = {
   operationIds: new Set(),
   operationActions: new Map(),
   batchBusy: false,
+  bulkProxyIds: [],
+  bulkProxyCount: { text: "", count: 0, revision: 0, timer: null, failed: false },
   statusRefreshing: false,
   statusTimer: null,
   statusRevision: 0,
@@ -1384,6 +1386,7 @@ function renderProfiles() {
     ? "尝试更换筛选条件，或重置筛选"
     : state.capabilities.create_windows ? "点击“新建窗口”创建本地窗口，或点击“同步窗口”导入本机来源" : sourceGuidance().listEmpty;
   $("#selected-count").textContent = state.selected.size;
+  $("#bulk-proxy-button").disabled = !state.selected.size || state.batchBusy || state.deleteBusy;
   $$("[data-batch]").forEach(
     (button) => (button.disabled = state.batchBusy || state.deleteBusy || state.selected.size === 0 || (button.dataset.batch === "open" && active.some((profile) => state.selected.has(String(profile.id)) && isDeletePending(profile)))),
   );
@@ -2682,6 +2685,139 @@ async function exportProfiles(button) {
   }
 }
 
+function countBulkProxyInput(text) {
+  const preview = state.bulkProxyCount;
+  const revision = ++preview.revision;
+  clearTimeout(preview.timer);
+  preview.timer = null;
+  preview.text = text;
+  preview.failed = false;
+  if (!text.includes("\\")) {
+    preview.count = text.split(/[\r\n]+/).reduce((count, line) =>
+      count + Number(/[^\p{White_Space}\u001c-\u001f]/u.test(line)), 0);
+    return;
+  }
+  // Backslashes may also belong to credentials. Use the importer's own row grammar.
+  preview.count = null;
+  preview.timer = setTimeout(async () => {
+    if (revision !== preview.revision) return;
+    preview.timer = null;
+    try {
+      const result = await api("bulk_proxy_count", { text });
+      if (revision !== preview.revision) return;
+      if (!Number.isSafeInteger(result?.count) || result.count < 0) throw new Error();
+      preview.count = result.count;
+    } catch {
+      if (revision !== preview.revision) return;
+      preview.failed = true;
+    }
+    updateBulkProxyCount();
+  }, 150);
+}
+function updateBulkProxyCount(error = "") {
+  const input = $("#bulk-proxy-text");
+  const preview = state.bulkProxyCount;
+  if (input.value !== preview.text) countBulkProxyInput(input.value);
+  const count = preview.count;
+  const total = state.bulkProxyIds.length;
+  const busy = state.batchBusy;
+  $("#bulk-proxy-count").textContent = `已选 ${total} 个窗口` + (count === null
+    ? (preview.failed ? "，条数待核对" : "，正在核对条数…")
+    : `，已输入 ${count} 条代理` + (count < total ? `，还需 ${total - count} 条` : count > total ? `，请减少 ${count - total} 条` : ""));
+  if (preview.failed) error = "本地服务暂未确认代理条数，请重新核对。";
+  $("#bulk-proxy-error").textContent = error;
+  $("#bulk-proxy-error").hidden = !error;
+  if (error) $("#bulk-proxy-error").scrollIntoView({ block: "nearest" });
+  input.disabled = busy;
+  $("#bulk-proxy-protocol").disabled = busy;
+  $("#bulk-proxy-clear").disabled = busy || !input.value;
+  $("#bulk-proxy-close").disabled = busy;
+  $("#bulk-proxy-cancel").disabled = busy;
+  $("#bulk-proxy-submit").disabled = busy || !total || (!preview.failed && count !== total);
+  $("#bulk-proxy-submit").textContent = busy ? "正在导入…" : preview.failed ? "重新核对条数" : "确认导入";
+  return count === total && total > 0;
+}
+function bulkProxySequence(value) {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === "string" && value && !/[^0-9]/.test(value)) return BigInt(value);
+  return null;
+}
+function openBulkProxyImport() {
+  const dialog = $("#bulk-proxy-dialog");
+  if (dialog.open || !state.selected.size || state.batchBusy || state.deleteBusy) return;
+  const targets = [];
+  for (const profile of state.profiles) {
+    const id = String(profile.id);
+    if (state.selected.has(id) && !isArchived(profile) && !isDeletePending(profile)) {
+      targets.push({ id, profile, sequence: bulkProxySequence(profile.seq) });
+    }
+  }
+  if (targets.length !== state.selected.size) {
+    toast("所选窗口已移除、在回收站或等待删除，请刷新后重新勾选。", "error");
+    return;
+  }
+  targets.sort((a, b) => {
+    if (a.sequence !== b.sequence) {
+      if (a.sequence === null) return 1;
+      if (b.sequence === null) return -1;
+      return a.sequence < b.sequence ? -1 : 1;
+    }
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  });
+  state.bulkProxyIds = targets.map(target => target.id);
+  $("#bulk-proxy-targets").innerHTML = targets.map(({ profile: p }, index) =>
+    `<li><span>第 ${index + 1} 条</span><span>序号 ${esc(p.seq ?? "—")} · ${esc(p.name || "未命名窗口")}</span></li>`
+  ).join("");
+  $("#bulk-proxy-protocol").value = "socks5";
+  $("#bulk-proxy-text").value = "";
+  updateBulkProxyCount();
+  dialog.showModal();
+  $("#bulk-proxy-text").focus();
+}
+function closeBulkProxyImport() {
+  if (state.batchBusy) return;
+  $("#bulk-proxy-text").value = "";
+  state.bulkProxyIds = [];
+  $("#bulk-proxy-targets").innerHTML = "";
+  updateBulkProxyCount();
+  $("#bulk-proxy-dialog").close();
+  $("#bulk-proxy-button").focus();
+}
+async function submitBulkProxyImport() {
+  if (!$("#bulk-proxy-dialog").open || state.batchBusy || state.deleteBusy) return;
+  if (state.bulkProxyCount.failed) countBulkProxyInput($("#bulk-proxy-text").value);
+  if (!updateBulkProxyCount()) return;
+  const ids = state.bulkProxyIds;
+  if (ids.some(id => state.operationIds.has(id))) {
+    updateBulkProxyCount("所选窗口正在执行其他操作，请稍后再导入。");
+    return;
+  }
+  state.batchBusy = true;
+  state.statusRevision++;
+  updateBulkProxyCount();
+  renderProfiles();
+  let result, error = "";
+  try {
+    result = await api("bulk_import_proxies", {
+      ids, text: $("#bulk-proxy-text").value, protocol: $("#bulk-proxy-protocol").value,
+    });
+    $("#bulk-proxy-text").value = "";
+    updateBulkProxyCount();
+    try { await refreshProfiles(); }
+    catch { showServiceError("代理导入已返回结果，窗口列表刷新失败，请点击刷新。"); }
+  } catch (e) {
+    error = e?.message || "代理导入失败。";
+  } finally {
+    state.batchBusy = false;
+    renderProfiles();
+  }
+  if (error) { updateBulkProxyCount(error); return; }
+  closeBulkProxyImport();
+  if (result?.updated === ids.length) toast(`已为 ${ids.length} 个窗口导入代理。`, "success");
+  else toast("本地服务未确认更新数量，请核对窗口列表。", "error");
+}
+
 async function openCreation(batch = false) {
   if (state.creation.opening || !$("#profile-drawer").hidden) return;
   state.creation.opening = true;
@@ -3089,7 +3225,7 @@ function bindEvents() {
   $("#drawer-backdrop").onclick = closeDrawer;
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape" || $("#confirm-dialog").open) return;
-    if ($("#sync-dialog").open || $("#window-layout-dialog").open) return;
+    if ($("#sync-dialog").open || $("#window-layout-dialog").open || $("#bulk-proxy-dialog").open) return;
     if (!$("#row-menu").hidden) {
       $("#row-menu").hidden = true;
       event.preventDefault();
@@ -3201,6 +3337,19 @@ function bindEvents() {
   $("#save-settings").onclick = saveSettings;
   $("#export-button").onclick = () =>
     exportProfiles($("#export-button"));
+  $("#bulk-proxy-button").onclick = openBulkProxyImport;
+  $("#bulk-proxy-text").oninput = () => updateBulkProxyCount();
+  $("#bulk-proxy-protocol").onchange = () => updateBulkProxyCount();
+  $("#bulk-proxy-clear").onclick = () => {
+    if (state.batchBusy) return;
+    $("#bulk-proxy-text").value = "";
+    updateBulkProxyCount();
+    $("#bulk-proxy-text").focus();
+  };
+  $("#bulk-proxy-submit").onclick = submitBulkProxyImport;
+  $("#bulk-proxy-cancel").onclick = closeBulkProxyImport;
+  $("#bulk-proxy-close").onclick = closeBulkProxyImport;
+  $("#bulk-proxy-dialog").addEventListener("cancel", event => { event.preventDefault(); closeBulkProxyImport(); });
 }
 async function readCookieFile(file) {
   const request = ++state.cookieReadRequest;

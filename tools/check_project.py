@@ -279,7 +279,8 @@ def main(argv=None):
             entries.append(run_command('window-layout', [python, '-B', str(ROOT/'tests/test_window_layout.py')], 'unittest', env))
             for filename in ('test_batch_parallel.py','test_engine_validation.py','test_profile_process_scan.py','test_sync_parallel.py','test_engine_portability.py','test_source_sessions.py','test_source_identity.py','test_status_purge_race.py'):
                 entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
-            for filename in ('test_status_projection.py', 'test_signature_status.py', 'test_group_operations.py'):
+            for filename in ('test_status_projection.py', 'test_signature_status.py', 'test_group_operations.py',
+                             'test_bulk_proxy_import.py'):
                 entries.append(run_command(filename, [python, '-B', str(ROOT/'tests'/filename)], 'unittest', env))
             for filename in ('test_sync_reliability.py','test_source_preparation.py','test_import_progress.py','test_profile_copy.py','test_batch_status.py','test_profile_delete.py','test_delete_integration.py','test_background_probe.py','test_legacy_sources.py','test_core_compatibility.py','test_ip_info_page.py','test_proxy_runtime_stability.py','test_clean_install.py','test_launch_paths.py','test_release_boundary.py','test_process_path_aliases.py','test_environment_compatibility.py'):
                 entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))

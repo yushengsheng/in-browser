@@ -1,5 +1,6 @@
 """Process scan contracts with synthetic objects; no browser or data access."""
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -11,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 
 import browser_processes as processes
+import profile_model
+from api import dispatch
 from local_state import LocalBrowserError
+from manager_service import ManagerService
 
 
 class ProfileProcessScanTests(unittest.TestCase):
@@ -111,6 +115,45 @@ class ProfileProcessScanTests(unittest.TestCase):
         self.assertEqual(result, [])
         cached.as_dict.assert_called_once_with(attrs=['name', 'exe'])
         lookup.assert_not_called()
+
+    def test_single_proxy_save_and_archive_require_a_confirmed_closed_profile(self):
+        with patch.object(profile_model, 'APP_ROOT', self.profile), \
+                patch.object(profile_model, 'fingerprint_fields', return_value=set()):
+            source = profile_model.defaults()
+            identity = 'fixture'
+            runtime = {'profile_path': str(self.profile), 'core_path': str(self.other / 'renamed.exe')}
+            source.update(id=identity, seq=1, name='Fixture', archived=False, _runtime=runtime)
+            service = ManagerService.__new__(ManagerService)
+            service.operations = threading.RLock()
+            service.controller = SimpleNamespace(state={identity: {'pid': 456}})
+            service.store = Mock()
+            service.store.lock = threading.RLock()
+            service.store.get.side_effect = lambda _: deepcopy(source)
+            service.store.public.side_effect = lambda p, *args: {k: v for k, v in p.items() if not k.startswith('_')}
+            service._require_available = Mock()
+            service._runtime = Mock(side_effect=lambda p, previous: deepcopy(previous))
+            service._status = Mock(return_value='closed')
+            service._sync = Mock()
+            service.proxy_runtime = Mock()
+            proxy = {'type': 'http', 'host': 'fixture.invalid', 'port': 8080}
+            for action, payload in [('archive', {'id': identity}), ('save', {'profile': {'id': identity, 'proxy': proxy}})]:
+                for label, listed, closed in [
+                    ('closed', [], True),
+                    ('unrelated', [self.candidate(args=['other.exe', '--user-data-dir=' + str(self.other)])], True),
+                    ('occupied', [self.candidate()], False),
+                    ('stock-opaque', [self.candidate(cmdline=None, name='BitBrowser.exe')], False),
+                    ('renamed-opaque', [self.candidate(cmdline=None)], False),
+                    ('tracked-opaque', [self.candidate(456, cmdline=None, name=None, exe=None)], False),
+                ]:
+                    with self.subTest(action=action, case=label), patch.object(processes.psutil, 'process_iter', return_value=listed):
+                        service.store.put.reset_mock()
+                        service.proxy_runtime.stop_if_unused.reset_mock()
+                        reply = dispatch(service, action, payload)
+                        self.assertEqual(reply['ok'], closed, reply.get('error'))
+                        self.assertEqual(service.store.put.called, closed)
+                        self.assertEqual(service.proxy_runtime.stop_if_unused.called, closed and action == 'save')
+                        if not closed:
+                            self.assertIn('关闭', reply['error'])
 
     def test_disappeared_processes_are_skipped_during_lookup_and_delayed_reads(self):
         for stage in ('lookup', 'metadata', 'unreadable'):

@@ -81,6 +81,10 @@ class ReleaseBoundary(unittest.TestCase):
             self.source_tree(root)
             runtime=root/'runtime-source'
             (runtime/'python/empty-runtime').mkdir(parents=True)
+            (root/'requirements.txt').write_text('fixture==1.0\n','utf-8')
+            info=runtime/'python/site-packages/fixture-1.0.dist-info'
+            info.mkdir(parents=True)
+            (info/'METADATA').write_text('Name: fixture\nVersion: 1.0\n','utf-8')
             for name in build_release.RUNTIME_EXECUTABLES:
                 path=runtime/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'synthetic')
             (runtime/'python/python.exe.config').write_text('<configuration />','utf-8')

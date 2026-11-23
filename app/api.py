@@ -36,6 +36,11 @@ def dispatch(service,action,payload=None):
         elif action=='save': result=service.save(payload['profile'],allow_fingerprint=False)
         elif action=='proxy_test': result=service.configuration.proxy_test(sanitize({'proxy':payload['proxy']})['proxy'])
         elif action=='proxy_parse': result=parse_proxy(payload.get('text',''),payload.get('default_type','socks5'))
+        elif action=='bulk_proxy_count':
+            from proxy_config import bulk_proxy_count
+            result={'count':bulk_proxy_count(payload.get('text',''))}
+        elif action=='bulk_import_proxies':
+            result=service.bulk_import_proxies(payload.get('ids'),payload.get('text'),payload.get('protocol'))
         elif action=='open': result=service.open(payload['id'])
         elif action=='close': result=service.close(payload['id'])
         elif action=='activate': result=service.activate(payload['id'])
