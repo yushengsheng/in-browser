@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 
 from api import dispatch
-from batch_operations import Operations, parallel_batch, shutdown_batches
+import batch_operations as batches
+from batch_operations import Operations, parallel_batch, report_stage, shutdown_batches
 import browser_core as core
 from manager_service import ManagerService
 
@@ -100,6 +101,142 @@ class ParallelBatchTests(unittest.TestCase):
         self.assertEqual(ids, [('a', caller), ('b', caller)])
         self.assertFalse(hasattr(service, '_batch_executor'))
 
+    def test_progress_is_read_only_and_absent_for_legacy_calls(self):
+        service = self.service(lambda identity: None)
+        token = 'synthetic_read_only'
+        self.assertEqual(service.request('batch_progress', {'operation_token': token})['data'],
+                         {'found': False, 'operation_token': token})
+        self.assertFalse(hasattr(service, '_batch_executor'))
+        self.assertFalse(hasattr(service, '_batch_progress'))
+        self.assertFalse(service.request('batch_progress', {'operation_token': 'bad'})['ok'])
+        self.assertEqual(service.request('batch', {'action': 'open', 'ids': ['one']})['data'],
+                         {'completed': 1, 'errors': []})
+        self.assertFalse(hasattr(service, '_batch_progress'))
+
+    def test_progress_records_actual_completion_before_selection_order_is_consumed(self):
+        entered, release = threading.Event(), threading.Event()
+        token = 'synthetic_out_of_order'
+        def handler(identity):
+            if identity == 'slow':
+                report_stage('environment')
+                report_stage('private synthetic stage')
+                entered.set()
+                self.assertTrue(release.wait(5))
+            elif identity == 'bad':
+                raise RuntimeError('private synthetic failure')
+        service = self.service(handler)
+        self.addCleanup(release.set)
+        with ThreadPoolExecutor(max_workers=1) as callers:
+            call = callers.submit(service.request, 'batch', {'action': 'open',
+                                  'ids': ['slow', 'fast', 'bad', 'slow'], 'operation_token': token})
+            try:
+                self.assertTrue(entered.wait(2))
+                deadline = time.monotonic() + 2
+                while True:
+                    snapshot = service.request('batch_progress', {'operation_token': token})['data']
+                    if snapshot['processed'] == 2 or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.001)
+                self.assertFalse(call.done())
+                self.assertEqual((snapshot['total'], snapshot['completed'], snapshot['failed']), (3, 1, 1))
+                self.assertEqual(snapshot['items'], [{'id': 'slow', 'stage': 'environment'},
+                                                    {'id': 'fast', 'stage': 'succeeded'},
+                                                    {'id': 'bad', 'stage': 'failed'}])
+                self.assertFalse(snapshot['finished'])
+                self.assertNotIn('private', str(snapshot))
+                self.assertFalse(service.operations.acquire(False))
+                snapshot['items'][0]['stage'] = 'failed'
+                self.assertEqual(service.request('batch_progress', {'operation_token': token})['data']['items'][0]['stage'], 'environment')
+            finally:
+                release.set()
+            result = call.result(3)['data']
+        self.assertEqual(result['completed'], 2)
+        self.assertEqual([item['id'] for item in result['errors']], ['bad'])
+        snapshot = service.request('batch_progress', {'operation_token': token})['data']
+        self.assertTrue(snapshot['finished'])
+        self.assertEqual(snapshot['processed'], 3)
+        self.assertIsNone(batches._PROGRESS_CONTEXT.get())
+        report_stage('closing')
+        self.assertEqual(service.request('batch_progress', {'operation_token': token})['data'], snapshot)
+
+    def test_duplicate_progress_tokens_do_not_execute_or_replace_active_work(self):
+        entered, release = threading.Event(), threading.Event()
+        def handler(identity):
+            entered.set()
+            self.assertTrue(release.wait(4))
+        service = self.service(handler)
+        self.addCleanup(release.set)
+        token = 'synthetic_duplicate_token'
+        with ThreadPoolExecutor(max_workers=1) as callers:
+            call = callers.submit(service.request, 'batch', {'action': 'open', 'ids': ['original'], 'operation_token': token})
+            try:
+                self.assertTrue(entered.wait(2))
+                duplicate = service.request('batch', {'action': 'close', 'ids': ['replacement'], 'operation_token': token})
+                self.assertFalse(duplicate['ok'])
+                snapshot = service.request('batch_progress', {'operation_token': token})['data']
+                self.assertEqual(snapshot['action'], 'open')
+                self.assertEqual([item['id'] for item in snapshot['items']], ['original'])
+            finally:
+                release.set()
+            self.assertEqual(call.result(3)['data']['completed'], 1)
+        shutdown_batches(service)
+        self.assertFalse(service.request('batch_progress', {'operation_token': token})['data']['found'])
+
+    def test_progress_capacity_and_expiry_never_overwrite_active_records(self):
+        service = self.service(lambda identity: None)
+        registry = service._batch_progress = batches._BatchProgress()
+        with patch.object(batches, '_PROGRESS_LIMIT', 2):
+            first = registry.begin('synthetic_capacity_a', 'open', ['one'])
+            second = registry.begin('synthetic_capacity_b', 'close', ['two'])
+            reply = service.request('batch', {'action': 'open', 'ids': ['three'], 'operation_token': 'synthetic_capacity_c'})
+            self.assertEqual(reply['data'], {'completed': 1, 'errors': []})
+            self.assertFalse(registry.snapshot('synthetic_capacity_c')['found'])
+            self.assertEqual(len(registry.records), 2)
+            registry.finish(first)
+            third = registry.begin('synthetic_capacity_c', 'close', ['three'])
+            self.assertFalse(registry.snapshot('synthetic_capacity_a')['found'])
+            self.assertIs(registry.records['synthetic_capacity_b'], second)
+            registry.finish(third)
+            with patch.object(batches.time, 'monotonic', return_value=third['ended'] + batches._PROGRESS_TTL):
+                self.assertFalse(registry.snapshot('synthetic_capacity_c')['found'])
+                replacement = registry.begin('synthetic_capacity_c', 'open', ['new'])
+            registry.stage(third, 'three', 'succeeded')
+            self.assertEqual(replacement['items'], {'new': 'queued'})
+            self.assertEqual(len(registry.records), 2)
+
+    def test_submission_failure_drains_active_work_before_finishing_progress(self):
+        entered, release, submission_failed = threading.Event(), threading.Event(), threading.Event()
+        def handler(identity):
+            report_stage('profile')
+            entered.set()
+            self.assertTrue(release.wait(4))
+        service = self.service(handler)
+        self.addCleanup(release.set)
+        executor = service._batch_executor = ThreadPoolExecutor(max_workers=10)
+        submit = executor.submit
+        def failing_submit(*args):
+            if executor.submit.call_count == 2:
+                self.assertTrue(entered.wait(2))
+                submission_failed.set()
+                raise RuntimeError('private synthetic submit failure')
+            return submit(*args)
+        token = 'synthetic_submission_failure'
+        with patch.object(executor, 'submit', side_effect=failing_submit), ThreadPoolExecutor(max_workers=1) as callers:
+            call = callers.submit(service.request, 'batch', {'action': 'open', 'ids': ['active', 'queued'], 'operation_token': token})
+            try:
+                self.assertTrue(submission_failed.wait(2))
+                self.assertFalse(call.done())
+                self.assertFalse(batches.batch_progress(service, token)['finished'])
+                self.assertFalse(service.operations.acquire(False))
+            finally:
+                release.set()
+            self.assertFalse(call.result(3)['ok'])
+        snapshot = batches.batch_progress(service, token)
+        self.assertTrue(snapshot['finished'])
+        self.assertEqual(snapshot['processed'], 1)
+        self.assertEqual(snapshot['items'], [{'id': 'active', 'stage': 'succeeded'}, {'id': 'queued', 'stage': 'unconfirmed'}])
+        self.assertNotIn('private', str(snapshot))
+
     def test_unexpected_worker_failure_does_not_abandon_other_items(self):
         service = self.service(lambda identity: None)
         def request(action, payload):
@@ -168,7 +305,7 @@ class ParallelBatchTests(unittest.TestCase):
         service.request = request
         def run():
             try:
-                parallel_batch(service, 'close', ['interrupt'] + [f'p{i}' for i in range(99)])
+                parallel_batch(service, 'close', ['interrupt'] + [f'p{i}' for i in range(99)], 'synthetic_interrupted')
             except SyntheticInterruption:
                 interrupted.set()
         with ThreadPoolExecutor(max_workers=1) as callers:
@@ -182,6 +319,12 @@ class ParallelBatchTests(unittest.TestCase):
             running.result(3)
         self.assertTrue(interrupted.is_set())
         self.assertLess(len(called), 100)
+        snapshot = batches.batch_progress(service, 'synthetic_interrupted')
+        self.assertTrue(snapshot['finished'])
+        self.assertEqual(snapshot['items'][0], {'id': 'interrupt', 'stage': 'unconfirmed'})
+        self.assertEqual(snapshot['processed'], len(called) - 1)
+        self.assertEqual(snapshot['failed'], 0)
+        self.assertTrue(all(item['stage'] in ('succeeded', 'unconfirmed') for item in snapshot['items']))
         self.assertTrue(service.operations.acquire(False))
         service.operations.release()
 

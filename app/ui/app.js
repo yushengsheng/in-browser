@@ -223,7 +223,11 @@ const state = {
   creation: { job: null, requestId: null, revision: 0, fingerprintRevision: 0, timer: null, reading: false, opening: false },
   operationIds: new Set(),
   operationActions: new Map(),
+  operationStages: new Map(),
   batchBusy: false,
+  batchProgress: null,
+  batchProgressReading: false,
+  batchProgressSequence: 0,
   bulkProxyIds: [],
   bulkProxyCount: { text: "", count: 0, revision: 0, timer: null, failed: false },
   statusRefreshing: false,
@@ -1298,11 +1302,11 @@ function updateOpenButton(button, profile) {
   const action = state.operationActions.get(String(profile.id));
   const pending = deletionPending || state.operationIds.has(String(profile.id)) ||
     ["opening", "closing"].includes(profile.status);
-  const label = deletionPending ? "删除未完成" : action === "open" || profile.status === "opening"
+  const label = operationStageLabel(profile.id) || (deletionPending ? "删除未完成" : action === "open" || profile.status === "opening"
     ? "检测代理并打开…"
     : action === "close" || profile.status === "closing"
       ? "正在关闭"
-      : pending ? "处理中" : running ? "已打开" : "打开";
+      : pending ? "处理中" : running ? "已打开" : "打开");
   button.classList.toggle("running", running);
   button.dataset.action = running ? "activate" : "open";
   button.disabled = pending;
@@ -1477,7 +1481,7 @@ function profileRow(p) {
   const pending =
     deletionPending || state.operationIds.has(String(p.id)) ||
     ["opening", "closing"].includes(p.status);
-  const actionLabel =
+  const actionLabel = operationStageLabel(p.id) || (
     deletionPending ? "删除未完成" : state.operationActions.get(String(p.id)) === "open" || p.status === "opening"
       ? "检测代理并打开…"
       : p.status === "closing"
@@ -1486,7 +1490,7 @@ function profileRow(p) {
           ? "处理中"
           : running
             ? "已打开"
-            : "打开";
+            : "打开");
   const proxy = p.proxy || {};
   const system = String(p.fingerprint?.os || p.os || "");
   const osIcon = /mac|ios/i.test(system)
@@ -2645,6 +2649,89 @@ function openRowMenu(id, anchor) {
   menu.style.top = `${rect.bottom + menu.offsetHeight + 8 > innerHeight ? Math.max(8, rect.top - menu.offsetHeight - 5) : rect.bottom + 5}px`;
   menu.querySelector("button")?.focus();
 }
+const batchStageLabels = {
+  queued: "等待处理", waiting: "等待窗口操作", checking: "检查窗口状态", signature: "维护启动签名",
+  environment: "验证环境", profile: "准备窗口资料", engine: "校验内核", proxy: "检测代理",
+  launching: "启动浏览器", page: "确认信息页", closing: "正在关闭", unconfirmed: "结果未确认",
+  saving: "保存运行记录", proxy_stop: "释放代理连接",
+};
+function operationStageLabel(id) {
+  id = String(id);
+  if (!state.operationIds.has(id)) return "";
+  const stage = state.operationStages.get(id);
+  const action = state.operationActions.get(id);
+  if (stage === "succeeded") return action === "close" ? "已关闭" : "已打开";
+  if (stage === "failed") return action === "close" ? "关闭失败" : "打开失败";
+  return batchStageLabels[stage] || "";
+}
+function updateBatchProgressRows() {
+  $$("#profile-rows > tr").forEach((row) => {
+    if (!state.operationStages.has(String(row.dataset.id))) return;
+    const profile = profileById(row.dataset.id), button = $(".open-button", row);
+    if (profile && button) updateOpenButton(button, profile);
+  });
+}
+function scheduleBatchProgress(progress) {
+  clearTimeout(progress.timer);
+  if (state.batchProgress !== progress || !state.batchBusy || progress.finished) return;
+  progress.timer = setTimeout(() => pollBatchProgress(progress), 400);
+}
+function startBatchProgress(action, ids, button, offset, total, completed, failed) {
+  const token = window.crypto?.randomUUID?.() || `batch_${Date.now().toString(36)}_${++state.batchProgressSequence}`;
+  const progress = { token, action, ids: new Set(ids.map(String)), button, offset, total, completed, failed, timer: null, finished: false };
+  state.batchProgress = progress;
+  button.textContent = `${action === "open" ? "打开" : "关闭"} ${offset}/${total}`;
+  scheduleBatchProgress(progress);
+  return progress;
+}
+function stopBatchProgress(progress) {
+  if (!progress) return;
+  clearTimeout(progress.timer);
+  if (state.batchProgress === progress) state.batchProgress = null;
+}
+async function pollBatchProgress(progress) {
+  clearTimeout(progress.timer);
+  if (state.batchProgress !== progress || !state.batchBusy || progress.finished) return;
+  if (state.batchProgressReading) { scheduleBatchProgress(progress); return; }
+  state.batchProgressReading = true;
+  try {
+    const data = await api("batch_progress", { operation_token: progress.token });
+    if (state.batchProgress !== progress || !state.batchBusy) return;
+    if (!data?.found || data.operation_token !== progress.token || data.action !== progress.action ||
+        data.total !== progress.ids.size || !Array.isArray(data.items) || data.items.length !== progress.ids.size) return;
+    const stages = new Map();
+    for (const item of data.items) {
+      const id = String(item.id), stage = item.stage;
+      if (!progress.ids.has(id) || stages.has(id) ||
+          !(Object.hasOwn(batchStageLabels, stage) || stage === "succeeded" || stage === "failed")) return;
+      stages.set(id, stage);
+    }
+    const completed = [...stages.values()].filter((stage) => stage === "succeeded").length;
+    const failed = [...stages.values()].filter((stage) => stage === "failed").length;
+    if (data.completed !== completed || data.failed !== failed || data.processed !== completed + failed) return;
+    stages.forEach((stage, id) => state.operationStages.set(id, stage));
+    progress.button.textContent = `${progress.action === "open" ? "打开" : "关闭"} ${progress.offset + data.processed}/${progress.total}（成功 ${progress.completed + completed}，失败 ${progress.failed + failed}）`;
+    progress.finished = data.finished === true;
+    updateBatchProgressRows();
+  } catch {
+    // Advisory progress never changes the synchronous batch result or lock.
+  } finally {
+    state.batchProgressReading = false;
+    scheduleBatchProgress(progress);
+  }
+}
+function applyBatchResultStages(progress, result) {
+  const errors = Array.isArray(result?.errors) ? result.errors : [];
+  const failed = new Set(errors.map((item) => String(item?.id)).filter((id) => progress.ids.has(id)));
+  const exact = failed.size === errors.length && result?.completed === progress.ids.size - failed.size;
+  progress.ids.forEach((id) => {
+    if (failed.has(id)) state.operationStages.set(id, "failed");
+    else if (exact) state.operationStages.set(id, "succeeded");
+    else if (!["succeeded", "failed"].includes(state.operationStages.get(id))) state.operationStages.set(id, "unconfirmed");
+  });
+  if (exact) progress.button.textContent = `${progress.action === "open" ? "打开" : "关闭"} ${progress.offset + progress.ids.size}/${progress.total}（成功 ${progress.completed + result.completed}，失败 ${progress.failed + failed.size}）`;
+  updateBatchProgressRows();
+}
 async function batchAction(action, button, { recycle = false } = {}) {
   if (state.batchBusy || state.deleteBusy) return;
   if (action === "delete") {
@@ -2685,6 +2772,7 @@ async function batchAction(action, button, { recycle = false } = {}) {
   ids.forEach((id) => {
     state.operationIds.add(String(id));
     state.operationActions.set(String(id), action);
+    if (["open", "close"].includes(action)) state.operationStages.set(String(id), "queued");
   });
   renderProfiles();
   let completed = 0;
@@ -2693,7 +2781,15 @@ async function batchAction(action, button, { recycle = false } = {}) {
   try {
     for (let offset = 0; offset < ids.length; offset += 100) {
       const chunk = ids.slice(offset, offset + 100);
-      const result = await api("batch", { action, ids: chunk });
+      const progress = ["open", "close"].includes(action)
+        ? startBatchProgress(action, chunk, button, processed, ids.length, completed, errors.length) : null;
+      let result;
+      try {
+        result = await api("batch", { action, ids: chunk, ...(progress ? { operation_token: progress.token } : {}) });
+        if (progress) applyBatchResultStages(progress, result);
+      } finally {
+        stopBatchProgress(progress);
+      }
       const failures = Array.isArray(result?.errors)
         ? result.errors
         : Array.isArray(result?.results)
@@ -2723,6 +2819,7 @@ async function batchAction(action, button, { recycle = false } = {}) {
     ids.forEach((id) => {
       state.operationIds.delete(String(id));
       state.operationActions.delete(String(id));
+      state.operationStages.delete(String(id));
     });
     button.textContent = label;
     renderProfiles();

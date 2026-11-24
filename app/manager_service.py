@@ -20,7 +20,7 @@ from engine_validation import verification_scope
 from proxy_runtime import ProxyRuntime
 from signature_lifetime import require_current_signature,runtime_signature_options
 from signature_status import SignatureStatusCache
-from batch_operations import Operations
+from batch_operations import Operations,report_stage
 
 
 def _sequence_digits(value):
@@ -441,7 +441,9 @@ class ManagerService:
 
     @verification_scope()
     def open(self,identity,*,offline_test=False,extra_urls=None):
+        report_stage('waiting')
         with self._window_operation(identity):
+            report_stage('checking')
             self._require_available(identity)
             p=self.store.get(identity)
             if p.get('archived'): raise LocalBrowserError('请先恢复回收站中的窗口。')
@@ -459,6 +461,7 @@ class ManagerService:
                     restoring_source_tabs=True
             if self._status(p)=='closing':raise LocalBrowserError('窗口正在正常保存并退出，请稍候再打开。')
             if not already and (getattr(self.configuration,'independent',False) or p['_runtime'].get('signature_provider')=='local-v1'):
+                report_stage('signature')
                 from local_runtime import LocalRuntime
                 p=LocalRuntime(self).prepare(p)
             if not already and p.get('created_locally'):
@@ -469,9 +472,11 @@ class ManagerService:
                 p=prepare_launch(self,p,offline_test=offline_test)
             environment_args=[]
             if not already and (self.root/'continuity-mode.bin').is_file():
+                report_stage('environment')
                 from fingerprint_continuity import verify_continuity
                 environment_args=verify_continuity(p,self.root,allow_device_variance=True).get('environment_args',[])
             if not already and (self.root/'portable-mode.bin').is_file():
+                report_stage('profile')
                 from portable_browser import prepare_profile
                 if not p.get('_portable_crypt'):raise LocalBrowserError('此窗口尚未准备便携加密资料，未启动，避免丢失登录数据。')
                 prepare_profile(Path(p['_runtime']['profile_path']),p['_portable_crypt'])
@@ -483,6 +488,7 @@ class ManagerService:
                 if already:
                     raise LocalBrowserError('窗口刚刚退出，请重新点击打开，以完成新窗口的环境和代理检查；本次未重新启动。')
                 if not offline_test and p['proxy']['type']!='noproxy':
+                    report_stage('proxy')
                     if not route or not self.proxy_runtime.owned(route) or not self.proxy_runtime.control(route):
                         raise LocalBrowserError('本地代理未就绪，未启动浏览器，也未改为直连。')
                     # Test the exact relay the browser will use, including its
@@ -499,12 +505,14 @@ class ManagerService:
                     if not self.proxy_runtime.owned(route) or not self.proxy_runtime.control(route):
                         raise LocalBrowserError('本地代理在检测期间退出，未启动浏览器，也未改为直连。')
                 elif not offline_test and p.get('created_locally') and (str(p.get('fingerprint',{}).get('webRTC'))=='0' or any(p.get('created_options',{}).get(key) for key in ('stop_ip_change','stop_country_change'))):
+                    report_stage('proxy')
                     from proxy_check import ProxyChecker
                     from created_window import check_egress
                     country=p.get('created_options',{}).get('stop_country_change')
                     checked=ProxyChecker(targets=[{'name':'IP环境信息','url':'https://ipapi.co/json/'}] if country else None,require_geo=bool(country)).test(p['proxy'])
                     if not checked.get('success'):raise LocalBrowserError('无法核实当前出口，已按设置停止打开。')
                     check_egress(p,checked)
+                report_stage('launching')
             if not already:
                 p['_runtime']=self._runtime(p,p['_runtime'])
                 p['_runtime'].pop('environment_args',None)
@@ -519,6 +527,7 @@ class ManagerService:
             route=None
             try:
                 if not offline_test and (not already or p['proxy']['type']!='noproxy' or p['_runtime'].get('local_proxy_mode')=='local'):
+                    report_stage('proxy')
                     route=self.proxy_runtime.ensure(p)
                     if not already:
                         p['_runtime']['local_proxy_mode']='local' if route else 'direct'
@@ -526,11 +535,13 @@ class ManagerService:
                         else:p['_runtime'].pop('local_proxy_port',None)
                         self._sync(p)
                 restore_options={'tab_group_restore':tab_group_restore} if tab_group_restore is not None else {}
+                report_stage('engine')
                 self.controller.open(identity,offline_test=offline_test,extra_urls=extra_urls,bootstrap_blank=bootstrap_blank,before_launch=before_launch,**restore_options)
             except Exception:
                 if not profile_processes(Path(p['_runtime']['profile_path'])):self.proxy_runtime.stop_if_unused(identity)
                 raise
             try:
+                report_stage('saving')
                 if p.get('_cookie_pending'):
                     with CDP(self.controller.endpoint(identity)) as connection:
                         sessions=[]
@@ -564,6 +575,7 @@ class ManagerService:
                     except Exception: pass
                 raise
             if not already and not offline_test and not (p.get('created_locally') and p.get('created_options',{}).get('workbench')=='disable'):
+                report_stage('page')
                 from ip_info_page import show_ip_info,IP_INFO_OPERATIONS,IP_INFO_CAUSE_TYPES
                 try:
                     with CDP(self.controller.endpoint(identity),timeout=5) as connection:show_ip_info(connection)
@@ -579,8 +591,11 @@ class ManagerService:
             return self.store.public(p,'open')
 
     def close(self,identity):
+        report_stage('waiting')
         with self._window_operation(identity):
+            report_stage('closing')
             self.controller.close(identity)
+            report_stage('proxy_stop')
             self.proxy_runtime.stop_if_unused(identity)
             return self.store.public(self.store.get(identity),'closed')
 

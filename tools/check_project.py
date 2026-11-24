@@ -277,7 +277,7 @@ def main(argv=None):
             removed_test = ROOT / 'tests/test_removed_features.py'
             entries.append(run_command('removed-features', [python, '-B', str(removed_test)], 'unittest', env))
             entries.append(run_command('window-layout', [python, '-B', str(ROOT/'tests/test_window_layout.py')], 'unittest', env))
-            for filename in ('test_batch_parallel.py','test_engine_validation.py','test_profile_process_scan.py','test_sync_parallel.py','test_engine_portability.py','test_source_sessions.py','test_source_identity.py','test_status_purge_race.py'):
+            for filename in ('test_batch_parallel.py','test_engine_validation.py','test_profile_process_scan.py','test_process_scan_scope.py','test_path_locks.py','test_portable_parallel.py','test_sync_parallel.py','test_engine_portability.py','test_source_sessions.py','test_source_identity.py','test_status_purge_race.py'):
                 entries.append(run_command(filename,[python,'-B',str(ROOT/'tests'/filename)],'unittest',env))
             for filename in ('test_status_projection.py', 'test_signature_status.py', 'test_group_operations.py',
                              'test_bulk_proxy_import.py', 'test_profile_cache.py'):

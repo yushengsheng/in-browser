@@ -5,9 +5,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
-import threading
+from path_locks import PathLocks
 
-_ENCRYPTED_WRITE_LOCK = threading.RLock()
+_ENCRYPTED_WRITE_LOCKS = PathLocks()
 
 
 class LocalBrowserError(Exception):
@@ -71,7 +71,7 @@ def read_encrypted(path: Path, *, root=None):
 def write_encrypted(path: Path, value, *, root=None):
     path=Path(path)
     content = protect(json.dumps(value, ensure_ascii=False, separators=(',', ':'),allow_nan=False).encode(),root=_vault_root(path,root))
-    with _ENCRYPTED_WRITE_LOCK:
+    with _ENCRYPTED_WRITE_LOCKS.hold(path):
         descriptor, name = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
         temporary = Path(name)
         try:

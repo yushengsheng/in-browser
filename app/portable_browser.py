@@ -12,13 +12,13 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
-import threading
 import time
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from browser_processes import profile_processes
 from local_state import LocalBrowserError, _dpapi_protect
+from path_locks import PathLocks
 
 _FAILED = '浏览器资料密钥缺失、不受支持或无法验证，未覆盖资料；请保留完整文件夹和原机备份。'
 _RUNNING = '浏览器资料正在使用或无法确认关闭状态，未改动资料；请先正常关闭窗口后重试。'
@@ -34,7 +34,7 @@ _DATABASES = (
     ('Default/Login Data', 'logins', 'password_value'),
     ('Default/Login Data For Account', 'logins', 'password_value'),
 )
-_LOCK = threading.RLock()
+_PROFILE_LOCKS = PathLocks()
 
 
 def _closed(profile):
@@ -146,9 +146,9 @@ def capture_profile(profile):
     No account, cookie value or password plaintext is returned. Missing or empty
     database values are allowed; unknown nonempty schemes fail closed.
     """
-    with _LOCK:
-        try:
-            profile = Path(profile).resolve()
+    try:
+        profile = Path(profile).resolve()
+        with _PROFILE_LOCKS.hold(profile):
             _closed(profile)
             state, identity = _read_state(profile)
             key = _unwrap(state.get('os_crypt', {}).get('encrypted_key'))
@@ -157,12 +157,12 @@ def capture_profile(profile):
             _unchanged(profile, identity)
             return {'format': 1, 'key': base64.b64encode(key).decode('ascii'),
                     'key_id': hashlib.sha256(key).hexdigest()}
-        except LocalBrowserError as exc:
-            if str(exc) == _RUNNING:
-                raise LocalBrowserError(_RUNNING) from None
-            raise LocalBrowserError(_FAILED) from None
-        except Exception:
-            raise LocalBrowserError(_FAILED) from None
+    except LocalBrowserError as exc:
+        if str(exc) == _RUNNING:
+            raise LocalBrowserError(_RUNNING) from None
+        raise LocalBrowserError(_FAILED) from None
+    except Exception:
+        raise LocalBrowserError(_FAILED) from None
 
 
 def prepare_profile(profile, private_dict):
@@ -171,50 +171,51 @@ def prepare_profile(profile, private_dict):
     Call after any profile copy and immediately before browser launch. A matching
     current wrapper is left byte-for-byte intact, including its mtime.
     """
-    with _LOCK:
-        temporary = None
-        try:
-            profile = Path(profile).resolve()
-            _closed(profile)
-            key = _private_key(private_dict)
-            state, identity = _read_state(profile)
-            _validate_databases(profile, key)
-            crypt = state.setdefault('os_crypt', {})
+    try:
+        profile = Path(profile).resolve()
+        with _PROFILE_LOCKS.hold(profile):
+            temporary = None
             try:
-                matches = hmac.compare_digest(_unwrap(crypt.get('encrypted_key')), key)
-            except Exception:
-                matches = False
-            _closed(profile)
-            _unchanged(profile, identity)
-            if matches:
-                return False
-            wrapped = _dpapi_protect(key)
-            if not isinstance(wrapped, bytes) or not wrapped or len(wrapped) > _MAX_WRAPPER_BYTES - 5:
-                raise ValueError('Invalid wrapped key')
-            # Check the newly created wrapper before publishing it.
-            encoded = base64.b64encode(b'DPAPI' + wrapped).decode('ascii')
-            if not hmac.compare_digest(_unwrap(encoded), key):
-                raise ValueError('Wrapped key mismatch')
-            crypt['encrypted_key'] = encoded
-            descriptor, name = tempfile.mkstemp(prefix='Local State.portable-', suffix='.tmp', dir=profile)
-            temporary = Path(name)
-            with os.fdopen(descriptor, 'w', encoding='utf-8', newline='') as output:
-                json.dump(state, output, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-                output.flush()
-                os.fsync(output.fileno())
-            _closed(profile)
-            _unchanged(profile, identity)
-            os.replace(temporary, profile / 'Local State')
-            return True
-        except LocalBrowserError as exc:
-            if str(exc) == _RUNNING:
-                raise LocalBrowserError(_RUNNING) from None
-            raise LocalBrowserError(_FAILED) from None
-        except Exception:
-            raise LocalBrowserError(_FAILED) from None
-        finally:
-            if temporary is not None:
+                _closed(profile)
+                key = _private_key(private_dict)
+                state, identity = _read_state(profile)
+                _validate_databases(profile, key)
+                crypt = state.setdefault('os_crypt', {})
                 try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                    matches = hmac.compare_digest(_unwrap(crypt.get('encrypted_key')), key)
+                except Exception:
+                    matches = False
+                _closed(profile)
+                _unchanged(profile, identity)
+                if matches:
+                    return False
+                wrapped = _dpapi_protect(key)
+                if not isinstance(wrapped, bytes) or not wrapped or len(wrapped) > _MAX_WRAPPER_BYTES - 5:
+                    raise ValueError('Invalid wrapped key')
+                # Check the newly created wrapper before publishing it.
+                encoded = base64.b64encode(b'DPAPI' + wrapped).decode('ascii')
+                if not hmac.compare_digest(_unwrap(encoded), key):
+                    raise ValueError('Wrapped key mismatch')
+                crypt['encrypted_key'] = encoded
+                descriptor, name = tempfile.mkstemp(prefix='Local State.portable-', suffix='.tmp', dir=profile)
+                temporary = Path(name)
+                with os.fdopen(descriptor, 'w', encoding='utf-8', newline='') as output:
+                    json.dump(state, output, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+                    output.flush()
+                    os.fsync(output.fileno())
+                _closed(profile)
+                _unchanged(profile, identity)
+                os.replace(temporary, profile / 'Local State')
+                return True
+            finally:
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    except LocalBrowserError as exc:
+        if str(exc) == _RUNNING:
+            raise LocalBrowserError(_RUNNING) from None
+        raise LocalBrowserError(_FAILED) from None
+    except Exception:
+        raise LocalBrowserError(_FAILED) from None

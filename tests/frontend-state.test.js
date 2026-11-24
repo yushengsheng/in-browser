@@ -1458,6 +1458,135 @@ test("list refresh failure does not turn confirmed batch success into operation 
   assert.equal(h.state.batchBusy, false);
 });
 
+function batchSnapshot(progress, stages, finished = false) {
+  const items = Array.from(progress.ids, (id, index) => ({ id, stage: stages[index] }));
+  const completed = items.filter((item) => item.stage === "succeeded").length;
+  const failed = items.filter((item) => item.stage === "failed").length;
+  return { found: true, operation_token: progress.token, action: progress.action,
+    total: items.length, completed, failed, processed: completed + failed, finished, items };
+}
+
+test("batch progress updates visible rows without rendering or releasing operation locks", async () => {
+  const h = fixture(), batch = deferred(), read = deferred(), calls = [];
+  h.state.profiles = [{ id: "slow", name: "Synthetic slow" }, { id: "fast", name: "Synthetic fast" }];
+  h.state.selected = new Set(["slow", "fast"]);
+  const row = h.element("synthetic row"), rowButton = h.element("synthetic row button");
+  row.dataset.id = "fast";
+  row.querySelector = () => rowButton;
+  h.context.document.querySelectorAll = (selector) => selector === "#profile-rows > tr" ? [row] : [];
+  let renders = 0;
+  h.context.renderProfiles = () => { renders++; };
+  h.context.api = async (action, payload) => {
+    calls.push({ action, payload });
+    return action === "batch" ? batch.promise : read.promise;
+  };
+  const button = h.element("batch"); button.textContent = "打开";
+  const running = h.context.batchAction("open", button), progress = h.state.batchProgress;
+  assert.equal(h.timers.get(progress.timer).delay, 400);
+  assert.equal(calls[0].payload.operation_token, progress.token);
+  h.state.selected = new Set(["changed-selection"]);
+  const polling = h.context.pollBatchProgress(progress);
+  await h.context.pollBatchProgress(progress);
+  await h.context.refreshStatus();
+  assert.deepEqual(calls.map((call) => call.action), ["batch", "batch_progress"]);
+  read.resolve(batchSnapshot(progress, ["environment", "succeeded"]));
+  await polling;
+  assert.match(button.textContent, /1\/2.*成功 1.*失败 0/);
+  assert.match(rowButton.innerHTML, /已打开/);
+  assert.equal(rowButton.disabled, true);
+  assert.equal(h.state.profiles[1].is_running, undefined);
+  assert.equal(h.state.operationIds.size, 2);
+  assert.equal(h.state.batchBusy, true);
+  assert.equal(renders, 1);
+  assert.equal(h.toasts.length, 0);
+  assert.match(h.context.profileRow(h.state.profiles[0]), /验证环境/);
+  batch.resolve({ completed: 2, errors: [] });
+  await running;
+  assert.equal(h.state.operationStages.size, 0);
+  assert.equal(h.state.batchProgress, null);
+  assert.equal(h.state.batchBusy, false);
+  assert.equal(button.textContent, "打开");
+  assert.deepEqual([...h.state.selected], ["changed-selection"]);
+  assert.equal(h.timers.has(progress.timer), false);
+});
+
+test("finished progress cannot report batch success or release locks before its response", async () => {
+  const h = fixture(), batch = deferred();
+  h.state.selected = new Set(["one", "two"]);
+  h.state.settings.confirm_close = false;
+  h.context.api = async (action) => action === "batch" ? batch.promise : batchSnapshot(h.state.batchProgress, ["succeeded", "failed"], true);
+  const running = h.context.batchAction("close", h.element("batch")), progress = h.state.batchProgress;
+  await h.context.pollBatchProgress(progress);
+  assert.equal(h.state.batchBusy, true);
+  assert.equal(h.state.operationIds.size, 2);
+  assert.equal(h.toasts.length, 0);
+  assert.equal(h.timers.size, 0);
+  batch.reject(new Error("Synthetic bridge interruption"));
+  await running;
+  assert.match(h.toasts[0].message, /已确认成功 0 个.*2 个结果未确认/);
+  assert.equal(h.state.operationStages.size, 0);
+});
+
+test("late progress from an earlier batch chunk cannot overwrite the next chunk", async () => {
+  const h = fixture(), first = deferred(), second = deferred(), read = deferred(), nextStarted = deferred(), calls = [];
+  h.state.selected = new Set(Array.from({ length: 101 }, (_, i) => `window-${i}`));
+  h.context.api = async (action, payload) => {
+    calls.push({ action, payload });
+    if (action === "batch" && payload.ids.length === 1) nextStarted.resolve();
+    return action === "batch_progress" ? read.promise : payload.ids.length === 100 ? first.promise : second.promise;
+  };
+  const running = h.context.batchAction("open", h.element("batch")), old = h.state.batchProgress;
+  const polling = h.context.pollBatchProgress(old);
+  first.resolve({ completed: 100, errors: [] });
+  await nextStarted.promise;
+  const current = h.state.batchProgress;
+  assert.notEqual(current, old);
+  assert.notEqual(current.token, old.token);
+  await h.context.pollBatchProgress(current);
+  assert.equal(calls.filter((call) => call.action === "batch_progress").length, 1);
+  read.resolve(batchSnapshot(old, Array(100).fill("failed"), true));
+  await polling;
+  assert.equal(h.state.batchProgress, current);
+  assert.equal(h.state.operationStages.get("window-0"), "succeeded");
+  assert.equal(h.state.operationStages.get("window-100"), "queued");
+  assert.match(h.element("batch").textContent, /100\/101/);
+  second.resolve({ completed: 1, errors: [] });
+  await running;
+  assert.equal(h.state.batchProgressReading, false);
+  assert.equal(h.timers.size, 0);
+});
+
+test("invalid and failed progress replies leave results unchanged and poll at a bounded rate", async () => {
+  const h = fixture(), batch = deferred();
+  h.state.selected.add("one");
+  let reply;
+  h.context.api = async (action) => {
+    if (action === "batch") return batch.promise;
+    if (reply instanceof Error) throw reply;
+    return reply;
+  };
+  const running = h.context.batchAction("open", h.element("batch")), progress = h.state.batchProgress;
+  for (const invalid of [
+    { found: false, operation_token: progress.token },
+    { ...batchSnapshot(progress, ["succeeded"]), operation_token: "different-batch-token" },
+    { ...batchSnapshot(progress, ["succeeded"]), items: [{ id: "other", stage: "succeeded" }] },
+    { ...batchSnapshot(progress, ["succeeded"]), completed: 0 },
+    new Error("Synthetic progress unavailable"),
+  ]) {
+    reply = invalid;
+    await h.context.pollBatchProgress(progress);
+    assert.equal(h.state.operationStages.get("one"), "queued");
+    assert.equal(h.state.batchBusy, true);
+    assert.equal(h.toasts.length, 0);
+    assert.equal(h.timers.size, 1);
+    assert.equal(h.timers.get(progress.timer).delay, 400);
+  }
+  batch.resolve({ completed: 1, errors: [] });
+  await running;
+  assert.match(h.toasts[0].message, /成功 1 个/);
+  assert.equal(h.timers.size, 0);
+});
+
 function cacheFixture(count = 1) {
   const h = fixture();
   h.state.profiles = Array.from({ length: count }, (_, index) => ({ id: `cache-${index}`, name: "Fixture window", seq: index + 1 }));

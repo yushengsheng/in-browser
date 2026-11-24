@@ -10,6 +10,9 @@ def dispatch(service,action,payload=None):
         if action=='bootstrap': result=service.bootstrap()
         elif action=='list': result=service.listing()
         elif action=='status': result=service.statuses()
+        elif action=='batch_progress':
+            from batch_operations import batch_progress
+            result=batch_progress(service,payload.get('operation_token'))
         elif action=='window_layout_get':
             from window_layout import get_settings
             result=get_settings(service)
@@ -66,7 +69,7 @@ def dispatch(service,action,payload=None):
                 result={'completed':completed,'errors':errors,'results':results}
             elif payload['action'] in ('open','close'):
                 from batch_operations import parallel_batch
-                result=parallel_batch(service,payload['action'],selected)
+                result=parallel_batch(service,payload['action'],selected,payload.get('operation_token'))
             else:
                 for identity in selected:
                     reply=service.request(payload['action'],{'id':identity})

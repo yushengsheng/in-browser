@@ -1,6 +1,10 @@
 """Profile/main-process identity shared by the controller and proxy worker."""
 import os
 from pathlib import Path
+from contextlib import contextmanager
+from contextvars import ContextVar
+import threading
+import time
 
 import psutil
 from local_state import LocalBrowserError
@@ -8,6 +12,84 @@ from local_state import LocalBrowserError
 
 def _canonical_profile(profile):
     return os.path.normcase(str(Path(profile).resolve()))
+
+
+_SCAN_SCOPE = ContextVar('profile_process_scan_scope', default=None)
+
+
+def _scan_candidates(require_inspectable):
+    for process in psutil.process_iter(['pid', 'cmdline']):
+        # psutil iterator objects are shared; take a private immutable command line.
+        info = dict(process.info)
+        args = tuple(info['cmdline'] or ())
+        inspection = False
+        if require_inspectable and not args:
+            try:
+                details = process.as_dict(attrs=['name', 'exe'])
+                inspection = (str(details.get('name') or '').casefold() == 'bitbrowser.exe' or
+                              Path(details.get('exe') or '').name.casefold() == 'bitbrowser.exe')
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as error:
+                inspection = error
+        if not args or _switch_values(args, '--user-data-dir'):
+            yield process.pid, args, inspection
+
+
+class _ScanGroup:
+    def __init__(self):
+        self.ready = threading.Event()
+        self.inspect = False
+        self.rows = None
+        self.error = None
+
+
+class _FreshScans:
+    """Combine pending requests, never reuse a scan that has already started."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = None
+
+    def rows(self, require_inspectable):
+        with self.lock:
+            leader = self.pending is None
+            if leader:
+                self.pending = _ScanGroup()
+            group = self.pending
+            group.inspect |= require_inspectable
+        if leader:
+            try:
+                # A bounded collection window lets parallel workers share one scan.
+                time.sleep(.002)
+                with self.lock:
+                    self.pending = None
+                group.rows = tuple(_scan_candidates(group.inspect))
+            except BaseException as error:
+                group.error = error
+            finally:
+                with self.lock:
+                    if self.pending is group:
+                        self.pending = None
+                group.ready.set()
+        else:
+            group.ready.wait()
+        if group.error is not None:
+            raise group.error
+        return group.rows
+
+
+@contextmanager
+def process_scan_scope():
+    """Short-lived batch coordination; callers after enumeration starts scan afresh."""
+    if _SCAN_SCOPE.get() is not None:
+        yield
+        return
+    token = _SCAN_SCOPE.set(_FreshScans())
+    try:
+        yield
+    finally:
+        _SCAN_SCOPE.reset(token)
 
 
 class ProfileProcessSnapshot:
@@ -100,17 +182,13 @@ class ProfileProcessSnapshot:
 def profile_processes(profile: Path, *, require_inspectable=False):
     expected = _canonical_profile(profile)
     result = []
-    for process in psutil.process_iter(['pid', 'cmdline']):
-        # Iterator objects are shared by psutil; another scan can replace .info.
-        info = dict(process.info)
-        args = info['cmdline'] or []
+    scope = _SCAN_SCOPE.get()
+    candidates = scope.rows(require_inspectable) if scope is not None else _scan_candidates(require_inspectable)
+    for pid, args, inspection in candidates:
         if require_inspectable and not args:
-            try:
-                details = process.as_dict(attrs=['name', 'exe'])
-            except psutil.NoSuchProcess:
-                continue
-            if (str(details.get('name') or '').casefold() == 'bitbrowser.exe' or
-                    Path(details.get('exe') or '').name.casefold() == 'bitbrowser.exe'):
+            if isinstance(inspection, Exception):
+                raise inspection
+            if inspection:
                 raise LocalBrowserError('无法核对某个比特内核的运行状态，请先正常关闭来源浏览器窗口后重试。')
         try:
             matches = any(_canonical_profile(value.strip('"')) == expected
@@ -120,7 +198,7 @@ def profile_processes(profile: Path, *, require_inspectable=False):
         if not matches:
             continue
         try:
-            current = psutil.Process(process.pid)
+            current = psutil.Process(pid)
             details = current.as_dict(attrs=['pid', 'cmdline', 'exe', 'create_time', 'name'])
         except psutil.NoSuchProcess:
             continue
